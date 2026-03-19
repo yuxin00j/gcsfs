@@ -13,6 +13,7 @@ import re
 import uuid
 import warnings
 import weakref
+import sys
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs
 from urllib.parse import quote as quote_urllib
@@ -96,6 +97,161 @@ def quote(s):
     """
     # Encode everything, including slashes
     return quote_urllib(s, safe="")
+
+
+import functools
+import time
+
+import queue
+import logging.handlers
+import atexit
+
+metrics_queue = queue.Queue()
+queue_handler = logging.handlers.QueueHandler(metrics_queue)
+
+# Absorb existing handlers
+extracted_handlers = logger.handlers[:]
+for h in extracted_handlers:
+    logger.removeHandler(h)
+logger.addHandler(queue_handler)
+
+class AggregatingFormatter(logging.Formatter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stats = {}
+        import threading
+        self._lock = threading.Lock()
+
+    def format(self, record):
+        if hasattr(record, 'metric_method'):
+            method = record.metric_method
+            duration = record.metric_duration
+            size = getattr(record, 'metric_size', 0)
+            path = getattr(record, 'metric_path', '')
+            
+            with self._lock:
+                if method not in self.stats:
+                    self.stats[method] = {
+                        'count': 0, 'sum': 0, 'min': float('inf'), 'max': 0, 'size': 0
+                    }
+                s = self.stats[method]
+                s['count'] += 1
+                s['sum'] += duration
+                s['min'] = min(s['min'], duration)
+                s['max'] = max(s['max'], duration)
+                s['size'] += size
+                
+                mean = s['sum'] / s['count']
+                throughput_str = ""
+                if size > 0 or s['size'] > 0:
+                    curr_throughput = size / duration if duration > 0 else 0
+                    avg_throughput = s['size'] / s['sum'] if s['sum'] > 0 else 0
+                    throughput_str = f", Throughput: {curr_throughput/1024/1024:.2f} MB/s, Avg: {avg_throughput/1024/1024:.2f} MB/s"
+
+                record.msg = (
+                    f"[GCSFS_METRIC] Method: {method}, Path: {path}, "
+                    f"Duration: {duration:.6f}s, Pid: {record.process}, "
+                    f"Count: {s['count']}, Sum: {s['sum']:.4f}s, Mean: {mean:.6f}s, "
+                    f"Min: {s['min']:.6f}s, Max: {s['max']:.6f}s"
+                    f"{throughput_str}"
+                )
+        return super().format(record)
+
+_listener = None
+
+def _start_metrics_listener(*handlers):
+    global _listener
+    if _listener is not None:
+        _listener.stop()
+    
+    all_handlers = list(handlers)
+    formatter = AggregatingFormatter('%(message)s')
+    if not all_handlers:
+         handler = logging.StreamHandler(sys.stdout)
+         handler.setFormatter(formatter)
+         all_handlers = [handler]
+    else:
+         for h in all_handlers:
+              h.setFormatter(formatter)
+
+    _listener = logging.handlers.QueueListener(metrics_queue, *all_handlers)
+    _listener.start()
+    atexit.register(_listener.stop)
+
+# Automatically start to stdout with absorbed handlers
+_start_metrics_listener(*extracted_handlers)
+
+def log_duration(method_name=None):
+    def decorator(func):
+        is_async = asyncio.iscoroutinefunction(func)
+        name = method_name or func.__name__
+
+        def _get_path(instance, *args, **kwargs):
+            for k in ["path", "rpath", "lpath"]:
+                if k in kwargs:
+                    return kwargs[k]
+            for arg in args:
+                if isinstance(arg, str):
+                    return arg
+            return getattr(instance, "path", "")
+
+        def _get_size(res, *args, **kwargs):
+            if isinstance(res, (bytes, str)):
+                return len(res)
+            if "data" in kwargs:
+                data = kwargs["data"]
+                return len(data) if hasattr(data, "__len__") else 0
+            if name == 'write' and len(args) > 0:
+                return len(args[0]) if hasattr(args[0], "__len__") else 0
+            if name == '_pipe_file' and len(args) > 1:
+                return len(args[1]) if hasattr(args[1], "__len__") else 0
+            return 0
+
+        if is_async:
+            @functools.wraps(func)
+            async def async_wrapper(self, *args, **kwargs):
+                start = time.time()
+                res = None
+                try:
+                    res = await func(self, *args, **kwargs)
+                    return res
+                finally:
+                    duration = time.time() - start
+                    path = _get_path(self, *args, **kwargs)
+                    size = _get_size(res, *args, **kwargs)
+                    logger.info(
+                        "[GCSFS_METRIC]",
+                        extra={
+                            'metric_method': name,
+                            'metric_duration': duration,
+                            'metric_size': size,
+                            'metric_path': path
+                        }
+                    )
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(self, *args, **kwargs):
+                start = time.time()
+                res = None
+                try:
+                    res = func(self, *args, **kwargs)
+                    return res
+                finally:
+                    duration = time.time() - start
+                    path = _get_path(self, *args, **kwargs)
+                    size = _get_size(res, *args, **kwargs)
+                    logger.info(
+                        "[GCSFS_METRIC]",
+                        extra={
+                            'metric_method': name,
+                            'metric_duration': duration,
+                            'metric_size': size,
+                            'metric_path': path
+                        }
+                    )
+            return sync_wrapper
+    return decorator
 
 
 def norm_path(path):
@@ -1044,6 +1200,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         timestamp = timestamp + "0" * (6 - len(timestamp.rsplit(".", 1)[-1]))
         return datetime.fromisoformat(timestamp + "+00:00")
 
+    @log_duration()
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
         path = self._strip_protocol(path).rstrip("/")
@@ -1111,6 +1268,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         else:
             raise FileNotFoundError(path)
 
+    @log_duration()
     async def _ls(
         self, path, detail=False, prefix="", versions=False, refresh=False, **kwargs
     ):
@@ -1166,6 +1324,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             f"&generation={generation}" if generation else "",
         )
 
+    @log_duration()
     async def _cat_file(self, path, start=None, end=None, **kwargs):
         """Simple one-shot get of file data"""
         u2 = self.url(path)
@@ -1460,6 +1619,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 [self._rm_file(f) for f in files], return_exceptions=True, batch_size=5
             )
 
+    @log_duration()
     async def _rm(self, path, recursive=False, maxdepth=None, batchsize=20):
         paths = await self._expand_path(path, recursive=recursive, maxdepth=maxdepth)
         files = [p for p in paths if self.split_path(p)[1]]
@@ -1493,6 +1653,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
 
     rm = asyn.sync_wrapper(_rm)
 
+    @log_duration()
     async def _pipe_file(
         self,
         path,
@@ -1551,6 +1712,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         self.invalidate_cache(self._parent(path))
         return location
 
+    @log_duration()
     async def _put_file(
         self,
         lpath,
@@ -1796,6 +1958,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
             checker.validate_http_response(r)  # validate file consistency
             return r.status, r.headers, r.request_info, data
 
+    @log_duration()
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
         u2 = self.url(rpath)
         if os.path.isdir(lpath):
@@ -1803,6 +1966,7 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         callback = callback or NoOpCallback()
         await self._get_file_request(u2, lpath, callback=callback, **kwargs)
 
+    @log_duration()
     def _open(
         self,
         path,
@@ -2054,6 +2218,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         """HTTP link to this file's data"""
         return self.fs.url(self.path)
 
+    @log_duration()
     def _upload_chunk(self, final=False):
         """Write one part of a multi-block file upload
 
@@ -2184,6 +2349,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         )
         self.generation = j.get("generation")
 
+    @log_duration()
     def _fetch_range(self, start=None, end=None):
         """Get data from GCS
 
@@ -2196,6 +2362,15 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             if "not satisfiable" in str(e):
                 return b""
             raise
+
+
+    @log_duration()
+    def read(self, *args, **kwargs):
+        return super().read(*args, **kwargs)
+
+    @log_duration()
+    def write(self, *args, **kwargs):
+        return super().write(*args, **kwargs)
 
 
 def _convert_fixed_key_metadata(metadata, *, from_google=False):

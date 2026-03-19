@@ -19,7 +19,7 @@ from google.cloud.storage.asyncio.async_grpc_client import AsyncGrpcClient
 
 from gcsfs import __version__ as version
 from gcsfs import zb_hns_utils
-from gcsfs.core import GCSFile, GCSFileSystem
+from gcsfs.core import GCSFile, GCSFileSystem, log_duration
 from gcsfs.zonal_file import ZonalFile
 
 logger = logging.getLogger("gcsfs")
@@ -143,6 +143,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             # Default to UNKNOWN in case bucket type is not obtained
             return BucketType.UNKNOWN
 
+    @log_duration()
     def _open(
         self,
         path,
@@ -241,6 +242,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         bucket_type = await self._lookup_bucket_type(bucket)
         return bucket_type == BucketType.ZONAL_HIERARCHICAL
 
+    @log_duration()
     async def _fetch_range_split(
         self, path, start=None, chunk_lengths=None, mrd=None, size=None, **kwargs
     ):
@@ -317,6 +319,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             if mrd_created:
                 await zb_hns_utils.close_mrd(mrd)
 
+    @log_duration()
     async def _cat_file(self, path, start=None, end=None, mrd=None, **kwargs):
         """Fetch a file's contents as bytes, with an optimized path for Zonal buckets.
 
@@ -456,6 +459,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         else:
             await super()._mv_file_cache_update(path1, path2, response)
 
+    @log_duration()
     async def _mv(self, path1, path2, **kwargs):
         """
         Move a file or directory. Overrides the parent `_mv` to provide an
@@ -537,6 +541,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
     mv = asyn.sync_wrapper(_mv)
 
+    @log_duration()
     async def _list_objects(self, path, prefix="", versions=False, **kwargs):
         try:
             return await super()._list_objects(
@@ -552,6 +557,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                     pass
             raise
 
+    @log_duration()
     async def _mkdir(
         self, path, create_parents=False, enable_hierarchical_namespace=False, **kwargs
     ):
@@ -639,6 +645,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
     mkdir = asyn.sync_wrapper(_mkdir)
 
+    @log_duration()
     async def _get_directory_info(self, path, bucket, key, generation):
         """
         Override to use Storage Control API's get_folder for HNS buckets.
@@ -685,6 +692,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         # Fallback to standard GCS behavior for non-HNS buckets
         return await super()._get_directory_info(path, bucket, key, generation)
 
+    @log_duration()
     async def _rmdir(self, path):
         """
         Deletes an empty directory. Overrides the parent `_rmdir` to delete
