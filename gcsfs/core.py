@@ -634,25 +634,43 @@ class GCSFileSystem(asyn.AsyncFileSystem):
     async def _request(
         self, method, path, *args, headers=None, json=None, data=None, **kwargs
     ):
+        import time
+        t0 = time.time()
         await self._set_session()
+        t1 = time.time()
+        
         if hasattr(data, "seek"):
             data.seek(0)
+            
+        t2 = time.time()
+        req_headers = self._get_headers(headers)
+        t3 = time.time()
+        
         async with self.session.request(
             method=method,
             url=self._format_path(path, args),
             params=self._get_params(kwargs),
             json=json,
-            headers=self._get_headers(headers),
+            headers=req_headers,
             data=data,
             timeout=self.requests_timeout,
         ) as r:
+            t4 = time.time()
             status = r.status
-            headers = r.headers
+            headers_out = r.headers
             info = r.request_info  # for debug only
             contents = await r.read()
+            t5 = time.time()
+
+            logger.warning(
+                f"[_request TRACING] {method} {path} "
+                f"total:{t5-t0:.3f}s set_sess:{t1-t0:.3f}s "
+                f"get_headers:{t3-t2:.3f}s "
+                f"request_conn:{t4-t3:.3f}s read:{t5-t4:.3f}s"
+            )
 
             validate_response(status, contents, path, args)
-            return status, headers, info, contents
+            return status, headers_out, info, contents
 
     async def _call(
         self, method, path, *args, json_out=False, info_out=False, **kwargs
