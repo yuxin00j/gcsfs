@@ -499,6 +499,18 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         self._session = None
         self._endpoint = endpoint_url
         self.session_kwargs = session_kwargs or {}
+
+        # Hardcoded safer TCP connection defaults to bypass Kubernetes IPv6 timeouts
+        # and aiohttp connection starvation for HuggingFace workloads.
+        import socket
+        import aiohttp
+
+        if "connector" not in self.session_kwargs:
+            self.session_kwargs["connector"] = aiohttp.TCPConnector(
+                family=socket.AF_INET,
+                limit=0
+            )
+
         self.default_location = default_location
         self.version_aware = version_aware
 
