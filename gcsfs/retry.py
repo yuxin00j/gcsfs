@@ -139,7 +139,9 @@ async def retry_request(func, retries=6, *args, **kwargs):
     for retry in range(retries):
         try:
             if retry > 0:
-                await asyncio.sleep(min(random.random() + 2 ** (retry - 1), 32))
+                sleep_time = min(random.random() + 2 ** (retry - 1), 32)
+                logger.info(f"{func.__name__} sleeping for {sleep_time:.2f}s before retry {retry}...")
+                await asyncio.sleep(sleep_time)
             return await func(*args, **kwargs)
         except (
             HttpError,
@@ -172,7 +174,7 @@ async def retry_request(func, retries=6, *args, **kwargs):
                 logger.exception(f"{func.__name__} out of retries on exception: {e}")
                 raise e
             if is_retriable(e):
-                logger.debug(f"{func.__name__} retrying after exception: {e}")
+                logger.info(f"{func.__name__} hit retriable exception: {e}. Attempting retry...")
                 continue
             logger.exception(f"{func.__name__} non-retriable exception: {e}")
             raise e
