@@ -2209,6 +2209,11 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         if not key:
             raise OSError("Attempt to open a bucket")
         self.generation = _coalesce_generation(generation, path_generation)
+        # Bypass eager metadata fetching in super().__init__ if size is not provided
+        size_provided = kwargs.get("size") is not None
+        if not size_provided and "r" in mode:
+            self._details = {"size": None, "contentType": "dummy"}
+
         super().__init__(
             gcsfs,
             path,
@@ -2219,6 +2224,10 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             cache_options=cache_options,
             **kwargs,
         )
+
+        if not size_provided and "r" in mode:
+            self._details = None
+            self._size = None
         self.gcsfs = gcsfs
         self.bucket = bucket
         self.key = key
@@ -2232,17 +2241,12 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             )
             self.mode = self.mode.replace("a", "w")
 
-        if "r" in self.mode:
-            det = self.details
-        else:
-            det = {}
-        self.content_type = content_type or det.get(
-            "contentType",
-            mimetypes.guess_type(self.path)[0] or "application/octet-stream",
-        )
-        self.metadata = metadata or det.get("metadata", {})
-        self.fixed_key_metadata = _convert_fixed_key_metadata(det, from_google=True)
-        self.fixed_key_metadata.update(fixed_key_metadata or {})
+        self._content_type = None
+        self._init_content_type = content_type
+        self._metadata = None
+        self._init_metadata = metadata
+        self._fixed_key_metadata = None
+        self._init_fixed_key_metadata = fixed_key_metadata
         self.kms_key_name = kms_key_name
         self.timeout = timeout
         if mode in {"wb", "xb"}:
@@ -2253,9 +2257,76 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
 
     @property
     def details(self):
+        if hasattr(self, "_details") and self._details is not None:
+            return self._details
         if self._details is None:
             self._details = self.fs.info(self.path, generation=self.generation)
         return self._details
+
+    @property
+    def size(self):
+        if hasattr(self, "_size") and self._size is not None:
+            return self._size
+        if "r" in self.mode:
+            self._size = self.details.get("size")
+            if hasattr(self, "cache") and self.cache is not None:
+                self.cache.size = self._size
+        return self._size
+
+    @size.setter
+    def size(self, value):
+        self._size = value
+
+    @property
+    def content_type(self):
+        if self._content_type is not None:
+            return self._content_type
+        if "r" in self.mode:
+            det = self.details
+        else:
+            det = {}
+        self._content_type = self._init_content_type or det.get(
+            "contentType",
+            mimetypes.guess_type(self.path)[0] or "application/octet-stream",
+        )
+        return self._content_type
+
+    @content_type.setter
+    def content_type(self, value):
+        self._content_type = value
+
+    @property
+    def metadata(self):
+        if self._metadata is not None:
+            return self._metadata
+        if "r" in self.mode:
+            self._metadata = self.details.get("metadata", {})
+        else:
+            self._metadata = {}
+        if getattr(self, "_init_metadata", None):
+            self._metadata.update(self._init_metadata)
+        return self._metadata
+
+    @metadata.setter
+    def metadata(self, value):
+        self._metadata = value
+
+    @property
+    def fixed_key_metadata(self):
+        if self._fixed_key_metadata is not None:
+            return self._fixed_key_metadata
+        if "r" in self.mode:
+            det = self.details
+        else:
+            det = {}
+        fixed = _convert_fixed_key_metadata(det, from_google=True)
+        fixed.update(getattr(self, "_init_fixed_key_metadata", {}) or {})
+        self._fixed_key_metadata = fixed
+        return self._fixed_key_metadata
+
+    @fixed_key_metadata.setter
+    def fixed_key_metadata(self, value):
+        self._fixed_key_metadata = value
 
     def info(self):
         """File information about this path"""
@@ -2413,6 +2484,8 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
 
     @log_duration()
     def read(self, *args, **kwargs):
+        if getattr(self, "_size", None) is None and "r" in self.mode:
+            _ = self.size
         return super().read(*args, **kwargs)
 
     @log_duration()
