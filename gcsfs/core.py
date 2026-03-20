@@ -1238,14 +1238,26 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 "type": "directory",
             }
         # Check exact file path
+        import time
+        logger.warning(f"[_info TRACING] Starting exact file and dir checks for path: {path}")
+        t1 = time.monotonic()
         try:
             exact = await self._get_object(path)
+            t2 = time.monotonic()
+            logger.warning(f"[_info TRACING] _get_object({path}) SUCCESS, took {t2-t1:.3f}s")
             # this condition finds a "placeholder" - still need to check if it's a directory
             if not _is_directory_marker(exact):
                 return exact
         except FileNotFoundError:
+            t2 = time.monotonic()
+            logger.warning(f"[_info TRACING] _get_object({path}) returned 404 Not Found, took {t2-t1:.3f}s")
             pass
-        return await self._get_directory_info(path, bucket, key, generation)
+            
+        t3 = time.monotonic()
+        dir_out = await self._get_directory_info(path, bucket, key, generation)
+        t4 = time.monotonic()
+        logger.warning(f"[_info TRACING] _get_directory_info({path}) completed, took {t4-t3:.3f}s")
+        return dir_out
 
     async def _get_directory_info(self, path, bucket, key, generation):
         """
