@@ -738,12 +738,19 @@ class GCSFileSystem(asyn.AsyncFileSystem):
         # Work around various permission settings. Prefer an object get (storage.objects.get), but
         # fall back to a bucket list + filter to object name (storage.objects.list).
         try:
+            import time
+            t_get_start = time.time()
             res = await self._call(
                 "GET", "b/{}/o/{}", bucket, key, json_out=True, generation=generation
             )
+            t_get_end = time.time()
+            logger.warning(f"[_info TRACING] storage.objects.get on {path} SUCCESS, took {t_get_end-t_get_start:.3f}s")
         except OSError as e:
             if not str(e).startswith("Forbidden"):
                 raise
+            import time
+            start_time = time.time()
+            logger.warning(f"[_info TRACING] Hit 403 Forbidden on {path}. Executing slow list fallback...")
             resp = await self._call(
                 "GET",
                 "b/{}/o",
@@ -753,6 +760,8 @@ class GCSFileSystem(asyn.AsyncFileSystem):
                 maxResults=1 if not generation else None,
                 versions="true" if generation else None,
             )
+            duration = time.time() - start_time
+            logger.warning(f"[_info TRACING] slow list fallback on {path} completed, took {duration:.3f}s")
             for item in resp.get("items", []):
                 if item["name"] == key and (
                     not generation or item.get("generation") == generation
