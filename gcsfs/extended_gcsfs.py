@@ -79,6 +79,11 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         return self._grpc_client
 
     async def _get_grpc_client(self):
+        current_loop = asyncio.get_running_loop()
+        if getattr(self, "_grpc_client_loop", None) is not current_loop:
+            self._grpc_client = None
+            self._grpc_client_loop = current_loop
+
         if self._grpc_client is None:
             self._grpc_client = AsyncGrpcClient(
                 credentials=self.credential,
@@ -87,6 +92,11 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         return self._grpc_client
 
     async def _get_control_plane_client(self):
+        current_loop = asyncio.get_running_loop()
+        if getattr(self, "_storage_control_client_loop", None) is not current_loop:
+            self._storage_control_client = None
+            self._storage_control_client_loop = current_loop
+
         if self._storage_control_client is None:
 
             # Initialize the storage control plane client for bucket
