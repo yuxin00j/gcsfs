@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -44,11 +45,27 @@ class BucketType(Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class LoggingGCSFile(GCSFile):
+    def read(self, length=-1):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}")
+        return super().read(length)
+
+
+class LoggingZonalFile(ZonalFile):
+    def read(self, length=-1):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}")
+        return super().read(length)
+
+
 gcs_file_types = {
-    BucketType.ZONAL_HIERARCHICAL: ZonalFile,
-    BucketType.NON_HIERARCHICAL: GCSFile,
-    BucketType.HIERARCHICAL: GCSFile,
-    BucketType.UNKNOWN: GCSFile,
+    BucketType.ZONAL_HIERARCHICAL: LoggingZonalFile,
+    BucketType.NON_HIERARCHICAL: LoggingGCSFile,
+    BucketType.HIERARCHICAL: LoggingGCSFile,
+    BucketType.UNKNOWN: LoggingGCSFile,
 }
 
 
@@ -169,6 +186,18 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                 asyn.sync(asyn.loop[0], cache.close, timeout=5.0)
             except fsspec.FSTimeoutError:
                 pass
+
+    def glob(self, path, **kwargs):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        logger.info(f"[CUSTOM LOG] glob: {path}, pid={pid}, tid={tid}")
+        return super().glob(path, **kwargs)
+
+    def info(self, path, **kwargs):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        logger.info(f"[CUSTOM LOG] info: {path}, pid={pid}, tid={tid}")
+        return super().info(path, **kwargs)
 
     @property
     def _user_project(self):
@@ -325,6 +354,9 @@ class ExtendedGcsFileSystem(GCSFileSystem):
         """
         Open a file.
         """
+        pid = os.getpid()
+        tid = threading.get_ident()
+        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}")
         bucket, _, _ = self.split_path(path)
         bucket_type = self._sync_lookup_bucket_type(bucket)
 
