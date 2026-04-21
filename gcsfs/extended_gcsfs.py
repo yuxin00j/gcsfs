@@ -3,6 +3,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -52,16 +53,22 @@ class LoggingGCSFile(GCSFile):
     def read(self, length=-1):
         pid = os.getpid()
         tid = threading.get_ident()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}")
-        return super().read(length)
+        t0 = time.perf_counter()
+        res = super().read(length)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
 
 class LoggingZonalFile(ZonalFile):
     def read(self, length=-1):
         pid = os.getpid()
         tid = threading.get_ident()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}")
-        return super().read(length)
+        t0 = time.perf_counter()
+        res = super().read(length)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
 
 gcs_file_types = {
@@ -200,14 +207,20 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     def glob(self, path, **kwargs):
         pid = os.getpid()
         tid = threading.get_ident()
-        logger.info(f"[CUSTOM LOG] glob: {path}, pid={pid}, tid={tid}")
-        return super().glob(path, **kwargs)
+        t0 = time.perf_counter()
+        res = super().glob(path, **kwargs)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] glob: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
     def info(self, path, **kwargs):
         pid = os.getpid()
         tid = threading.get_ident()
-        logger.info(f"[CUSTOM LOG] info: {path}, pid={pid}, tid={tid}")
-        return super().info(path, **kwargs)
+        t0 = time.perf_counter()
+        res = super().info(path, **kwargs)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] info: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
     @property
     def _user_project(self):
@@ -366,11 +379,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         pid = os.getpid()
         tid = threading.get_ident()
-        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}")
+        t0 = time.perf_counter()
         bucket, _, _ = self.split_path(path)
         bucket_type = self._sync_lookup_bucket_type(bucket)
 
-        return gcs_file_types[bucket_type](
+        res = gcs_file_types[bucket_type](
             self,
             path,
             mode,
@@ -385,6 +398,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             finalize_on_close=kwargs.pop("finalize_on_close", self.finalize_on_close),
             **kwargs,
         )
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
     async def _process_limits_to_offset_and_length(
