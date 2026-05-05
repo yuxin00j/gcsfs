@@ -53,7 +53,7 @@ class LoggingGCSFile(GCSFile):
         t0 = time.perf_counter()
         res = super().read(length)
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, duration={t1-t0:.6f}s")
         return res
 
 
@@ -64,7 +64,7 @@ class LoggingZonalFile(ZonalFile):
         t0 = time.perf_counter()
         res = super().read(length)
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, duration={t1-t0:.6f}s")
         return res
 
 
@@ -462,6 +462,10 @@ class ExtendedGcsFileSystem(GCSFileSystem):
 
         Delegates concurrent fetching of individual chunks directly to `_cat_file`.
         """
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
+
         file_size = size or await _get_mrd_size(mrd)
         if file_size is None:
             logger.warning(
@@ -500,10 +504,6 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                             start=current_offset,
                             end=end_offset,
                             mrd=mrd,
-                            # Distribute the concurrency budget proportionally.
-                            # Since these outer tasks are already concurrent, this is typically 1.
-                            # However, if a large chunk dominates the total size, it receives
-                            # higher concurrency to prevent it from becoming a bottleneck.
                             concurrency=max(
                                 1, length * concurrency // sum(chunk_lengths)
                             ),
@@ -520,6 +520,8 @@ class ExtendedGcsFileSystem(GCSFileSystem):
                 if isinstance(res, Exception):
                     raise res
 
+            t1 = time.perf_counter()
+            logger.info(f"[CUSTOM LOG] _fetch_range_split: {path}, pid={pid}, tid={tid}, start={start}, chunk_lengths={chunk_lengths}, duration={t1-t0:.6f}s")
             return results
         except BaseException:
             for t in tasks:
