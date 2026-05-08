@@ -10,6 +10,7 @@ import mimetypes
 import os
 import posixpath
 import queue
+import time
 import re
 import sys
 import threading
@@ -341,6 +342,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         version_aware=False,
         **kwargs,
     ):
+        t0 = time.perf_counter()
         if cache_timeout is not None:
             kwargs["listings_expiry_time"] = cache_timeout
         super().__init__(
@@ -375,6 +377,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.credentials = GoogleCredentials(
             project, access, token, on_google=self.on_google
         )
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] GCSFileSystem initialized: pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
 
     @property
     def _location(self):
