@@ -79,6 +79,13 @@ class ZonalFile(GCSFile):
             )
             object_size = self.mrd_pool.persisted_size
 
+            self._details = {
+                "name": path,
+                "size": object_size,
+                "type": "file",
+                "generation": generation,
+            }
+
             if object_size is None:
                 logger.warning(
                     "AsyncMultiRangeDownloader (MRD) exists but has no 'persisted_size'. "
