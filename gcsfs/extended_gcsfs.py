@@ -140,6 +140,7 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             - retry_multiplier: Multiplier for delay between retries.
             These map to `google.api_core.retry.AsyncRetry` arguments (without 'retry_' prefix).
         """
+        t0 = time.perf_counter()
         valid_keys = DEFAULT_RETRY_CONFIG.keys()
         self.retry_config = {
             k[6:]: v
@@ -177,6 +178,10 @@ class ExtendedGcsFileSystem(GCSFileSystem):
             self.loop,
             self._mrd_pool_cache,
         )
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] ExtendedGcsFileSystem initialized: pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
 
     @staticmethod
     def _finalize_mrd_pool_cache(loop, cache):
