@@ -1,0 +1,48 @@
+common:
+  bucket_types:
+    - "regional"
+    - "hns"
+    - "zonal"
+
+scenarios:
+  - name: "glob_empty"
+    pattern: ""
+    files: [1000, 10000]
+
+  - name: "glob_empty_folders"
+    pattern: ""
+    folders: [256]
+    files: [1000, 10000]
+
+  - name: "glob_wildcard"
+    pattern: "/*"
+    files: [1000, 10000]
+
+  - name: "glob_wildcard_folders"
+    pattern: "/*"
+    folders: [256]
+    files: [1000, 10000]
+
+  - name: "glob_recursive"
+    depth: 8
+    folders: [256]
+    pattern: "/**"
+    files: [1000, 10000]
+
+  - name: "glob_recursive_deep"
+    depth: 24
+    folders: [256]
+    pattern: "/**"
+    files: [1000, 10000]
+
+  - name: "glob_explicit"
+    pattern: "/file_0"
+    files: [1000, 10000]
+
+  - name: "glob_question"
+    pattern: "/file_?"
+    files: [1000, 10000]
+
+  - name: "glob_brackets"
+    pattern: "/file_[0-9]"
+    files: [1000, 10000]
