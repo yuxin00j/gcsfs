@@ -81,27 +81,37 @@ def test_glob_single_threaded(benchmark, gcsfs_benchmark_glob, monitor):
     ids=lambda p: p.name,
 )
 def test_glob_multi_threaded(benchmark, gcsfs_benchmark_glob, monitor):
-    gcs, target_dirs, _, params = gcsfs_benchmark_glob
+    gcs, target_dirs, prefix, params = gcsfs_benchmark_glob
 
-    chunks = _chunk_list(target_dirs, params.threads)
-    args_list = [(gcs, chunks[i], params.pattern) for i in range(params.threads)]
+    if params.pattern == "/**":
+        run_multi_threaded(
+            benchmark, monitor, params, _glob_op, [(gcs, prefix, params.pattern)], BENCHMARK_GROUP
+        )
+    else:
+        chunks = _chunk_list(target_dirs, params.threads)
+        args_list = [(gcs, chunks[i], params.pattern) for i in range(params.threads)]
 
-    run_multi_threaded(
-        benchmark, monitor, params, _glob_dirs, args_list, BENCHMARK_GROUP
-    )
+        run_multi_threaded(
+            benchmark, monitor, params, _glob_dirs, args_list, BENCHMARK_GROUP
+        )
 
 
 def _process_worker(
-    gcs, target_dirs, threads, process_durations_shared, index, pattern="/*"
+    gcs, target_dirs, threads, process_durations_shared, index, pattern="/*", prefix=None
 ):
     """A worker function for each process to glob the directory."""
     start_time = time.perf_counter()
-    chunks = _chunk_list(target_dirs, threads)
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = [
-            executor.submit(_glob_dirs, gcs, chunks[i], pattern) for i in range(threads)
-        ]
-        list(futures)
+    if pattern == "/**" and prefix is not None:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = [executor.submit(_glob_op, gcs, prefix, pattern)]
+            list(futures)
+    else:
+        chunks = _chunk_list(target_dirs, threads)
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = [
+                executor.submit(_glob_dirs, gcs, chunks[i], pattern) for i in range(threads)
+            ]
+            list(futures)
     duration_s = time.perf_counter() - start_time
     process_durations_shared[index] = duration_s
 
@@ -115,18 +125,30 @@ def _process_worker(
 def test_glob_multi_process(
     benchmark, gcsfs_benchmark_glob, extended_gcs_factory, request, monitor
 ):
-    _, target_dirs, _, params = gcsfs_benchmark_glob
+    _, target_dirs, prefix, params = gcsfs_benchmark_glob
 
     def args_builder(gcs_instance, i, shared_arr):
-        chunks = _chunk_list(target_dirs, params.processes)
-        return (
-            gcs_instance,
-            chunks[i],
-            params.threads,
-            shared_arr,
-            i,
-            params.pattern,
-        )
+        if params.pattern == "/**":
+            return (
+                gcs_instance,
+                [],
+                params.threads,
+                shared_arr,
+                i,
+                params.pattern,
+                prefix,
+            )
+        else:
+            chunks = _chunk_list(target_dirs, params.processes)
+            return (
+                gcs_instance,
+                chunks[i],
+                params.threads,
+                shared_arr,
+                i,
+                params.pattern,
+                None,
+            )
 
     run_multi_process(
         benchmark,
