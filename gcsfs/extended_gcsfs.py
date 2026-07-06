@@ -484,7 +484,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         tid = threading.get_ident()
         t0 = time.perf_counter()
 
-        file_size = size or await _get_mrd_size(mrd)
+        file_size = size
+        if file_size is None and not callable(mrd):
+            file_size = await _get_mrd_size(mrd)
         if file_size is None:
             logger.warning(
                 f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "
@@ -554,17 +556,22 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool, path=None):
         """Helper to handle concurrent chunk downloads cleanly."""
         if path is None:
-            if hasattr(mrd_or_pool, "bucket_name") and hasattr(mrd_or_pool, "object_name"):
+            if not callable(mrd_or_pool) and hasattr(mrd_or_pool, "bucket_name") and hasattr(mrd_or_pool, "object_name"):
                 path = f"{mrd_or_pool.bucket_name}/{mrd_or_pool.object_name}"
 
         if path is None:
+            if callable(mrd_or_pool):
+                mrd_or_pool = await mrd_or_pool()
             return await self._do_concurrent_mrd_fetch(offset, length, concurrency, mrd_or_pool)
 
         start = offset
         end = offset + length
 
         async def _fetch():
-            return await self._do_concurrent_mrd_fetch(offset, length, concurrency, mrd_or_pool)
+            mrd = mrd_or_pool
+            if callable(mrd):
+                mrd = await mrd()
+            return await self._do_concurrent_mrd_fetch(offset, length, concurrency, mrd)
 
         return await coalesced_read("mrd_fetch", path, start, end, _fetch)
 
@@ -672,7 +679,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             pool_created_here = True
 
         try:
-            file_size = await _get_mrd_size(mrd)
+            file_size = kwargs.pop("size", None)
+            if file_size is None and not callable(mrd):
+                file_size = await _get_mrd_size(mrd)
             if file_size is None:
                 logger.warning(
                     f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "

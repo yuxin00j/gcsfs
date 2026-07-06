@@ -145,11 +145,9 @@ class ZonalFile(GCSFile):
                 self.flush_interval_bytes,
             )
 
-    def _ensure_mrd_pool(self):
+    async def _async_ensure_mrd_pool(self):
         if getattr(self, "_mrd_pool", None) is None:
-            self._mrd_pool = asyn.sync(
-                self.gcsfs.loop,
-                self.gcsfs._mrd_pool_cache.get,
+            self._mrd_pool = await self.gcsfs._mrd_pool_cache.get(
                 self.bucket,
                 self.key,
                 self.generation,
@@ -157,6 +155,11 @@ class ZonalFile(GCSFile):
             )
             if getattr(self._mrd_pool, "details", None) is not None:
                 self._details = self._mrd_pool.details
+        return self._mrd_pool
+
+    def _ensure_mrd_pool(self):
+        if getattr(self, "_mrd_pool", None) is None:
+            asyn.sync(self.gcsfs.loop, self._async_ensure_mrd_pool)
 
     @property
     def mrd_pool(self):
@@ -221,8 +224,6 @@ class ZonalFile(GCSFile):
                 raise
 
         # non-prefetch route
-        mrd = self.mrd_pool
-
         async def _do_fetch():
             if chunk_lengths is not None:
                 return await self.gcsfs._fetch_range_split(
@@ -231,7 +232,7 @@ class ZonalFile(GCSFile):
                     start=start,
                     chunk_lengths=chunk_lengths,
                     size=self.size,
-                    mrd=mrd,
+                    mrd=self._async_ensure_mrd_pool,
                 )
 
             return await self.gcsfs._cat_file(
@@ -239,7 +240,8 @@ class ZonalFile(GCSFile):
                 start=start,
                 end=end,
                 concurrency=self.concurrency,
-                mrd=mrd,
+                mrd=self._async_ensure_mrd_pool,
+                size=self.size,
             )
 
         try:
@@ -252,7 +254,7 @@ class ZonalFile(GCSFile):
     async def _async_fetch_range(self, start_offset, total_size, split_factor=1):
         """The native coroutine called by the BackgroundPrefetcher."""
         return await self.gcsfs._concurrent_mrd_fetch(
-            start_offset, total_size, split_factor, self.mrd_pool, path=self.path
+            start_offset, total_size, split_factor, self._async_ensure_mrd_pool, path=self.path
         )
 
     def write(self, data):
