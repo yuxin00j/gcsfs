@@ -221,6 +221,8 @@ class ZonalFile(GCSFile):
                 raise
 
         # non-prefetch route
+        mrd = self.mrd_pool
+
         async def _do_fetch():
             if chunk_lengths is not None:
                 return await self.gcsfs._fetch_range_split(
@@ -229,7 +231,7 @@ class ZonalFile(GCSFile):
                     start=start,
                     chunk_lengths=chunk_lengths,
                     size=self.size,
-                    mrd=self.mrd_pool,
+                    mrd=mrd,
                 )
 
             return await self.gcsfs._cat_file(
@@ -237,7 +239,7 @@ class ZonalFile(GCSFile):
                 start=start,
                 end=end,
                 concurrency=self.concurrency,
-                mrd=self.mrd_pool,
+                mrd=mrd,
             )
 
         try:
