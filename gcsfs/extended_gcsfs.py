@@ -29,7 +29,7 @@ from gcsfs import __version__ as version
 from gcsfs import zb_hns_utils
 from gcsfs._dircache import HnsDirCacheUpdater
 from gcsfs.concurrency import split_range
-from gcsfs.core import GCSFile, GCSFileSystem
+from gcsfs.core import GCSFile, GCSFileSystem, coalesced_read
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -495,7 +495,24 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             if pool_created_here:
                 await mrd.close()
 
-    async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool):
+    async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool, path=None):
+        """Helper to handle concurrent chunk downloads cleanly."""
+        if path is None:
+            if hasattr(mrd_or_pool, "bucket_name") and hasattr(mrd_or_pool, "object_name"):
+                path = f"{mrd_or_pool.bucket_name}/{mrd_or_pool.object_name}"
+
+        if path is None:
+            return await self._do_concurrent_mrd_fetch(offset, length, concurrency, mrd_or_pool)
+
+        start = offset
+        end = offset + length
+
+        async def _fetch():
+            return await self._do_concurrent_mrd_fetch(offset, length, concurrency, mrd_or_pool)
+
+        return await coalesced_read("mrd_fetch", path, start, end, _fetch)
+
+    async def _do_concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool):
         """Helper to handle concurrent chunk downloads cleanly."""
         ranges = split_range(length, concurrency, self.MIN_CHUNK_SIZE_FOR_CONCURRENCY)
 
@@ -620,6 +637,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 length,
                 concurrency,
                 mrd,
+                path=path,
             )
 
         finally:
