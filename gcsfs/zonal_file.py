@@ -70,23 +70,7 @@ class ZonalFile(GCSFile):
         self.pool_size = pool_size
         object_size = None
         if "r" in self.mode:
-            self.mrd_pool = asyn.sync(
-                self.gcsfs.loop,
-                self.gcsfs._mrd_pool_cache.get,
-                bucket,
-                key,
-                generation,
-                self.pool_size,
-            )
-            if getattr(self.mrd_pool, "details", None) is not None:
-                self._details = self.mrd_pool.details
-            object_size = self.mrd_pool.persisted_size
-
-            if object_size is None:
-                logger.warning(
-                    "AsyncMultiRangeDownloader (MRD) exists but has no 'persisted_size'. "
-                    "This may result in incorrect behavior for unfinalized objects."
-                )
+            self._mrd_pool = None
         elif "w" in self.mode or "a" in self.mode:
             pass
         else:
@@ -160,6 +144,26 @@ class ZonalFile(GCSFile):
                 self.generation,
                 self.flush_interval_bytes,
             )
+
+    def _ensure_mrd_pool(self):
+        if getattr(self, "_mrd_pool", None) is None:
+            self._mrd_pool = asyn.sync(
+                self.gcsfs.loop,
+                self.gcsfs._mrd_pool_cache.get,
+                self.bucket,
+                self.key,
+                self.generation,
+                self.pool_size,
+            )
+            if getattr(self._mrd_pool, "details", None) is not None:
+                self._details = self._mrd_pool.details
+
+    @property
+    def mrd_pool(self):
+        if "r" in self.mode:
+            self._ensure_mrd_pool()
+            return self._mrd_pool
+        return None
 
     def _fetch_range(
         self,
@@ -385,8 +389,8 @@ class ZonalFile(GCSFile):
         # super is closed before aaow since flush may need aaow
         super().close()
 
-        if hasattr(self, "mrd_pool") and self.mrd_pool:
-            asyn.sync(self.gcsfs.loop, self.mrd_pool.close)
+        if getattr(self, "_mrd_pool", None) is not None:
+            asyn.sync(self.gcsfs.loop, self._mrd_pool.close)
 
         # Only close aaow if the stream is open
         if self.aaow and self.aaow._is_stream_open:
