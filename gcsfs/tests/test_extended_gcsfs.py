@@ -5,6 +5,7 @@ import io
 import multiprocessing
 import os
 import random
+import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -510,6 +511,14 @@ def test_multithreaded_read_one_fails_others_survive_zb(
     """
     if extended_gcsfs.on_google:
         pytest.skip("Cannot mock failures on real GCS")
+
+    cache_dir = (
+        "/dev/shm/gcsfs_shared_cache"
+        if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK)
+        else "/tmp/gcsfs_shared_cache"
+    )
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     with gcs_bucket_mocks(
         _MULTI_THREADED_TEST_DATA, bucket_type_val=BucketType.ZONAL_HIERARCHICAL
@@ -1475,7 +1484,9 @@ async def test_cat_file_delegates_resolved_range_to_mrd_fetch(
 
         await extended_gcsfs._cat_file("bucket/obj", concurrency=4)
 
-        mock_concurrent_fetch.assert_awaited_once_with(0, 500, 4, mock_pool)
+        mock_concurrent_fetch.assert_awaited_once_with(
+            0, 500, 4, mock_pool, path="bucket/obj"
+        )
 
 
 @pytest.mark.asyncio

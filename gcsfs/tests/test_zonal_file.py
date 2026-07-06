@@ -665,7 +665,9 @@ async def test_zonal_file_async_fetch_range(mock_sync, mock_gcsfs):
     mock_gcsfs._concurrent_mrd_fetch = mock.AsyncMock(return_value=b"async data")
     result = await zf._async_fetch_range(start_offset=0, total_size=100, split_factor=2)
     assert result == b"async data"
-    mock_gcsfs._concurrent_mrd_fetch.assert_awaited_once_with(0, 100, 2, zf.mrd_pool)
+    mock_gcsfs._concurrent_mrd_fetch.assert_awaited_once_with(
+        0, 100, 2, zf.mrd_pool, path="gs://test-bucket/test-key"
+    )
     zf.close()
 
 

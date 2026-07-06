@@ -246,7 +246,7 @@ class ZonalFile(GCSFile):
     async def _async_fetch_range(self, start_offset, total_size, split_factor=1):
         """The native coroutine called by the BackgroundPrefetcher."""
         return await self.gcsfs._concurrent_mrd_fetch(
-            start_offset, total_size, split_factor, self.mrd_pool
+            start_offset, total_size, split_factor, self.mrd_pool, path=self.path
         )
 
     def write(self, data):

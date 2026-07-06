@@ -1,6 +1,18 @@
+import asyncio
+import os
+import shutil
+from unittest import mock
+
 import pytest
 
 from gcsfs.caching import ReadAheadChunked
+from gcsfs.core import shared_cached_read
+
+# Determine cache directory dynamically based on environment / system support
+if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+    CACHE_DIR = "/dev/shm/gcsfs_shared_cache"
+else:
+    CACHE_DIR = "/tmp/gcsfs_shared_cache"
 
 
 class MockVectorFetcher:
@@ -198,3 +210,191 @@ def test_out_of_bounds(cache_setup):
     """Test start >= size returns empty."""
     cache, _ = cache_setup
     assert cache._fetch(150, 200) == b""
+
+
+@pytest.mark.asyncio
+async def test_multi_process_caching_and_locking():
+    """
+    Tests that concurrent/sequential reads utilizing the multi-process
+    shared cache write to and hit the cache correctly, blocking via flock.
+    """
+    # Force clean up before/after
+    if os.path.exists(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+    fetch_count = 0
+
+    async def mock_fetch():
+        nonlocal fetch_count
+        fetch_count += 1
+        await asyncio.sleep(0.05)
+        return b"shared_process_bytes"
+
+    try:
+        # 1. First coalesced read (cache miss, performs fetch)
+        res1 = await shared_cached_read("bucket/file_mp", 0, 50, mock_fetch)
+        assert res1 == b"shared_process_bytes"
+        assert fetch_count == 1
+
+        # Check that cache file exists
+        assert os.path.exists(CACHE_DIR)
+        files = os.listdir(CACHE_DIR)
+        assert len(files) > 0
+
+        # 2. Second coalesced read (cache hit, bypasses fetch)
+        res2 = await shared_cached_read("bucket/file_mp", 0, 50, mock_fetch)
+        assert res2 == b"shared_process_bytes"
+        # fetch_count should STILL be 1!
+        assert fetch_count == 1
+    finally:
+        # Cleanup guaranteed even if assertions fail
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_instances_share_cache():
+    """
+    Tests that distinct GCSFileSystem instances share the same file cache
+    so that a file range read by one instance is served from cache for another.
+    """
+    from gcsfs.core import GCSFileSystem
+
+    if os.path.exists(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+    fs1 = GCSFileSystem(token="anon")
+    fs2 = GCSFileSystem(token="anon")
+
+    call_count = 0
+
+    async def mock_call(method, url, headers=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return {}, b"file_instance_shared_data"
+
+    try:
+        with mock.patch.object(fs1, "_call", side_effect=mock_call):
+            with mock.patch.object(fs2, "_call", side_effect=mock_call):
+                # Instance 1 fetches data (cache miss)
+                res1 = await fs1._cat_file_sequential(
+                    "mybucket/shared_file.txt", start=0, end=26
+                )
+                assert res1 == b"file_instance_shared_data"
+                assert call_count == 1
+
+                # Instance 2 reads the same range (cache hit, _call not invoked)
+                res2 = await fs2._cat_file_sequential(
+                    "mybucket/shared_file.txt", start=0, end=26
+                )
+                assert res2 == b"file_instance_shared_data"
+                assert call_count == 1
+    finally:
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+
+def _process_multi_range_read_task(
+    path, ranges, cache_dir, barrier, result_queue, fetch_counter
+):
+    """Worker process function for testing multi-range multi-process cache concurrency."""
+    import asyncio
+
+    from gcsfs.core import shared_cached_read
+
+    async def _async_worker():
+        results = []
+        for start, end in ranges:
+
+            async def mock_fetch(s=start, e=end):
+                with fetch_counter.get_lock():
+                    fetch_counter.value += 1
+                await asyncio.sleep(0.05)
+                return f"data_{s}_{e}".encode()
+
+            # Wait at barrier for each range so both processes hit shared_cached_read simultaneously
+            barrier.wait(timeout=5)
+            res = await shared_cached_read(path, start, end, mock_fetch)
+            results.append(((start, end), res))
+        result_queue.put(results)
+
+    asyncio.run(_async_worker())
+
+
+@pytest.mark.asyncio
+async def test_e2e_multiprocess_shared_cache_concurrency_and_invalidation():
+    """
+    End-to-End Test:
+    1. Spawns two distinct OS processes that simultaneously attempt to read multiple ranges of the same file.
+    2. Verifies that for each range, only 1 process queries the backend while the other reads from cache.
+    3. Verifies that repeated reads of previously fetched ranges hit the cache.
+    4. Verifies that invalidate_cache purges all shared range cache files for the path.
+    """
+    import hashlib
+    import multiprocessing
+
+    from gcsfs.core import GCSFileSystem
+
+    path = "e2e_bucket/multi_range_test_file.bin"
+    ranges = [(0, 100), (100, 200), (200, 300), (300, 400), (0, 100)]
+    unique_ranges = {(0, 100), (100, 200), (200, 300), (300, 400)}
+
+    if os.path.exists(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+    try:
+        # 1. Multi-Process Concurrency Test across 5 range reads (4 unique)
+        barrier = multiprocessing.Barrier(2)
+        result_queue = multiprocessing.Queue()
+        fetch_counter = multiprocessing.Value("i", 0)
+
+        p1 = multiprocessing.Process(
+            target=_process_multi_range_read_task,
+            args=(path, ranges, CACHE_DIR, barrier, result_queue, fetch_counter),
+        )
+        p2 = multiprocessing.Process(
+            target=_process_multi_range_read_task,
+            args=(path, ranges, CACHE_DIR, barrier, result_queue, fetch_counter),
+        )
+
+        p1.start()
+        p2.start()
+
+        p1.join(timeout=15)
+        p2.join(timeout=15)
+
+        assert p1.exitcode == 0, "Process 1 failed"
+        assert p2.exitcode == 0, "Process 2 failed"
+
+        r1 = result_queue.get(timeout=2)
+        r2 = result_queue.get(timeout=2)
+
+        # Verify correct data returned for all ranges in both processes
+        for (start, end), data in r1:
+            assert data == f"data_{start}_{end}".encode()
+        for (start, end), data in r2:
+            assert data == f"data_{start}_{end}".encode()
+
+        # Exactly 4 fetches must be performed across both OS processes for 4 unique ranges
+        assert fetch_counter.value == len(unique_ranges)
+
+        # 2. Verify cache files exist for all 4 unique ranges
+        path_hash = hashlib.sha256(path.encode()).hexdigest()
+        assert os.path.exists(CACHE_DIR)
+        cached_files = [
+            f
+            for f in os.listdir(CACHE_DIR)
+            if f.startswith(path_hash) and not f.endswith(".lock")
+        ]
+        assert len(cached_files) == len(unique_ranges)
+
+        # 3. Invalidation Test: Purge all ranges for this path
+        fs = GCSFileSystem(token="anon")
+        fs.invalidate_cache(path)
+
+        # All range cache files for this path should be unlinked
+        matching_files = [f for f in os.listdir(CACHE_DIR) if f.startswith(path_hash)]
+        assert (
+            len(matching_files) == 0
+        ), f"Cache files remaining after invalidation: {matching_files}"
+
+    finally:
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)

@@ -38,6 +38,175 @@ from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE
 
 logger = logging.getLogger("gcsfs")
 
+import fcntl
+import hashlib
+
+
+def _normalize_path(path):
+    """Canonicalize GCS path to bucket/key form, stripping protocol and slashes."""
+    if not path:
+        return ""
+    if "://" in path:
+        path = path.split("://", 1)[1]
+    return path.strip("/")
+
+
+def invalidate_shared_cache(path=None):
+    """Purge shared memory range cache files from disk/SHM."""
+    cache_dir = (
+        "/dev/shm/gcsfs_shared_cache"
+        if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK)
+        else "/tmp/gcsfs_shared_cache"
+    )
+    if not os.path.exists(cache_dir):
+        return
+
+    if path is None:
+        try:
+            for fname in os.listdir(cache_dir):
+                try:
+                    os.unlink(os.path.join(cache_dir, fname))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        norm_path = _normalize_path(path)
+        if not norm_path:
+            return
+        path_hash = hashlib.sha256(norm_path.encode()).hexdigest()
+        try:
+            for fname in os.listdir(cache_dir):
+                if fname.startswith(path_hash):
+                    try:
+                        os.unlink(os.path.join(cache_dir, fname))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+async def shared_cached_read(path, start, end, fetch_coro):
+    """
+    Reads file range data from a shared multi-process memory-backed cache (/dev/shm or /tmp).
+
+    On cache miss, acquires a non-blocking process lock via flock, executes fetch_coro,
+    atomically writes the result to cache, and returns the data.
+    """
+    if start is None:
+        start = 0
+    if end is None:
+        return await fetch_coro()
+
+    # Normalize start and end
+    if start >= end:
+        return b""
+
+    norm_path = _normalize_path(path)
+    if not norm_path:
+        return await fetch_coro()
+
+    # Multi-process memory-backed cache under /dev/shm or /tmp
+    if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        cache_dir = "/dev/shm/gcsfs_shared_cache"
+    else:
+        cache_dir = "/tmp/gcsfs_shared_cache"
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        # Fallback to direct fetch if cache directory cannot be created
+        return await fetch_coro()
+
+    path_hash = hashlib.sha256(norm_path.encode()).hexdigest()
+    cache_file = os.path.join(cache_dir, f"{path_hash}_{start}_{end}")
+    lock_file = cache_file + ".lock"
+
+    try:
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY, 0o666)
+    except Exception:
+        # Fallback to direct fetch if lock file cannot be created/opened
+        return await fetch_coro()
+
+    try:
+        # Acquire exclusive lock in a non-blocking loop with exponential backoff & 30s timeout
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+        poll_delay = 0.01
+        lock_acquired = False
+
+        while not lock_acquired:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_acquired = True
+            except (BlockingIOError, PermissionError):
+                if loop.time() - start_time > 30.0:
+                    logger.warning(
+                        f"Shared cache lock timeout (30s) for {norm_path} range [{start}, {end}]"
+                    )
+                    return await fetch_coro()
+                await asyncio.sleep(poll_delay)
+                poll_delay = min(poll_delay * 1.5, 0.05)
+            except OSError as e:
+                import errno
+
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    if loop.time() - start_time > 30.0:
+                        logger.warning(
+                            f"Shared cache lock timeout (30s) for {norm_path} range [{start}, {end}]"
+                        )
+                        return await fetch_coro()
+                    await asyncio.sleep(poll_delay)
+                    poll_delay = min(poll_delay * 1.5, 0.05)
+                else:
+                    raise
+
+        # Check if cache file exists (cache hit)
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    data = f.read()
+                logger.debug(
+                    f"Multi-process cache hit for {norm_path} range [{start}, {end}]"
+                )
+                return data
+            except Exception:
+                pass  # Fall back to download on read error
+
+        # Cache miss: fetch data from backend
+        data = await fetch_coro()
+
+        # Write data to a process-unique temporary cache file and rename atomically
+        temp_task_id = id(asyncio.current_task()) if asyncio.current_task() else 0
+        temp_cache_file = f"{cache_file}.tmp.{os.getpid()}_{temp_task_id}"
+        file_written = False
+
+        try:
+            with open(temp_cache_file, "wb") as f:
+                f.write(data)
+            os.rename(temp_cache_file, cache_file)
+            file_written = True
+        except Exception as e:
+            logger.debug(f"Failed to write shared cache file for {norm_path}: {e}")
+        finally:
+            if not file_written and os.path.exists(temp_cache_file):
+                try:
+                    os.unlink(temp_cache_file)
+                except Exception:
+                    pass
+
+        return data
+
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+
 
 if "GCSFS_DEBUG" in os.environ:
     setup_logging(logger=logger, level=os.getenv("GCSFS_DEBUG"))
@@ -935,6 +1104,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             If None, clear all listings cached else listings at or under given
             path.
         """
+        invalidate_shared_cache(path)
         if path is None:
             logger.debug("invalidate_cache clearing cache")
             self.dircache.clear()
@@ -1207,15 +1377,28 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if start is not None and end is not None and start >= end >= 0:
             return b""
 
-        u2 = self.url(path, generation=kwargs.get("generation"))
-        if start is not None or end is not None:
-            head = {"Range": await self._process_limits(path, start, end)}
-        else:
-            head = {}
+        if start is None:
+            start = 0
+        if end is None:
+            try:
+                end = (await self._info(path))["size"]
+            except Exception:
+                pass
 
-        cache_type = kwargs.get("cache_type")
-        headers, out = await self._call("GET", u2, headers=head, cache_type=cache_type)
-        return out
+        async def _fetch():
+            u2 = self.url(path, generation=kwargs.get("generation"))
+            if start is not None or end is not None:
+                head = {"Range": await self._process_limits(path, start, end)}
+            else:
+                head = {}
+
+            cache_type = kwargs.get("cache_type")
+            headers, out = await self._call(
+                "GET", u2, headers=head, cache_type=cache_type
+            )
+            return out
+
+        return await shared_cached_read(path, start, end, _fetch)
 
     async def _cat_file_concurrent(
         self, path, start=None, end=None, concurrency=DEFAULT_CONCURRENCY, **kwargs
