@@ -11,7 +11,7 @@
 #   - transformers pinned to match a4_v1/launcher.sh so tokenizer/model
 #     loading behavior is identical across the GPU and CPU benchmarks.
 datasets
-fsspec
+fsspec>=2026.6.0
 gcsfs
 lightning>=2.0
 psutil

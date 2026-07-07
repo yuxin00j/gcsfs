@@ -109,7 +109,8 @@ def mock_gcsfs():
 
 
 @mock.patch("gcsfs.zonal_file.asyn.sync")
-def test_zonal_file_generation_kwarg_handling(mock_sync, mock_gcsfs):
+@pytest.mark.asyncio
+async def test_zonal_file_generation_kwarg_handling(mock_sync, mock_gcsfs):
     """Test that ZonalFile explicitly provided generation kwarg is not dropped."""
     from gcsfs.zonal_file import ZonalFile
 
@@ -119,35 +120,34 @@ def test_zonal_file_generation_kwarg_handling(mock_sync, mock_gcsfs):
         gcsfs=mock_gcsfs, path="gs://test-bucket/test-key", mode="rb", generation="456"
     )
 
-    expected_call = mock.call(
-        mock_gcsfs.loop,
-        mock_gcsfs._mrd_pool_cache.get,
+    await zf._ensure_mrd_pool_async()
+
+    mock_gcsfs._mrd_pool_cache.get.assert_awaited_with(
         "test-bucket",
         "test-key",
         "456",
         mock.ANY,
     )
-    assert expected_call in mock_sync.call_args_list
     zf.close()
 
 
 @mock.patch("gcsfs.zonal_file.asyn.sync")
-def test_zonal_file_generation_path_handling(mock_sync, mock_gcsfs):
+@pytest.mark.asyncio
+async def test_zonal_file_generation_path_handling(mock_sync, mock_gcsfs):
     """Test that ZonalFile parses generation from the path when provided."""
     from gcsfs.zonal_file import ZonalFile
 
     mock_gcsfs.split_path.return_value = ("test-bucket", "test-key", "123")
     zf = ZonalFile(gcsfs=mock_gcsfs, path="gs://test-bucket/test-key#123", mode="rb")
 
-    expected_call = mock.call(
-        mock_gcsfs.loop,
-        mock_gcsfs._mrd_pool_cache.get,
+    await zf._ensure_mrd_pool_async()
+
+    mock_gcsfs._mrd_pool_cache.get.assert_awaited_with(
         "test-bucket",
         "test-key",
         "123",
         mock.ANY,
     )
-    assert expected_call in mock_sync.call_args_list
     zf.close()
 
 

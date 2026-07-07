@@ -70,23 +70,8 @@ class ZonalFile(GCSFile):
         self.pool_size = pool_size
         object_size = None
         if "r" in self.mode:
-            self.mrd_pool = asyn.sync(
-                self.gcsfs.loop,
-                self.gcsfs._mrd_pool_cache.get,
-                bucket,
-                key,
-                generation,
-                self.pool_size,
-            )
-            if getattr(self.mrd_pool, "details", None) is not None:
-                self._details = self.mrd_pool.details
-            object_size = self.mrd_pool.persisted_size
-
-            if object_size is None:
-                logger.warning(
-                    "AsyncMultiRangeDownloader (MRD) exists but has no 'persisted_size'. "
-                    "This may result in incorrect behavior for unfinalized objects."
-                )
+            self.mrd_pool = None
+            self._generation = generation
         elif "w" in self.mode or "a" in self.mode:
             pass
         else:
@@ -161,6 +146,20 @@ class ZonalFile(GCSFile):
                 self.flush_interval_bytes,
             )
 
+    async def _ensure_mrd_pool_async(self):
+        if self.mrd_pool is None:
+            bucket, key, _ = self.gcsfs.split_path(self.path)
+            self.mrd_pool = await self.gcsfs._mrd_pool_cache.get(
+                bucket,
+                key,
+                self._generation,
+                self.pool_size,
+            )
+            if getattr(self.mrd_pool, "details", None) is not None:
+                self._details = self.mrd_pool.details
+                if self.size is None:
+                    self.size = self.mrd_pool.persisted_size
+
     def _fetch_range(
         self,
         start: int | None = None,
@@ -218,6 +217,7 @@ class ZonalFile(GCSFile):
 
         # non-prefetch route
         async def _do_fetch():
+            await self._ensure_mrd_pool_async()
             if chunk_lengths is not None:
                 return await self.gcsfs._fetch_range_split(
                     self.path,
@@ -245,6 +245,7 @@ class ZonalFile(GCSFile):
 
     async def _async_fetch_range(self, start_offset, total_size, split_factor=1):
         """The native coroutine called by the BackgroundPrefetcher."""
+        await self._ensure_mrd_pool_async()
         return await self.gcsfs._concurrent_mrd_fetch(
             start_offset, total_size, split_factor, self.mrd_pool, path=self.path
         )
