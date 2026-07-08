@@ -328,3 +328,165 @@ class InfoCache(MutableMapping):
 
     def __iter__(self):
         return iter(list(self._cache))
+
+import random
+import fcntl
+import hashlib
+class CrossProcessBlockCache(BaseCache):
+    """
+    A strictly block-aligned cross-process file cache built on /dev/shm.
+    Aligns reads into chunk blocks (e.g., 5MB) to maximize deduplication across
+    concurrent processes (like PyTorch dataloader workers).
+    Includes probabilistic background LRU eviction to strictly limit RAM usage.
+    """
+    name = "crossprocess_block"
+
+    def __init__(
+        self,
+        blocksize: int,
+        fetcher,
+        size: int,
+        cache_dir: str = "/dev/shm/gcsfs_block_cache",
+        max_size_mb: int = 1024,
+        **kwargs
+    ):
+        super().__init__(blocksize, fetcher, size)
+        
+        if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+            self.cache_dir = cache_dir
+        else:
+            self.cache_dir = "/tmp/gcsfs_block_cache"
+            
+        self.max_size_bytes = max_size_mb * 1024 * 1024
+        
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        path = kwargs.get("path", "unknown_path")
+        self.file_id = hashlib.sha256(path.encode()).hexdigest()
+
+    def _get_block_path(self, block_number: int):
+        return os.path.join(self.cache_dir, f"{self.file_id}_{block_number}")
+
+    def _fetch(self, start: int | None, end: int | None) -> bytes:
+        if start is None:
+            start = 0
+        if end is None:
+            end = self.size
+        if start >= self.size or start >= end:
+            return b""
+            
+        start_block_number = start // self.blocksize
+        end_block_number = (end - 1) // self.blocksize
+        
+        start_pos = start % self.blocksize
+        end_pos = end % self.blocksize
+        if end_pos == 0:
+            end_pos = self.blocksize
+            
+        if start_block_number == end_block_number:
+            block = self._fetch_block_cached(start_block_number)
+            return block[start_pos:end_pos]
+        else:
+            out = [self._fetch_block_cached(start_block_number)[start_pos:]]
+            for b in range(start_block_number + 1, end_block_number):
+                out.append(self._fetch_block_cached(b))
+            out.append(self._fetch_block_cached(end_block_number)[:end_pos])
+            return b"".join(out)
+
+    def _fetch_block_cached(self, block_number: int) -> bytes:
+        block_path = self._get_block_path(block_number)
+        
+        if os.path.exists(block_path):
+            try:
+                os.utime(block_path, None)
+                with open(block_path, "rb") as f:
+                    return f.read()
+            except Exception:
+                pass
+                
+        lock_file = block_path + ".lock"
+        f_lock = None
+        try:
+            try:
+                f_lock = open(lock_file, "w")
+                while True:
+                    try:
+                        fcntl.flock(f_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except (BlockingIOError, IOError):
+                        time.sleep(0.01)
+            except Exception:
+                start = block_number * self.blocksize
+                end = min(start + self.blocksize, self.size)
+                return self.fetcher(start, end)
+                
+            if os.path.exists(block_path):
+                try:
+                    os.utime(block_path, None)
+                    with open(block_path, "rb") as f:
+                        return f.read()
+                except Exception:
+                    pass
+                    
+            start = block_number * self.blocksize
+            end = min(start + self.blocksize, self.size)
+            data = self.fetcher(start, end)
+            
+            try:
+                tmp_path = f"{block_path}.tmp.{os.getpid()}"
+                with open(tmp_path, "wb") as f_tmp:
+                    f_tmp.write(data)
+                os.rename(tmp_path, block_path)
+            except Exception:
+                pass
+            
+            if random.random() < 0.05:
+                self._evict()
+                
+            return data
+        finally:
+            if f_lock:
+                try:
+                    fcntl.flock(f_lock, fcntl.LOCK_UN)
+                    f_lock.close()
+                except Exception:
+                    pass
+
+    def _evict(self):
+        try:
+            if not os.path.exists(self.cache_dir):
+                return
+                
+            files = []
+            total_size = 0
+            for f in os.listdir(self.cache_dir):
+                if f.endswith('.lock') or '.tmp.' in f:
+                    continue
+                full_path = os.path.join(self.cache_dir, f)
+                try:
+                    st = os.stat(full_path)
+                    files.append((st.st_mtime, full_path, st.st_size))
+                    total_size += st.st_size
+                except Exception:
+                    pass
+                    
+            if total_size <= self.max_size_bytes:
+                return
+                
+            files.sort(key=lambda x: x[0])
+            for mtime, path, size in files:
+                try:
+                    os.remove(path)
+                    total_size -= size
+                    if total_size <= self.max_size_bytes:
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+register_cache(CrossProcessBlockCache, clobber=True)
+
