@@ -169,14 +169,15 @@ async def shared_cached_read(path, start, end, fetch_coro):
             try:
                 with open(cache_file, "rb") as f:
                     data = f.read()
-                logger.debug(
-                    f"Multi-process cache hit for {norm_path} range [{start}, {end}]"
+                logger.info(
+                    f"[CUSTOM LOG] Multi-process cache hit for {norm_path} range [{start}, {end}]"
                 )
                 return data
             except Exception:
                 pass  # Fall back to download on read error
 
         # Cache miss: fetch data from backend
+        logger.info(f"[CUSTOM LOG] Multi-process cache miss for {norm_path} range [{start}, {end}], fetching from network")
         data = await fetch_coro()
 
         # Write data to a process-unique temporary cache file and rename atomically
@@ -1294,7 +1295,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
         cache_key = self._get_info_cache_key(path, generation=generation)
         if cache_key in self.infocache:
+            logger.info(f"[CUSTOM LOG] InfoCache hit for {cache_key}")
             return self.infocache[cache_key]
+            
+        logger.info(f"[CUSTOM LOG] InfoCache miss for {cache_key}, fetching from network")
 
         if "/" not in path:
             try:
