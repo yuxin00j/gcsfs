@@ -223,7 +223,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         pid = os.getpid()
         tid = threading.get_ident()
         t0 = time.perf_counter()
-        res = super().info(path, **kwargs)
+        import fsspec.asyn
+        res = fsspec.asyn.sync(self.loop, self._info, path, **kwargs)
         t1 = time.perf_counter()
         logger.info(f"[CUSTOM LOG] info: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
         return res

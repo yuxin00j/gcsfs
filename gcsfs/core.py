@@ -1129,13 +1129,17 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if not path:
                 self.dircache.pop("", None)
 
-            keys_to_delete = [
-                k
-                for k in self.infocache
-                if k == path or k.startswith(f"{path}#") or k.startswith(f"{path}/")
-            ]
-            for k in keys_to_delete:
-                self.infocache.pop(k, None)
+            if hasattr(self.infocache, "invalidate_prefix"):
+                self.infocache.invalidate_prefix(path)
+            else:
+                keys_to_delete = [
+                    k
+                    for k in self.infocache
+                    if k == path or k.startswith(f"{path}#") or k.startswith(f"{path}/")
+                ]
+                for k in keys_to_delete:
+                    self.infocache.pop(k, None)
+                    
             while path:
                 self.dircache.pop(path, None)
                 self.invalidate_info(path)
@@ -1283,15 +1287,19 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 self._get_info_cache_key(path, generation=generation), None
             )
         else:
-            keys_to_delete = [
-                k for k in self.infocache if k == path or k.startswith(f"{path}#")
-            ]
-            for k in keys_to_delete:
-                self.infocache.pop(k, None)
+            if hasattr(self.infocache, "invalidate_prefix"):
+                self.infocache.invalidate_prefix(path)
+            else:
+                keys_to_delete = [
+                    k for k in self.infocache if k == path or k.startswith(f"{path}#")
+                ]
+                for k in keys_to_delete:
+                    self.infocache.pop(k, None)
 
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
         path = self._strip_protocol(path).rstrip("/")
+        print(f"_info called! path={path}")
 
         cache_key = self._get_info_cache_key(path, generation=generation)
         if cache_key in self.infocache:

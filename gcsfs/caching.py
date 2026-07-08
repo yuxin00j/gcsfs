@@ -123,12 +123,15 @@ class ReadAheadChunked(BaseCache):
 register_cache(ReadAheadChunked, clobber=True)
 
 
+import os
+import json
+import urllib.parse
+import threading
+
 class InfoCache(MutableMapping):
     """
     Caching of single-object metadata (e.g., from info() calls).
-
-    Structure:
-        {"key": {"name": "path", "size": 123, "type": "file", ...}, ...}
+    Implemented with a cross-process disk cache (via /dev/shm) and an L1 memory cache.
     """
 
     def __init__(
@@ -143,17 +146,84 @@ class InfoCache(MutableMapping):
         self.info_expiry_time = info_expiry_time
         self.max_paths = max_paths
 
-    def __getitem__(self, item):
-        if self.info_expiry_time is not None:
-            if self._times.get(item, 0) - time.time() < -self.info_expiry_time:
-                self.__delitem__(item)
-                raise KeyError(item)
+        if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK):
+            self.cache_dir = "/dev/shm/gcsfs_info_cache"
+        else:
+            self.cache_dir = "/tmp/gcsfs_info_cache"
+            
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            self.cache_dir = None
 
-        val = self._cache[item]
-        self._cache.move_to_end(item)
-        return val
+    def _get_disk_path(self, key):
+        if not self.cache_dir:
+            return None
+        safe_key = urllib.parse.quote_plus(str(key))
+        if len(safe_key) > 200:
+            import hashlib
+            h = hashlib.sha256(safe_key.encode()).hexdigest()
+            safe_key = safe_key[:150] + "_" + h
+        return os.path.join(self.cache_dir, safe_key + ".json")
+
+    def __getitem__(self, item):
+        # L1 Check
+        if item in self._cache:
+            if self.info_expiry_time is not None:
+                if self._times.get(item, 0) - time.time() < -self.info_expiry_time:
+                    self._cache.pop(item, None)
+                    self._times.pop(item, None)
+                else:
+                    val = self._cache[item]
+                    self._cache.move_to_end(item)
+                    return val
+
+        # L2 Check
+        disk_path = self._get_disk_path(item)
+        if disk_path and os.path.exists(disk_path):
+            if self.info_expiry_time is not None:
+                mtime = os.path.getmtime(disk_path)
+                if time.time() - mtime > self.info_expiry_time:
+                    try:
+                        os.remove(disk_path)
+                    except OSError:
+                        pass
+                    raise KeyError(item)
+            try:
+                with open(disk_path, "r") as f:
+                    val = json.load(f)
+                
+                # Decode datetime fields if they exist
+                import datetime
+                for date_key in ["mtime", "ctime", "timeCreated", "updated", "timeStorageClassUpdated", "timeFinalized"]:
+                    if date_key in val and isinstance(val[date_key], str):
+                        try:
+                            # gcsfs expects datetime objects in UTC
+                            if val[date_key].endswith("+00:00"):
+                                dt_str = val[date_key]
+                            elif val[date_key].endswith("Z"):
+                                dt_str = val[date_key][:-1] + "+00:00"
+                            else:
+                                dt_str = val[date_key]
+                            val[date_key] = datetime.datetime.fromisoformat(dt_str)
+                        except ValueError:
+                            pass
+                            
+                # Promote to L1
+                self._cache[item] = val
+                if self.info_expiry_time is not None:
+                    self._times[item] = os.path.getmtime(disk_path)
+                if self.max_paths and len(self._cache) > self.max_paths:
+                    k, _ = self._cache.popitem(last=False)
+                    self._times.pop(k, None)
+                return val
+            except Exception:
+                pass
+
+        raise KeyError(item)
 
     def __setitem__(self, key, value):
+        print(f"InfoCache __setitem__ called! use_info_cache={self.use_info_cache}, key={key}")
         if not self.use_info_cache:
             return
 
@@ -161,16 +231,58 @@ class InfoCache(MutableMapping):
             self._cache.move_to_end(key)
         self._cache[key] = value
 
+        now = time.time()
         if self.info_expiry_time is not None:
-            self._times[key] = time.time()
+            self._times[key] = now
 
         if self.max_paths and len(self._cache) > self.max_paths:
             k, _ = self._cache.popitem(last=False)
             self._times.pop(k, None)
 
+        # L2 Write
+        disk_path = self._get_disk_path(key)
+        if disk_path:
+            try:
+                tmp_path = f"{disk_path}.tmp.{os.getpid()}_{threading.get_ident()}"
+                with open(tmp_path, "w") as f:
+                    json.dump(value, f, default=str)
+                os.rename(tmp_path, disk_path)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+
     def __delitem__(self, key):
         self._cache.pop(key, None)
         self._times.pop(key, None)
+        disk_path = self._get_disk_path(key)
+        if disk_path:
+            try:
+                os.remove(disk_path)
+            except OSError:
+                pass
+
+    def invalidate_prefix(self, prefix):
+        # L1 Clear
+        keys_to_delete = [
+            k for k in self._cache
+            if k == prefix or k.startswith(f"{prefix}#") or k.startswith(f"{prefix}/")
+        ]
+        for k in keys_to_delete:
+            self._cache.pop(k, None)
+            self._times.pop(k, None)
+            
+        # L2 Clear
+        if self.cache_dir:
+            try:
+                safe_prefix = urllib.parse.quote_plus(prefix)
+                for f_name in os.listdir(self.cache_dir):
+                    if f_name.startswith(safe_prefix):
+                        try:
+                            os.remove(os.path.join(self.cache_dir, f_name))
+                        except OSError:
+                            pass
+            except Exception:
+                pass
 
     def __contains__(self, item):
         try:
@@ -182,6 +294,7 @@ class InfoCache(MutableMapping):
     def clear(self):
         self._cache.clear()
         self._times.clear()
+        # Only clears L1, we leave L2 for other processes unless explicitly invalidated
 
     def __len__(self):
         return len(self._cache)
