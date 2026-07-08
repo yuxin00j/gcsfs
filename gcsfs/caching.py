@@ -1,4 +1,6 @@
-from collections import deque
+import time
+from collections import OrderedDict, deque
+from collections.abc import MutableMapping
 
 from fsspec.caching import BaseCache, register_cache
 
@@ -119,3 +121,70 @@ class ReadAheadChunked(BaseCache):
 
 
 register_cache(ReadAheadChunked, clobber=True)
+
+
+class InfoCache(MutableMapping):
+    """
+    Caching of single-object metadata (e.g., from info() calls).
+
+    Structure:
+        {"key": {"name": "path", "size": 123, "type": "file", ...}, ...}
+    """
+
+    def __init__(
+        self,
+        use_info_cache=True,
+        info_expiry_time=None,
+        max_paths=100000,
+    ):
+        self._cache = OrderedDict()
+        self._times = {}
+        self.use_info_cache = use_info_cache
+        self.info_expiry_time = info_expiry_time
+        self.max_paths = max_paths
+
+    def __getitem__(self, item):
+        if self.info_expiry_time is not None:
+            if self._times.get(item, 0) - time.time() < -self.info_expiry_time:
+                self.__delitem__(item)
+                raise KeyError(item)
+
+        val = self._cache[item]
+        self._cache.move_to_end(item)
+        return val
+
+    def __setitem__(self, key, value):
+        if not self.use_info_cache:
+            return
+
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = value
+
+        if self.info_expiry_time is not None:
+            self._times[key] = time.time()
+
+        if self.max_paths and len(self._cache) > self.max_paths:
+            k, _ = self._cache.popitem(last=False)
+            self._times.pop(k, None)
+
+    def __delitem__(self, key):
+        self._cache.pop(key, None)
+        self._times.pop(key, None)
+
+    def __contains__(self, item):
+        try:
+            self[item]
+            return True
+        except KeyError:
+            return False
+
+    def clear(self):
+        self._cache.clear()
+        self._times.clear()
+
+    def __len__(self):
+        return len(self._cache)
+
+    def __iter__(self):
+        return iter(list(self._cache))

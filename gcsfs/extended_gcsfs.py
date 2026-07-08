@@ -728,6 +728,38 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         return bucket_type in [BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL]
 
+    def _update_dircache_after_rename(self, path1, path2):
+        super()._update_dircache_after_rename(path1, path2)
+        path1 = self._strip_protocol(path1)
+        path2 = self._strip_protocol(path2)
+        source_prefix = f"{path1.rstrip('/')}/"
+        dest_prefix = f"{path2.rstrip('/')}/"
+
+        keys_to_delete = [
+            k
+            for k in self.infocache
+            if k == path1 or k.startswith(f"{path1}#") or k.startswith(source_prefix)
+        ]
+        for k in keys_to_delete:
+            self.infocache.pop(k, None)
+
+        keys_to_delete_dest = [
+            k
+            for k in self.infocache
+            if k == path2 or k.startswith(f"{path2}#") or k.startswith(dest_prefix)
+        ]
+        for k in keys_to_delete_dest:
+            self.infocache.pop(k, None)
+
+    async def _mv_file_cache_update(self, path1, path2, response=None):
+        src_bucket, _, _ = self.split_path(path1)
+        dest_bucket, _, _ = self.split_path(path2)
+
+        await super()._mv_file_cache_update(path1, path2, response)
+        if await self._is_bucket_hns_enabled(src_bucket) and src_bucket == dest_bucket:
+            self.invalidate_info(path1)
+            self.invalidate_info(path2)
+
     async def _mv(self, path1, path2, **kwargs):
         """
         Move a file or directory. Overrides the parent `_mv` to provide an
@@ -975,6 +1007,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 retry=self._get_retry_config(),
                 timeout=STORAGE_CONTROL_RPC_TIMEOUT,
             )
+            self.invalidate_info(path)
             # Instead of invalidating the parent cache, update it to add the new entry.
             self._cache_add_entry(
                 self._parent(path),
@@ -1153,6 +1186,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
 
             # Remove the directory from the cache and from its parent's listing.
+            self.invalidate_info(path)
             self.dircache.pop(path, None)
             # Remove the deleted directory entry from the parent's listing.
             self._cache_drop_entries(self._parent(path), {path})
@@ -1672,6 +1706,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             await zb_hns_utils.close_aaow(writer, finalize_on_close=finalize_on_close)
 
         await self._write_file_cache_update(rpath)
+        self.invalidate_info(rpath)
 
     async def _pipe_file(
         self,
@@ -1745,6 +1780,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             await zb_hns_utils.close_aaow(writer, finalize_on_close=finalize_on_close)
 
         await self._write_file_cache_update(path)
+        self.invalidate_info(path)
 
     async def _get_file_request(
         self, rpath, lpath, *args, headers=None, callback=None, **kwargs

@@ -31,6 +31,7 @@ from fsspec.utils import other_paths, setup_logging, stringify_path
 
 from . import __version__ as version
 from ._dircache import DirCacheUpdater
+from .caching import InfoCache
 from .checkers import get_consistency_checker
 from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
@@ -523,6 +524,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.session_kwargs = session_kwargs or {}
         self.default_location = default_location
         self.version_aware = version_aware
+
+        self.infocache = InfoCache(
+            use_info_cache=kwargs.get("use_info_cache", True),
+            info_expiry_time=kwargs.get("info_expiry_time", None),
+            max_paths=kwargs.get("info_max_paths", 100000),
+        )
 
         if check_connection:
             warnings.warn(
@@ -1115,12 +1122,22 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if path is None:
             logger.debug("invalidate_cache clearing cache")
             self.dircache.clear()
+            self.infocache.clear()
         else:
             path = self._strip_protocol(path).rstrip("/")
             if not path:
                 self.dircache.pop("", None)
+
+            keys_to_delete = [
+                k
+                for k in self.infocache
+                if k == path or k.startswith(f"{path}#") or k.startswith(f"{path}/")
+            ]
+            for k in keys_to_delete:
+                self.infocache.pop(k, None)
             while path:
                 self.dircache.pop(path, None)
+                self.invalidate_info(path)
                 path = self._parent(path)
 
     async def _mkdir(
@@ -1246,18 +1263,50 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         timestamp = timestamp + "0" * (6 - len(timestamp.rsplit(".", 1)[-1]))
         return datetime.fromisoformat(timestamp + "+00:00")
 
+    def _get_info_cache_key(self, path, generation=None, **kwargs):
+        """
+        Derive the key for the info cache incorporating generation.
+        """
+        path = self._strip_protocol(path).rstrip("/")
+        bucket, key, path_generation = self.split_path(path)
+        resolved_generation = _coalesce_generation(generation, path_generation)
+
+        if resolved_generation:
+            return f"{path}#{resolved_generation}"
+        return path
+
+    def invalidate_info(self, path, generation=None):
+        path = self._strip_protocol(path).rstrip("/")
+        if generation is not None:
+            self.infocache.pop(
+                self._get_info_cache_key(path, generation=generation), None
+            )
+        else:
+            keys_to_delete = [
+                k for k in self.infocache if k == path or k.startswith(f"{path}#")
+            ]
+            for k in keys_to_delete:
+                self.infocache.pop(k, None)
+
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
         path = self._strip_protocol(path).rstrip("/")
+
+        cache_key = self._get_info_cache_key(path, generation=generation)
+        if cache_key in self.infocache:
+            return self.infocache[cache_key]
+
         if "/" not in path:
             try:
                 out = await self._call("GET", f"b/{path}", json_out=True)
                 out.update(size=0, type="directory")
+                self.infocache[cache_key] = out
             except OSError:
                 # GET bucket failed, try ls; will have no metadata
                 exists = await self._ls(path)
                 if exists:
                     out = {"name": path, "size": 0, "type": "directory"}
+                    self.infocache[cache_key] = out
                 else:
                     raise FileNotFoundError(path)
             return out
@@ -1272,16 +1321,19 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 if o["name"].rstrip("/") == name and (
                     not generation or o.get("generation") == generation
                 ):
+                    self.infocache[cache_key] = o
                     return o
         if self._ls_from_cache(path):
             # this is a directory
-            return {
+            out = {
                 "bucket": bucket,
                 "name": path,
                 "size": 0,
                 "storageClass": "DIRECTORY",
                 "type": "directory",
             }
+            self.infocache[cache_key] = out
+            return out
 
         async with parallel_tasks_first_completed(
             [
@@ -1294,10 +1346,13 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             try:
                 get_object_res = await get_object_task
                 if not _is_directory_marker(get_object_res):
+                    self.infocache[cache_key] = get_object_res
                     return get_object_res
             except FileNotFoundError:
                 pass
-            return await get_directory_info_task
+            res = await get_directory_info_task
+            self.infocache[cache_key] = res
+            return res
 
     async def _get_directory_info(self, path, bucket, key, generation):
         """
@@ -1526,6 +1581,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             json=i_json,
             json_out=True,
         )
+        self.invalidate_info(path)
         return o_json.get("metadata", {})
 
     setxattrs = asyn.sync_wrapper(_setxattrs)
@@ -1547,6 +1603,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 "destination": {"name": key, "bucket": bucket},
             },
         )
+        self.invalidate_info(path)
 
     merge = asyn.sync_wrapper(_merge)
 
@@ -1648,6 +1705,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 sourceGeneration=g1,
             )
         await self._write_file_cache_update(path2)
+        self.invalidate_info(path2)
+
+    async def _mv_file_cache_update(self, path1, path2, response=None):
+        await super()._mv_file_cache_update(path1, path2, response)
+        self.invalidate_info(path1)
+        self.invalidate_info(path2)
 
     async def _mv_file(self, path1, path2, **kwargs):
         src_bucket, src_key, generation1 = self.split_path(path1)
@@ -1692,6 +1755,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if key:
             await self._call("DELETE", "b/{}/o/{}", bucket, key, generation=generation)
             await self._rm_file_cache_update(path)
+            self.invalidate_info(path, generation)
         else:
             await self._rmdir(path)
 
@@ -1752,6 +1816,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 m = re.search("HTTP/[0-9.]+ ([0-9]+)", response)
                 code = int(m.groups()[0]) if m else None
                 if code in [200, 204]:
+                    self.invalidate_info(path)
                     out.append(path)
                     deleted.append(path)
                 elif code in errs and retry < 5:
@@ -1900,6 +1965,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             checker.validate_json_response(out)
 
         await self._write_file_cache_update(path)
+        self.invalidate_info(path)
         return location
 
     async def _put_file(
@@ -1979,6 +2045,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 checker.validate_json_response(out)
 
             await self._write_file_cache_update(rpath)
+            self.invalidate_info(rpath)
 
     async def _isdir(self, path):
 

@@ -3,6 +3,7 @@ import builtins
 import concurrent.futures
 import io
 import os
+import time
 import uuid
 from builtins import FileNotFoundError
 from datetime import datetime, timezone
@@ -174,6 +175,104 @@ def test_dircache_filled(gcs):
 
     gcs.find(TEST_BUCKET)
     assert len(gcs.dircache)
+
+
+def test_infocache(gcs):
+    # Missing objects should not be cached
+    try:
+        gcs.info(f"{TEST_BUCKET}/doesnotexist")
+    except FileNotFoundError:
+        pass
+    assert f"{TEST_BUCKET}/doesnotexist" not in gcs.infocache
+
+    # Existing object should be cached
+    with gcs.open(f"{TEST_BUCKET}/test_info_cache", "w") as f:
+        f.write("data")
+    assert f"{TEST_BUCKET}/test_info_cache" not in gcs.infocache
+
+    info = gcs.info(f"{TEST_BUCKET}/test_info_cache")
+    assert f"{TEST_BUCKET}/test_info_cache" in gcs.infocache
+    assert gcs.infocache[f"{TEST_BUCKET}/test_info_cache"]["size"] == info["size"]
+
+    # Mutations should invalidate exact object infocache
+    with gcs.open(f"{TEST_BUCKET}/test_info_cache", "w") as f:
+        f.write("more data")
+    assert f"{TEST_BUCKET}/test_info_cache" not in gcs.infocache
+
+    # rm should clear infocache
+    gcs.info(f"{TEST_BUCKET}/test_info_cache")
+    assert f"{TEST_BUCKET}/test_info_cache" in gcs.infocache
+    gcs.rm(f"{TEST_BUCKET}/test_info_cache")
+    assert f"{TEST_BUCKET}/test_info_cache" not in gcs.infocache
+
+
+def test_infocache_ttl(gcs):
+    # Setup infocache with small TTL
+    gcs.infocache.info_expiry_time = 0.1
+
+    with gcs.open(f"{TEST_BUCKET}/test_ttl", "w") as f:
+        f.write("data")
+
+    gcs.info(f"{TEST_BUCKET}/test_ttl")
+    assert f"{TEST_BUCKET}/test_ttl" in gcs.infocache
+
+    time.sleep(0.15)
+
+    # Accessing it should trigger expiration and KeyError (handled by 'in' check returning False)
+    assert f"{TEST_BUCKET}/test_ttl" not in gcs.infocache
+
+
+def test_infocache_lru(gcs):
+    # Setup infocache with small max_paths
+    gcs.infocache.max_paths = 2
+    gcs.infocache.clear()  # Clear to start fresh
+
+    files = [f"{TEST_BUCKET}/lru_{i}" for i in range(4)]
+    for f_path in files:
+        with gcs.open(f_path, "w") as f:
+            f.write("data")
+
+    # Cache first two
+    gcs.info(files[0])
+    gcs.info(files[1])
+    assert files[0] in gcs.infocache
+    assert files[1] in gcs.infocache
+
+    # Cache third, should evict files[0] (LRU)
+    gcs.info(files[2])
+    assert files[2] in gcs.infocache
+    assert files[0] not in gcs.infocache
+    assert files[1] in gcs.infocache
+
+    # Access files[1] to make it MRU
+    gcs.info(files[1])
+
+    # Cache fourth, should evict files[2] (since files[1] was recently accessed)
+    gcs.info(files[3])
+    assert files[3] in gcs.infocache
+    assert files[2] not in gcs.infocache
+    assert files[1] in gcs.infocache
+
+
+def test_infocache_recursive_invalidation(gcs):
+    dir_path = f"{TEST_BUCKET}/test_dir"
+    file_path1 = f"{dir_path}/file1"
+    file_path2 = f"{dir_path}/file2"
+
+    with gcs.open(file_path1, "w") as f:
+        f.write("data")
+    with gcs.open(file_path2, "w") as f:
+        f.write("data")
+
+    gcs.info(file_path1)
+    gcs.info(file_path2)
+    assert file_path1 in gcs.infocache
+    assert file_path2 in gcs.infocache
+
+    # Invalidate directory cache recursively
+    gcs.invalidate_cache(dir_path)
+    assert file_path1 not in gcs.infocache
+    assert file_path2 not in gcs.infocache
 
 
 def test_many_connect(gcs_factory):
