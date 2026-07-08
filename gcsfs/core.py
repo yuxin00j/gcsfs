@@ -1305,66 +1305,81 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if cache_key in self.infocache:
             logger.info(f"[CUSTOM LOG] InfoCache hit for {cache_key}")
             return self.infocache[cache_key]
-            
-        logger.info(f"[CUSTOM LOG] InfoCache miss for {cache_key}, fetching from network")
 
-        if "/" not in path:
-            try:
-                out = await self._call("GET", f"b/{path}", json_out=True)
-                out.update(size=0, type="directory")
-                self.infocache[cache_key] = out
-            except OSError:
-                # GET bucket failed, try ls; will have no metadata
-                exists = await self._ls(path)
-                if exists:
-                    out = {"name": path, "size": 0, "type": "directory"}
+        if hasattr(self.infocache, "lock_key"):
+            cm = self.infocache.lock_key(cache_key)
+        else:
+            import contextlib
+            @contextlib.asynccontextmanager
+            async def _dummy():
+                yield
+            cm = _dummy()
+
+        async with cm:
+            # Re-check the cache inside the lock
+            if cache_key in self.infocache:
+                logger.info(f"[CUSTOM LOG] InfoCache hit for {cache_key} (after lock)")
+                return self.infocache[cache_key]
+                
+            logger.info(f"[CUSTOM LOG] InfoCache miss for {cache_key}, fetching from network")
+
+            if "/" not in path:
+                try:
+                    out = await self._call("GET", f"b/{path}", json_out=True)
+                    out.update(size=0, type="directory")
                     self.infocache[cache_key] = out
-                else:
-                    raise FileNotFoundError(path)
-            return out
-        # Check directory cache for parent dir
-        parent_path = self._parent(path)
-        parent_cache = self._ls_from_cache(parent_path)
-        bucket, key, path_generation = self.split_path(path)
-        generation = _coalesce_generation(generation, path_generation)
-        if parent_cache:
-            name = "/".join((bucket, key))
-            for o in parent_cache:
-                if o["name"].rstrip("/") == name and (
-                    not generation or o.get("generation") == generation
-                ):
-                    self.infocache[cache_key] = o
-                    return o
-        if self._ls_from_cache(path):
-            # this is a directory
-            out = {
-                "bucket": bucket,
-                "name": path,
-                "size": 0,
-                "storageClass": "DIRECTORY",
-                "type": "directory",
-            }
-            self.infocache[cache_key] = out
-            return out
+                except OSError:
+                    # GET bucket failed, try ls; will have no metadata
+                    exists = await self._ls(path)
+                    if exists:
+                        out = {"name": path, "size": 0, "type": "directory"}
+                        self.infocache[cache_key] = out
+                    else:
+                        raise FileNotFoundError(path)
+                return out
+            # Check directory cache for parent dir
+            parent_path = self._parent(path)
+            parent_cache = self._ls_from_cache(parent_path)
+            bucket, key, path_generation = self.split_path(path)
+            generation = _coalesce_generation(generation, path_generation)
+            if parent_cache:
+                name = "/".join((bucket, key))
+                for o in parent_cache:
+                    if o["name"].rstrip("/") == name and (
+                        not generation or o.get("generation") == generation
+                    ):
+                        self.infocache[cache_key] = o
+                        return o
+            if self._ls_from_cache(path):
+                # this is a directory
+                out = {
+                    "bucket": bucket,
+                    "name": path,
+                    "size": 0,
+                    "storageClass": "DIRECTORY",
+                    "type": "directory",
+                }
+                self.infocache[cache_key] = out
+                return out
 
-        async with parallel_tasks_first_completed(
-            [
-                self._get_object(path),
-                self._get_directory_info(path, bucket, key, generation),
-            ]
-        ) as (tasks, done, pending):
-            get_object_task, get_directory_info_task = tasks
+            async with parallel_tasks_first_completed(
+                [
+                    self._get_object(path),
+                    self._get_directory_info(path, bucket, key, generation),
+                ]
+            ) as (tasks, done, pending):
+                get_object_task, get_directory_info_task = tasks
 
-            try:
-                get_object_res = await get_object_task
-                if not _is_directory_marker(get_object_res):
-                    self.infocache[cache_key] = get_object_res
-                    return get_object_res
-            except FileNotFoundError:
-                pass
-            res = await get_directory_info_task
-            self.infocache[cache_key] = res
-            return res
+                try:
+                    get_object_res = await get_object_task
+                    if not _is_directory_marker(get_object_res):
+                        self.infocache[cache_key] = get_object_res
+                        return get_object_res
+                except FileNotFoundError:
+                    pass
+                res = await get_directory_info_task
+                self.infocache[cache_key] = res
+                return res
 
     async def _get_directory_info(self, path, bucket, key, generation):
         """

@@ -1,6 +1,7 @@
 import time
 from collections import OrderedDict, deque
 from collections.abc import MutableMapping
+import contextlib
 
 from fsspec.caching import BaseCache, register_cache
 
@@ -250,6 +251,32 @@ class InfoCache(MutableMapping):
             except Exception as e:
                 import traceback
                 traceback.print_exc()
+
+    @contextlib.asynccontextmanager
+    async def lock_key(self, key):
+        if not self.use_info_cache or not self.cache_dir:
+            yield
+            return
+            
+        disk_path = self._get_disk_path(key)
+        lock_file = disk_path + ".lock"
+        import fcntl
+        import asyncio
+        
+        f = None
+        try:
+            f = open(lock_file, "w")
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, IOError):
+                    await asyncio.sleep(0.01)
+            yield
+        finally:
+            if f:
+                fcntl.flock(f, fcntl.LOCK_UN)
+                f.close()
 
     def __delitem__(self, key):
         self._cache.pop(key, None)

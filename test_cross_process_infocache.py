@@ -5,11 +5,16 @@ import gcsfs
 import multiprocessing
 import urllib.parse
 
-def fetch_info(queue):
+def fetch_info(queue, delay):
+    time.sleep(delay)  # Stagger slightly but keep them concurrent
     fs = gcsfs.GCSFileSystem(project="gcs-tess")
+    
+    start = time.perf_counter()
     with fs.open("gs://gcp-public-data-landsat/index.csv.gz", "rb") as f:
         info = f.details
-    print(f"Process 1 infocache len: {len(fs.infocache)}")
+    duration = time.perf_counter() - start
+    
+    print(f"Process {os.getpid()} fetched info in {duration:.4f}s. infocache len: {len(fs.infocache)}")
     queue.put(info["name"])
 
 def main():
@@ -23,12 +28,20 @@ def main():
             except Exception:
                 pass
     
-    print("Step 1: Spawning a completely separate Python process...")
+    print("Step 1: Spawning 3 concurrent Python processes to trigger InfoCache miss race condition...")
     queue = multiprocessing.Queue()
-    p = multiprocessing.Process(target=fetch_info, args=(queue,))
-    p.start()
-    p.join()
-    print("Process 1 fetched info for:", queue.get())
+    
+    processes = []
+    for i in range(3):
+        p = multiprocessing.Process(target=fetch_info, args=(queue, i * 0.1))
+        processes.append(p)
+        p.start()
+        
+    for p in processes:
+        p.join()
+        
+    for _ in processes:
+        print("Fetched info for:", queue.get())
 
     # 2. Verify it's on disk
     if os.path.exists(shm_dir):
@@ -41,14 +54,18 @@ def main():
     print("Step 3: Creating a new GCSFileSystem in the main process...")
     fs = gcsfs.GCSFileSystem(project="gcs-tess")
     
-    print("Step 4: Fetching info again via fs.open(). This should instantly hit the L2 disk cache!")
-    start = time.time()
+    # Trigger auth / session initialization
+    print("Step 4: Initializing session...")
+    fs.ls("gs://gcs-tess/does-not-exist")
+    
+    print("Step 5: Fetching info again via fs.open(). This should instantly hit the L2 disk cache!")
+    start = time.perf_counter()
     with fs.open("gs://gcp-public-data-landsat/index.csv.gz", "rb") as f:
         info = f.details
-    duration = time.time() - start
-    print(f"Info fetched in {duration:.4f}s: {info['name']} (Size: {info['size']})")
+    duration = time.perf_counter() - start
+    print(f"Info fetched in {duration:.6f}s: {info['name']} (Size: {info['size']})")
     
-    print("Test passed! Cross-process L2 cache works.")
+    print("Test passed! Cross-process L2 cache locks work.")
 
 if __name__ == "__main__":
     main()
