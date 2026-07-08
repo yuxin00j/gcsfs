@@ -177,8 +177,11 @@ async def shared_cached_read(path, start, end, fetch_coro):
                 pass  # Fall back to download on read error
 
         # Cache miss: fetch data from backend
-        logger.info(f"[CUSTOM LOG] Multi-process cache miss for {norm_path} range [{start}, {end}], fetching from network")
+        import time
+        start_fetch_time = time.time()
         data = await fetch_coro()
+        fetch_latency = time.time() - start_fetch_time
+        logger.info(f"[CUSTOM LOG] Multi-process cache miss for {norm_path} range [{start}, {end}], fetching from network. Latency: {fetch_latency:.3f}s")
 
         # Write data to a process-unique temporary cache file and rename atomically
         temp_task_id = id(asyncio.current_task()) if asyncio.current_task() else 0
@@ -1305,6 +1308,16 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if cache_key in self.infocache:
             logger.info(f"[CUSTOM LOG] InfoCache hit for {cache_key}")
             return self.infocache[cache_key]
+            
+        import time
+        start_time = time.time()
+        try:
+            return await self._info_fetch(path, cache_key, generation, **kwargs)
+        finally:
+            latency = time.time() - start_time
+            logger.info(f"[CUSTOM LOG] InfoCache miss for {cache_key}, fetching from network. Latency: {latency:.3f}s")
+
+    async def _info_fetch(self, path, cache_key, generation=None, **kwargs):
 
         if hasattr(self.infocache, "lock_key"):
             cm = self.infocache.lock_key(cache_key)
