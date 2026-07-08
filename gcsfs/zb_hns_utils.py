@@ -6,6 +6,7 @@ import ctypes
 import logging
 import os
 import threading
+import time
 import weakref
 from io import BytesIO
 
@@ -44,10 +45,16 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
+    pid = os.getpid()
+    tid = threading.get_ident()
+    t0 = time.perf_counter()
     try:
-        return await AsyncMultiRangeDownloader.create_mrd(
+        res = await AsyncMultiRangeDownloader.create_mrd(
             grpc_client, bucket_name, object_name, generation
         )
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] init_mrd: {bucket_name}/{object_name}, pid={pid}, tid={tid}, generation={generation}, duration={t1-t0:.6f}s")
+        return res
     except NotFound:
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.
