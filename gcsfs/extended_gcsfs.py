@@ -153,6 +153,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         )
 
     async def _get_threshold_for_disk_reads(self, bucket):
+        if await self._is_zonal_bucket(bucket):
+            return (
+                5 * 1024 * 1024
+            )  # Thanks to our in house, zero copy DirectMemmoveBuffer
         return await super()._get_threshold_for_disk_reads(bucket)
 
     @staticmethod
