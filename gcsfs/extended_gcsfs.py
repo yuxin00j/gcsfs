@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
+import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -47,11 +49,33 @@ class BucketType(Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class LoggingGCSFile(GCSFile):
+    def read(self, length=-1):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
+        res = super().read(length)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, duration={t1-t0:.6f}s")
+        return res
+
+
+class LoggingZonalFile(ZonalFile):
+    def read(self, length=-1):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
+        res = super().read(length)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, duration={t1-t0:.6f}s")
+        return res
+
+
 gcs_file_types = {
-    BucketType.ZONAL_HIERARCHICAL: ZonalFile,
-    BucketType.NON_HIERARCHICAL: GCSFile,
-    BucketType.HIERARCHICAL: GCSFile,
-    BucketType.UNKNOWN: GCSFile,
+    BucketType.ZONAL_HIERARCHICAL: LoggingZonalFile,
+    BucketType.NON_HIERARCHICAL: LoggingGCSFile,
+    BucketType.HIERARCHICAL: LoggingGCSFile,
+    BucketType.UNKNOWN: LoggingGCSFile,
 }
 
 
@@ -114,6 +138,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             - retry_multiplier: Multiplier for delay between retries.
             These map to `google.api_core.retry.AsyncRetry` arguments (without 'retry_' prefix).
         """
+        t0 = time.perf_counter()
         valid_keys = DEFAULT_RETRY_CONFIG.keys()
         self.retry_config = {
             k[6:]: v
@@ -152,6 +177,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self._mrd_pool_cache,
         )
 
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] ExtendedGcsFileSystem initialized: pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+
     async def _get_threshold_for_disk_reads(self, bucket):
         if await self._is_zonal_bucket(bucket):
             return (
@@ -179,6 +209,24 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 asyn.sync(asyn.loop[0], cache.close, timeout=5.0)
             except fsspec.FSTimeoutError:
                 pass
+
+    def glob(self, path, **kwargs):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
+        res = super().glob(path, **kwargs)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] glob: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
+
+    def info(self, path, **kwargs):
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
+        res = super().info(path, **kwargs)
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] info: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
     @property
     def _user_project(self):
@@ -335,10 +383,13 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         Open a file.
         """
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
         bucket, _, _ = self.split_path(path)
         bucket_type = self._sync_lookup_bucket_type(bucket)
 
-        return gcs_file_types[bucket_type](
+        res = gcs_file_types[bucket_type](
             self,
             path,
             mode,
@@ -353,6 +404,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             finalize_on_close=kwargs.pop("finalize_on_close", self.finalize_on_close),
             **kwargs,
         )
+        t1 = time.perf_counter()
+        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        return res
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
     async def _process_limits_to_offset_and_length(
@@ -426,6 +480,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         Delegates concurrent fetching of individual chunks directly to `_cat_file`.
         """
+        pid = os.getpid()
+        tid = threading.get_ident()
+        t0 = time.perf_counter()
+
         file_size = size or await _get_mrd_size(mrd)
         if file_size is None:
             logger.warning(
@@ -464,10 +522,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                             start=current_offset,
                             end=end_offset,
                             mrd=mrd,
-                            # Distribute the concurrency budget proportionally.
-                            # Since these outer tasks are already concurrent, this is typically 1.
-                            # However, if a large chunk dominates the total size, it receives
-                            # higher concurrency to prevent it from becoming a bottleneck.
                             concurrency=max(
                                 1, length * concurrency // sum(chunk_lengths)
                             ),
@@ -484,6 +538,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 if isinstance(res, Exception):
                     raise res
 
+            t1 = time.perf_counter()
+            logger.info(f"[CUSTOM LOG] _fetch_range_split: {path}, pid={pid}, tid={tid}, start={start}, chunk_lengths={chunk_lengths}, duration={t1-t0:.6f}s")
             return results
         except BaseException:
             for t in tasks:
