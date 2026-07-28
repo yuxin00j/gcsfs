@@ -181,6 +181,25 @@ def _is_directory_marker(entry):
     return entry["size"] == 0 and entry["name"].endswith("/")
 
 
+def _download_chunk_mp(rpath, lpath, start, end, fs):
+    import os
+
+    if hasattr(fs, "cat_file"):
+        data = fs.cat_file(rpath, start=start, end=end)
+    else:
+        import fsspec
+
+        data = fsspec.asyn.sync(fs.loop, fs._cat_file, rpath, start=start, end=end)
+    if not data:
+        return 0
+    fd = os.open(lpath, os.O_WRONLY)
+    try:
+        os.pwrite(fd, data, start)
+    finally:
+        os.close(fd)
+    return len(data)
+
+
 class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     r"""
     Connect to Google Cloud Storage.
@@ -2152,7 +2171,54 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if os.path.isdir(lpath):
             return
 
+        use_multiprocessing = kwargs.pop("multiprocessing", False)
         callback = callback or NoOpCallback()
+
+        if use_multiprocessing:
+            import multiprocessing as mp
+
+            try:
+                cpu_count = mp.cpu_count()
+            except NotImplementedError:
+                cpu_count = 4
+
+            # Standard workload logic for non-BIDI environments
+            default_concurrency = 8 if cpu_count >= 8 else 4
+            default_chunk_size = 5 * 1024 * 1024  # 5 MiB
+
+            concurrency = kwargs.pop("concurrency", default_concurrency)
+            chunk_size = kwargs.pop("chunk_size", default_chunk_size)
+
+            info = await self._info(rpath, **kwargs)
+            size = info.get("size", 0)
+
+            lparent = os.path.dirname(lpath) or os.curdir
+            os.makedirs(lparent, exist_ok=True)
+            with open(lpath, "wb") as f:
+                f.truncate(size)
+
+            callback.set_size(size)
+
+            from concurrent.futures import ProcessPoolExecutor
+            import asyncio
+
+            ctx = mp.get_context("spawn")
+            loop = asyncio.get_running_loop()
+
+            tasks = []
+            with ProcessPoolExecutor(max_workers=concurrency, mp_context=ctx) as pool:
+                for offset in range(0, size, chunk_size):
+                    end = min(offset + chunk_size, size)
+                    tasks.append(
+                        loop.run_in_executor(
+                            pool, _download_chunk_mp, rpath, lpath, offset, end, self
+                        )
+                    )
+
+                for fut in asyncio.as_completed(tasks):
+                    res = await fut
+                    callback.relative_update(res)
+            return
 
         concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)
         chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)

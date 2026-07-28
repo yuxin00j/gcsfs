@@ -339,15 +339,17 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
         bucket, key, _ = self.split_path(rpath)
-        use_multiprocessing = kwargs.pop("multiprocessing", False)
+        use_multiprocessing = kwargs.get("multiprocessing", False)
 
         is_zonal = await self._is_zonal_bucket(bucket)
 
-        if not use_multiprocessing:
+        if not use_multiprocessing or not is_zonal:
             return await super()._get_file(rpath, lpath, callback=callback, **kwargs)
 
         if os.path.isdir(lpath):
             return
+            
+        kwargs.pop("multiprocessing", None)  # Consume for local usage
 
         import multiprocessing as mp
         try:
@@ -355,15 +357,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         except NotImplementedError:
             cpu_count = 4
 
-        if is_zonal:
-            # Zonal buckets represent our BIDI workloads (gRPC native interaction)
-            # We clamp max processes to 16 for single files and chunk size to 1 GiB
-            default_concurrency = min(cpu_count, 16)
-            default_chunk_size = 1024 * 1024 * 1024  # 1 GiB
-        else:
-            # Standard workload logic for non-BIDI environments
-            default_concurrency = 8 if cpu_count >= 8 else 4
-            default_chunk_size = 5 * 1024 * 1024  # 5 MiB
+        # Zonal buckets represent our BIDI workloads (gRPC native interaction)
+        # We clamp max processes to 16 for single files and chunk size to 1 GiB
+        default_concurrency = min(cpu_count, 16)
+        default_chunk_size = 1024 * 1024 * 1024  # 1 GiB
 
         concurrency = kwargs.pop("concurrency", default_concurrency)
         chunk_size = kwargs.pop("chunk_size", default_chunk_size)
