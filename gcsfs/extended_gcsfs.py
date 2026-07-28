@@ -343,7 +343,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         is_zonal = await self._is_zonal_bucket(bucket)
 
-        if not use_multiprocessing or not is_zonal:
+        if not use_multiprocessing:
             return await super()._get_file(rpath, lpath, callback=callback, **kwargs)
 
         if os.path.isdir(lpath):
@@ -355,10 +355,15 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         except NotImplementedError:
             cpu_count = 4
 
-        # Zonal buckets represent our BIDI workloads (gRPC native interaction)
-        # We clamp max processes to 16 for single files and chunk size to 1 GiB
-        default_concurrency = min(cpu_count, 16)
-        default_chunk_size = 1024 * 1024 * 1024  # 1 GiB
+        if is_zonal:
+            # Zonal buckets represent our BIDI workloads (gRPC native interaction)
+            # We clamp max processes to 16 for single files and chunk size to 1 GiB
+            default_concurrency = min(cpu_count, 16)
+            default_chunk_size = 1024 * 1024 * 1024  # 1 GiB
+        else:
+            # Standard workload logic for non-BIDI environments
+            default_concurrency = 8 if cpu_count >= 8 else 4
+            default_chunk_size = 5 * 1024 * 1024  # 5 MiB
 
         concurrency = kwargs.pop("concurrency", default_concurrency)
         chunk_size = kwargs.pop("chunk_size", default_chunk_size)
