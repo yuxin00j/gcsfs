@@ -341,14 +341,27 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         bucket, key, _ = self.split_path(rpath)
         use_multiprocessing = kwargs.pop("multiprocessing", False)
 
-        if not use_multiprocessing or not await self._is_zonal_bucket(bucket):
+        is_zonal = await self._is_zonal_bucket(bucket)
+
+        if not use_multiprocessing or not is_zonal:
             return await super()._get_file(rpath, lpath, callback=callback, **kwargs)
 
         if os.path.isdir(lpath):
             return
 
-        concurrency = kwargs.pop("concurrency", zb_hns_utils.DEFAULT_CONCURRENCY)
-        chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
+        import multiprocessing as mp
+        try:
+            cpu_count = mp.cpu_count()
+        except NotImplementedError:
+            cpu_count = 4
+
+        # Zonal buckets represent our BIDI workloads (gRPC native interaction)
+        # We clamp max processes to 16 for single files and chunk size to 1 GiB
+        default_concurrency = min(cpu_count, 16)
+        default_chunk_size = 1024 * 1024 * 1024  # 1 GiB
+
+        concurrency = kwargs.pop("concurrency", default_concurrency)
+        chunk_size = kwargs.pop("chunk_size", default_chunk_size)
 
         callback = callback or NoOpCallback()
         info = await self._info(rpath, **kwargs)
@@ -361,7 +374,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         callback.set_size(size)
 
-        import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
         import asyncio
 
