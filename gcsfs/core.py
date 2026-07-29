@@ -2206,7 +2206,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             loop = asyncio.get_running_loop()
 
             tasks = []
-            with ProcessPoolExecutor(max_workers=concurrency, mp_context=ctx) as pool:
+            pool = ProcessPoolExecutor(max_workers=concurrency, mp_context=ctx)
+            try:
                 for offset in range(0, size, chunk_size):
                     end = min(offset + chunk_size, size)
                     tasks.append(
@@ -2218,6 +2219,17 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 for fut in asyncio.as_completed(tasks):
                     res = await fut
                     callback.relative_update(res)
+            except BaseException:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                raise
+            finally:
+                import sys
+                if sys.version_info >= (3, 9):
+                    pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    pool.shutdown(wait=False)
             return
 
         concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)

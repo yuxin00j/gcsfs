@@ -29,7 +29,7 @@ from gcsfs import __version__ as version
 from gcsfs import zb_hns_utils
 from gcsfs._dircache import HnsDirCacheUpdater
 from gcsfs.concurrency import split_range
-from gcsfs.core import GCSFile, GCSFileSystem
+from gcsfs.core import GCSFile, GCSFileSystem, _download_chunk_mp
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -78,25 +78,6 @@ async def _get_mrd_size(mrd_or_pool):
         return None
     async with _get_mrd_from_pool_or_mrd(mrd_or_pool) as m:
         return m.persisted_size
-
-
-def _download_chunk_mp(rpath, lpath, start, end, fs):
-    import os
-
-    if hasattr(fs, "cat_file"):
-        data = fs.cat_file(rpath, start=start, end=end)
-    else:
-        import fsspec
-
-        data = fsspec.asyn.sync(fs.loop, fs._cat_file, rpath, start=start, end=end)
-    if not data:
-        return 0
-    fd = os.open(lpath, os.O_WRONLY)
-    try:
-        os.pwrite(fd, data, start)
-    finally:
-        os.close(fd)
-    return len(data)
 
 
 class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
@@ -383,7 +364,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         loop = asyncio.get_running_loop()
 
         tasks = []
-        with ProcessPoolExecutor(max_workers=concurrency, mp_context=ctx) as pool:
+        pool = ProcessPoolExecutor(max_workers=concurrency, mp_context=ctx)
+        try:
             for offset in range(0, size, chunk_size):
                 end = min(offset + chunk_size, size)
                 tasks.append(
@@ -395,6 +377,17 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             for fut in asyncio.as_completed(tasks):
                 res = await fut
                 callback.relative_update(res)
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            raise
+        finally:
+            import sys
+            if sys.version_info >= (3, 9):
+                pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                pool.shutdown(wait=False)
 
     def _open(
         self,
