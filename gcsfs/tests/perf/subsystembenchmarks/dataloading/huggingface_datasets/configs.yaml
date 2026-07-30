@@ -21,17 +21,6 @@ scenarios:
   - name: "read"
     scenario: "read"
     variants:
-      - {axis: "access", access: "sequential"}
-
-      - {axis: "shuffle_split", max_buffer_input_shards: 8}
-
-      - {axis: "workers", num_workers: 0}
-
-      - {axis: "format", fmt: "pretok_parquet"}
-      - {axis: "format", fmt: "pretok_jsonl"}
-
-      - {axis: "climbmix", fmt: "pretok_jsonl", file_count: 100, rows_per_file: 6988}
-
-      - {axis: "scale", file_count: 512, rows_per_file: 1365}
-
-      - {axis: "prefetch", prefetch_factor: 4}
+      - {axis: "shuffle_split", max_buffer_input_shards: 4, shuffle_buffer_size: 10000}
+      - {axis: "shuffle_split", max_buffer_input_shards: 10, shuffle_buffer_size: 1000}
+      - {axis: "shuffle_split", max_buffer_input_shards: 2, shuffle_buffer_size: 10000}
