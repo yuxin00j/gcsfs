@@ -17,7 +17,7 @@ class HFReadParameters(ReadParameters):
 
     def _id_extra_tokens(self):
         if self.access == "shuffled" and self.max_buffer_input_shards:
-            return [f"mbis{self.max_buffer_input_shards}"]
+            return [f"mbis{self.max_buffer_input_shards}", f"buf{self.shuffle_buffer_size}"]
         return []
 
     def extra_columns(self):
