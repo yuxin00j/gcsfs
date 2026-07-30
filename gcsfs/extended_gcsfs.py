@@ -54,9 +54,11 @@ class LoggingGCSFile(GCSFile):
         pid = os.getpid()
         tid = threading.get_ident()
         t0 = time.perf_counter()
+        start_time = time.time()
         res = super().read(length)
+        end_time = time.time()
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, duration={t1-t0:.6f}s")
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
         return res
 
 
@@ -65,9 +67,11 @@ class LoggingZonalFile(ZonalFile):
         pid = os.getpid()
         tid = threading.get_ident()
         t0 = time.perf_counter()
+        start_time = time.time()
         res = super().read(length)
+        end_time = time.time()
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, duration={t1-t0:.6f}s")
+        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
         return res
 
 
@@ -386,6 +390,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         pid = os.getpid()
         tid = threading.get_ident()
         t0 = time.perf_counter()
+        start_time = time.time()
         bucket, _, _ = self.split_path(path)
         bucket_type = self._sync_lookup_bucket_type(bucket)
 
@@ -404,8 +409,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             finalize_on_close=kwargs.pop("finalize_on_close", self.finalize_on_close),
             **kwargs,
         )
+        end_time = time.time()
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}, duration={t1-t0:.6f}s")
+        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
         return res
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
