@@ -21,6 +21,5 @@ scenarios:
   - name: "read"
     scenario: "read"
     variants:
-      - {axis: "shuffle_split", max_buffer_input_shards: 4, shuffle_buffer_size: 10000}
-      - {axis: "shuffle_split", max_buffer_input_shards: 10, shuffle_buffer_size: 1000}
       - {axis: "shuffle_split", max_buffer_input_shards: 2, shuffle_buffer_size: 10000}
+      - {axis: "shuffle_split", max_buffer_input_shards: 4, shuffle_buffer_size: 10000}
