@@ -58,7 +58,7 @@ class LoggingGCSFile(GCSFile):
         res = super().read(length)
         end_time = time.time()
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
+        print(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
         return res
 
 
@@ -71,7 +71,7 @@ class LoggingZonalFile(ZonalFile):
         res = super().read(length)
         end_time = time.time()
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
+        print(f"[CUSTOM LOG] read: {self.path}, pid={pid}, tid={tid}, length={length}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
         return res
 
 
@@ -411,7 +411,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         )
         end_time = time.time()
         t1 = time.perf_counter()
-        logger.info(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
+        print(f"[CUSTOM LOG] open: {path}, pid={pid}, tid={tid}, start_time={start_time:.6f}, end_time={end_time:.6f}, duration={t1-t0:.6f}s")
         return res
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
