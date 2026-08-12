@@ -194,7 +194,15 @@ def _download_chunk_mp(rpath, lpath, start, end, fs):
         return 0
     fd = os.open(lpath, os.O_WRONLY)
     try:
-        os.pwrite(fd, data, start)
+        if hasattr(os, "pwrite"):
+            os.pwrite(fd, data, start)
+        else:
+            # Fallback for Windows
+            import threading
+            _L = threading.Lock()
+            with _L:
+                os.lseek(fd, start, os.SEEK_SET)
+                os.write(fd, data)
     finally:
         os.close(fd)
     return len(data)
