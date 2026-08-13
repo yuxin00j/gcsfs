@@ -2169,36 +2169,68 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if check_consistency:
             checker.validate_json_response(details)
 
+
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
         if os.path.isdir(lpath):
             return
 
         callback = callback or NoOpCallback()
+        
+        # Async IO multi-thread defaults
+        concurrency = kwargs.pop("concurrency", 16)
+        chunk_size = kwargs.pop("chunk_size", 32 * 1024 * 1024)
 
-        concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)
-        chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
-        max_prefetch_size = kwargs.pop(
-            "max_prefetch_size", 2 * concurrency * chunk_size
-        )
+        details = await self._info(rpath, **kwargs)
+        total_size = details.get("size", 0)
+        callback.set_size(total_size)
 
-        try:
-            # The concurrent path uses `_cat_file` to interact with gcsfs which doesn't take headers as argument.
-            if concurrency > 1 and "headers" not in kwargs:
-                await self._get_file_concurrent(
-                    rpath,
-                    lpath,
-                    concurrency,
-                    callback=callback,
-                    chunk_size=chunk_size,
-                    max_prefetch_size=max_prefetch_size,
-                    **kwargs,
-                )
+        lparent = os.path.dirname(lpath) or os.curdir
+        os.makedirs(lparent, exist_ok=True)
+        with open(lpath, "wb") as f:
+            f.truncate(total_size)
+
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        
+        # Use ThreadPoolExecutor mapped into asyncio to fetch and write without dropping GIL
+        loop = asyncio.get_event_loop()
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        fallback_lock = threading.Lock()
+        
+        fd = None
+        if hasattr(os, "pwrite"):
+            fd = os.open(lpath, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+
+        def fetch_chunk_sync(start):
+            end = min(start + chunk_size, total_size)
+            # Fetch directly utilizing the synchronous API
+            data = self.cat_file(rpath, start=start, end=end)
+            
+            if fd is not None:
+                written = 0
+                chunk_view = memoryview(data)
+                while written < len(data):
+                    written += os.pwrite(fd, chunk_view[written:], start + written)
             else:
-                await self._get_file_request(rpath, lpath, callback=callback, **kwargs)
-        except BaseException:
-            if os.path.exists(lpath):
-                os.remove(lpath)
-            raise
+                with fallback_lock:
+                    with open(lpath, "rb+") as f:
+                        f.seek(start)
+                        f.write(data)
+            
+            callback.relative_update(len(data))
+            return len(data)
+
+        # Run synchronous fetches inside executor 
+        futures = []
+        for start in range(0, total_size, chunk_size):
+            futures.append(loop.run_in_executor(executor, fetch_chunk_sync, start))
+        
+        if futures:
+            await asyncio.gather(*futures)
+
+        if fd is not None:
+            os.close(fd)
 
     def _open(
         self,
