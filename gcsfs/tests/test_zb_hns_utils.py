@@ -1379,3 +1379,79 @@ def test_direct_memmove_buffer_pypy_fallback():
     assert isinstance(buf._result_bytes, bytearray)
 
     executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_acquire_init_mrd_slot_basic():
+    """Tests that acquire_init_mrd_slot acquires and releases cleanly."""
+    async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=4):
+        # In critical section
+        pass
+
+
+@pytest.mark.asyncio
+async def test_acquire_init_mrd_slot_disabled():
+    """Tests that acquire_init_mrd_slot is a no-op when max_concurrency <= 0."""
+    async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=0):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_acquire_init_mrd_slot_concurrency_limiting():
+    """Tests that acquire_init_mrd_slot limits concurrency across tasks."""
+    max_concurrency = 2
+    active_count = 0
+    max_active = 0
+
+    async def worker():
+        nonlocal active_count, max_active
+        async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=max_concurrency):
+            active_count += 1
+            max_active = max(max_active, active_count)
+            await asyncio.sleep(0.02)
+            active_count -= 1
+
+    tasks = [asyncio.create_task(worker()) for _ in range(6)]
+    await asyncio.gather(*tasks)
+
+    assert max_active <= max_concurrency
+
+
+def _mp_lock_worker(max_concurrency, active_counter, max_observed, lock):
+    import time
+    async def _run():
+        async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=max_concurrency):
+            with lock:
+                active_counter.value += 1
+                if active_counter.value > max_observed.value:
+                    max_observed.value = active_counter.value
+            await asyncio.sleep(0.05)
+            with lock:
+                active_counter.value -= 1
+    asyncio.run(_run())
+
+
+def test_acquire_init_mrd_slot_multiprocess():
+    """Tests that acquire_init_mrd_slot limits concurrency across OS processes."""
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    max_concurrency = 3
+    active_counter = ctx.Value("i", 0)
+    max_observed = ctx.Value("i", 0)
+    lock = ctx.Lock()
+
+    processes = [
+        ctx.Process(
+            target=_mp_lock_worker,
+            args=(max_concurrency, active_counter, max_observed, lock),
+        )
+        for _ in range(8)
+    ]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
+
+    assert max_observed.value <= max_concurrency
+
+

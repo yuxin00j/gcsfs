@@ -5,9 +5,16 @@ import contextlib
 import ctypes
 import logging
 import os
+import random
+import tempfile
 import threading
 import weakref
 from io import BytesIO
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from google.api_core.exceptions import NotFound
 from google.cloud.storage.asyncio.async_appendable_object_writer import (
@@ -23,8 +30,68 @@ try:
     DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "4"))
 except ValueError:
     DEFAULT_CONCURRENCY = 4
+try:
+    DEFAULT_INIT_MRD_CONCURRENCY = int(
+        os.environ.get("GCSFS_MAX_CONCURRENT_INIT_MRD", "16")
+    )
+except ValueError:
+    DEFAULT_INIT_MRD_CONCURRENCY = 16
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
+
+
+@contextlib.asynccontextmanager
+async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+    """
+    Acquires a cross-process lock slot to rate-limit concurrent init_mrd calls.
+    Allows at most max_concurrency processes/threads to perform init_mrd concurrently.
+    """
+    if max_concurrency <= 0 or fcntl is None:
+        yield
+        return
+
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+
+    start_idx = random.randint(0, max_concurrency - 1)
+    attempt = 0
+
+    while True:
+        for i in range(max_concurrency):
+            slot = (start_idx + i) % max_concurrency
+            lock_path = os.path.join(lock_dir, f"gcsfs_init_mrd_{uid}_{slot}.lock")
+            fd = None
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                continue
+
+            # Successfully acquired slot lock
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return
+
+        # All slots currently in use; back off with jitter before next sweep
+        attempt += 1
+        sleep_time = min(
+            0.001 * (1.2 ** min(attempt, 20)) + random.uniform(0.0005, 0.002), 0.05
+        )
+        await asyncio.sleep(sleep_time)
 
 
 try:
@@ -46,11 +113,13 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     """
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
+    Rate-limited across processes via acquire_init_mrd_slot.
     """
     try:
-        return await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation
-        )
+        async with acquire_init_mrd_slot():
+            return await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
     except NotFound:
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.
