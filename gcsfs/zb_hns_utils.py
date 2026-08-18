@@ -32,10 +32,10 @@ except ValueError:
     DEFAULT_CONCURRENCY = 4
 try:
     DEFAULT_INIT_MRD_CONCURRENCY = int(
-        os.environ.get("GCSFS_MAX_CONCURRENT_INIT_MRD", "16")
+        os.environ.get("GCSFS_MAX_CONCURRENT_INIT_MRD", "14")
     )
 except ValueError:
-    DEFAULT_INIT_MRD_CONCURRENCY = 16
+    DEFAULT_INIT_MRD_CONCURRENCY = 14
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
