@@ -10,6 +10,7 @@ import tempfile
 import threading
 import weakref
 from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import fcntl
@@ -40,6 +41,19 @@ MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
 
+_lock_fds: dict = {}
+_slot_in_use: set = set()
+
+
+def _get_slot_fd(slot: int, lock_dir: str, uid: Any) -> int:
+    global _lock_fds
+    if slot not in _lock_fds:
+        lock_path = os.path.join(lock_dir, f"gcsfs_init_mrd_{uid}_{slot}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        _lock_fds[slot] = fd
+    return _lock_fds[slot]
+
+
 @contextlib.asynccontextmanager
 async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
     """
@@ -59,17 +73,14 @@ async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
     while True:
         for i in range(max_concurrency):
             slot = (start_idx + i) % max_concurrency
-            lock_path = os.path.join(lock_dir, f"gcsfs_init_mrd_{uid}_{slot}.lock")
-            fd = None
+            if slot in _slot_in_use:
+                continue
+            _slot_in_use.add(slot)
             try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+                fd = _get_slot_fd(slot, lock_dir, uid)
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (BlockingIOError, OSError):
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+                _slot_in_use.discard(slot)
                 continue
 
             # Successfully acquired slot lock
@@ -80,17 +91,12 @@ async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
                     fcntl.flock(fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                _slot_in_use.discard(slot)
             return
 
         # All slots currently in use; back off with jitter before next sweep
         attempt += 1
-        sleep_time = min(
-            0.001 * (1.2 ** min(attempt, 20)) + random.uniform(0.0005, 0.002), 0.05
-        )
+        sleep_time = min(0.001 + random.uniform(0.0005, 0.002) * min(attempt, 5), 0.01)
         await asyncio.sleep(sleep_time)
 
 

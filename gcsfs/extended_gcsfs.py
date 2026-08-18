@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import tempfile
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -275,6 +276,20 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     async def _lookup_bucket_type(self, bucket):
         if bucket in self._storage_layout_cache:
             return self._storage_layout_cache[bucket]
+
+        # Fast path: check cross-process cache in temp directory
+        try:
+            cache_file = os.path.join(tempfile.gettempdir(), f"gcsfs_layout_{bucket}.txt")
+            if os.path.exists(cache_file):
+                with open(cache_file, "r") as f:
+                    val = f.read().strip()
+                for bt in BucketType:
+                    if bt.value == val or bt.name == val:
+                        self._storage_layout_cache[bucket] = bt
+                        return bt
+        except Exception:
+            pass
+
         bucket_type = await self._get_bucket_type(bucket)
         # Don't cache UNKNOWN type.
         # This ensures that subsequent operations will retry the lookup,
@@ -282,6 +297,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         if bucket_type == BucketType.UNKNOWN:
             return bucket_type
         self._storage_layout_cache[bucket] = bucket_type
+        try:
+            cache_file = os.path.join(tempfile.gettempdir(), f"gcsfs_layout_{bucket}.txt")
+            with open(cache_file, "w") as f:
+                f.write(bucket_type.value if hasattr(bucket_type, "value") else str(bucket_type))
+        except Exception:
+            pass
         return self._storage_layout_cache[bucket]
 
     _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
