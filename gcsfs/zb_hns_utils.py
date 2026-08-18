@@ -109,17 +109,46 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+_channel_warmed = False
+_channel_warm_lock = None
+
+
+async def _ensure_channel_warmed(
+    grpc_client, bucket_name, object_name, generation=None
+):
+    global _channel_warmed, _channel_warm_lock
+    if _channel_warmed:
+        return None
+    if _channel_warm_lock is None:
+        _channel_warm_lock = asyncio.Lock()
+    async with _channel_warm_lock:
+        if _channel_warmed:
+            return None
+        async with acquire_init_mrd_slot():
+            mrd = await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
+            _channel_warmed = True
+            return mrd
+
+
 async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     """
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
-    Rate-limited across processes via acquire_init_mrd_slot.
+    Rate-limits only the first connection / ALTS handshake per process.
     """
+    global _channel_warmed
     try:
-        async with acquire_init_mrd_slot():
-            return await AsyncMultiRangeDownloader.create_mrd(
+        if not _channel_warmed:
+            warmed_mrd = await _ensure_channel_warmed(
                 grpc_client, bucket_name, object_name, generation
             )
+            if warmed_mrd is not None:
+                return warmed_mrd
+        return await AsyncMultiRangeDownloader.create_mrd(
+            grpc_client, bucket_name, object_name, generation
+        )
     except NotFound:
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.

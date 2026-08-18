@@ -12,12 +12,20 @@ import json
 import multiprocessing as mp
 import os
 import random
+import resource
 import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = min(65536, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+except Exception:
+    pass
 
 
 @dataclasses.dataclass
@@ -41,10 +49,8 @@ def thread_worker(
     thread_ready_barrier: threading.Barrier,
     process_start_event: threading.Event,
     results: List[Dict[str, Any]],
+    fs: Any,
 ):
-    import gcsfs
-
-    fs = gcsfs.GCSFileSystem()
     latencies: List[float] = []
     errors: List[str] = []
 
@@ -107,6 +113,9 @@ def process_worker(
     global_start_event: Any,
     result_queue: mp.Queue,
 ):
+    import gcsfs
+
+    fs = gcsfs.GCSFileSystem()
     thread_results: List[Dict[str, Any]] = []
     threads = []
     num_threads = config.num_threads_per_process
@@ -126,6 +135,7 @@ def process_worker(
                 thread_ready_barrier,
                 local_start_event,
                 thread_results,
+                fs,
             ),
         )
         threads.append(t)
