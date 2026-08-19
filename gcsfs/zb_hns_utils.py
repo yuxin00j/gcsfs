@@ -33,10 +33,10 @@ except ValueError:
     DEFAULT_CONCURRENCY = 4
 try:
     DEFAULT_INIT_MRD_CONCURRENCY = int(
-        os.environ.get("GCSFS_MAX_CONCURRENT_INIT_MRD", "14")
+        os.environ.get("GCSFS_MAX_CONCURRENT_INIT_MRD", "10")
     )
 except ValueError:
-    DEFAULT_INIT_MRD_CONCURRENCY = 14
+    DEFAULT_INIT_MRD_CONCURRENCY = 10
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
@@ -677,6 +677,9 @@ class MRDPool:
                     mrd = await self._create_mrd()
                     self._all_mrds.append(mrd)
                 self.persisted_size = mrd.persisted_size
+                if self.generation is None:
+                    self.generation = getattr(mrd, "generation", None)
+                self.finalized = getattr(mrd, "is_finalized", self.finalized)
                 self._free_mrds.put_nowait(mrd)
                 self._active_count += 1
 
@@ -866,27 +869,26 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
-        info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
-        if generation is None:
-            generation = info.get("generation")
         key = (bucket_name, object_name, generation)
-        finalized = info.get("timeFinalized") is not None
+        if generation is not None:
+            self._incref(key)
 
-        self._incref(key)
         mrd_pool = MRDPool(
             fs,
             bucket_name,
             object_name,
             generation,
-            finalized,
-            pool_size,
+            finalized=True,
+            pool_size=pool_size,
             cache=self,
         )
-        if info is not None:
-            mrd_pool.details = info
 
         try:
             await mrd_pool.initialize()
+            if generation is None:
+                key = (bucket_name, object_name, mrd_pool.generation)
+                mrd_pool._key = key
+                self._incref(key)
         except BaseException:
             # Init failed. `mrd_pool.close()` donates any partial MRDs back
             # via release() and drops the refcount we just took. If that was
