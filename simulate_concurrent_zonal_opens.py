@@ -36,8 +36,6 @@ class SimulationConfig:
     num_threads_per_process: int = 10
     num_opens_per_thread: int = 1
     read_bytes: int = 0
-    file_strategy: str = "random"  # 'random', 'shared_subset', 'round_robin'
-    shared_files_count: int = 50
     output_json: Optional[str] = None
 
 
@@ -60,17 +58,8 @@ def thread_worker(
 
     t_start = time.perf_counter()
 
-    for i in range(config.num_opens_per_thread):
-        if config.file_strategy == "random":
-            fpath = random.choice(file_list)
-        elif config.file_strategy == "shared_subset":
-            subset = file_list[: min(config.shared_files_count, len(file_list))]
-            fpath = random.choice(subset)
-        elif config.file_strategy == "round_robin":
-            idx = (thread_id * config.num_opens_per_thread + i) % len(file_list)
-            fpath = file_list[idx]
-        else:
-            fpath = random.choice(file_list)
+    for _ in range(config.num_opens_per_thread):
+        fpath = random.choice(file_list)
 
         if fpath.startswith("gs://"):
             full_path = fpath
@@ -231,7 +220,6 @@ def print_report(all_results: List[Dict[str, Any]], config: SimulationConfig, to
     print(f"  Threads per process:        {config.num_threads_per_process}")
     print(f"  Total concurrent threads:   {config.num_processes * config.num_threads_per_process}")
     print(f"  Opens per thread:           {config.num_opens_per_thread}")
-    print(f"  File selection strategy:    {config.file_strategy}")
     print(f"  Read payload after open:    {config.read_bytes} bytes")
     print("-" * 70)
     print(f"Summary Results:")
@@ -405,18 +393,6 @@ def main():
         help="Bytes to read after opening file. 0 for open only, -1 for full file (default: 0)",
     )
     parser.add_argument(
-        "--file-strategy",
-        choices=["random", "shared_subset", "round_robin"],
-        default="random",
-        help="File selection strategy (default: random)",
-    )
-    parser.add_argument(
-        "--shared-files-count",
-        type=int,
-        default=50,
-        help="Subset size when using shared_subset strategy (default: 50)",
-    )
-    parser.add_argument(
         "--output-json",
         default=None,
         help="Path to output JSON results file",
@@ -431,8 +407,6 @@ def main():
         num_threads_per_process=args.num_threads_per_process,
         num_opens_per_thread=args.num_opens_per_thread,
         read_bytes=args.read_bytes,
-        file_strategy=args.file_strategy,
-        shared_files_count=args.shared_files_count,
         output_json=args.output_json,
     )
 
