@@ -1,3 +1,4 @@
+import time
 import logging
 
 from fsspec import asyn
@@ -57,6 +58,7 @@ class ZonalFile(GCSFile):
         of `_MAX_CHUNK_SIZE_BYTES` (2 MiB). Note that this higher default value may
         increase memory usage.
         """
+        t0 = time.perf_counter()
         bucket, key, path_generation = gcsfs.split_path(path)
         generation = _coalesce_generation(generation, path_generation)
         if not key:
@@ -115,6 +117,9 @@ class ZonalFile(GCSFile):
             # pass persisted_size here so that Cache is initialized with correct object size
             size=object_size,
             **kwargs,
+        )
+        logger.debug(
+            f"ZonalFile({path}, mode={mode}) initialized in {(time.perf_counter() - t0) * 1000:.2f} ms"
         )
 
     async def _init_mrd(self, bucket_name, object_name, generation=None):

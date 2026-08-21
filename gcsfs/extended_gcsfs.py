@@ -1,3 +1,4 @@
+import time
 import asyncio
 import contextlib
 import logging
@@ -335,10 +336,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         Open a file.
         """
+        t0 = time.perf_counter()
         bucket, _, _ = self.split_path(path)
         bucket_type = self._sync_lookup_bucket_type(bucket)
 
-        return gcs_file_types[bucket_type](
+        file_obj = gcs_file_types[bucket_type](
             self,
             path,
             mode,
@@ -353,6 +355,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             finalize_on_close=kwargs.pop("finalize_on_close", self.finalize_on_close),
             **kwargs,
         )
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.debug(
+            f"open() on {path} (mode={mode}, type={bucket_type.name}) completed in {latency_ms:.2f} ms"
+        )
+        return file_obj
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
     async def _process_limits_to_offset_and_length(

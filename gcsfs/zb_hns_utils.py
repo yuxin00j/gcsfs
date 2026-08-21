@@ -1,3 +1,4 @@
+import time
 import asyncio
 import collections
 import concurrent.futures
@@ -120,10 +121,13 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
+    t0 = time.perf_counter()
+    warmed = False
     if not _warmed_channels.get(grpc_client):
         lock = _get_channel_lock(grpc_client)
         async with lock:
             if not _warmed_channels.get(grpc_client):
+                t_warm = time.perf_counter()
                 async with acquire_init_mrd_slot():
                     try:
                         channel = grpc_client.grpc_client.transport.grpc_channel
@@ -131,11 +135,23 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                     except Exception as e:
                         logger.debug(f"Failed to explicitly warm channel: {e}")
                 _warmed_channels[grpc_client] = True
+                warmed = True
+                logger.debug(
+                    f"ALTS channel warmup for {bucket_name}/{object_name} completed in "
+                    f"{(time.perf_counter() - t_warm) * 1000:.2f} ms"
+                )
 
     try:
-        return await AsyncMultiRangeDownloader.create_mrd(
+        t_mrd = time.perf_counter()
+        mrd = await AsyncMultiRangeDownloader.create_mrd(
             grpc_client, bucket_name, object_name, generation
         )
+        logger.debug(
+            f"init_mrd for {bucket_name}/{object_name} completed in "
+            f"{(time.perf_counter() - t0) * 1000:.2f} ms "
+            f"(create_mrd: {(time.perf_counter() - t_mrd) * 1000:.2f} ms, warmed={warmed})"
+        )
+        return mrd
     except NotFound:
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
 
