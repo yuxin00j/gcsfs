@@ -30,17 +30,17 @@ except ValueError:
 # ALTS handshake and create_mrd concurrency limits
 try:
     DEFAULT_INIT_MRD_CONCURRENCY = int(
-        os.environ.get("GCSFS_ALTS_CONCURRENCY", "10")
+        os.environ.get("GCSFS_ALTS_CONCURRENCY", "8")
     )
 except ValueError:
-    DEFAULT_INIT_MRD_CONCURRENCY = 10
+    DEFAULT_INIT_MRD_CONCURRENCY = 8
 
 try:
     DEFAULT_CREATE_MRD_CONCURRENCY = int(
-        os.environ.get("GCSFS_CREATE_MRD_CONCURRENCY", "16")
+        os.environ.get("GCSFS_CREATE_MRD_CONCURRENCY", "32")
     )
 except ValueError:
-    DEFAULT_CREATE_MRD_CONCURRENCY = 16
+    DEFAULT_CREATE_MRD_CONCURRENCY = 32
 
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
@@ -84,6 +84,26 @@ def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str, name: str = "a
         os.ftruncate(fd, 0)
         os.write(fd, str(next_val).encode('utf-8'))
         return val
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def acquire_init_mrd_slot_sync(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+    """
+    Synchronous rate-limiter for credentials acquisition and metadata server calls.
+    """
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+    slot = _get_next_slot(max_concurrency, lock_dir, uid, "alts")
+    fd = _get_slot_fd(slot, lock_dir, uid, name="alts")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
