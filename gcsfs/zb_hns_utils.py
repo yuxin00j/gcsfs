@@ -27,8 +27,20 @@ try:
 except ValueError:
     DEFAULT_CONCURRENCY = 4
 
-# ALTS handshake concurrency limit
-DEFAULT_INIT_MRD_CONCURRENCY = 10
+# ALTS handshake and create_mrd concurrency limits
+try:
+    DEFAULT_INIT_MRD_CONCURRENCY = int(
+        os.environ.get("GCSFS_ALTS_CONCURRENCY", "10")
+    )
+except ValueError:
+    DEFAULT_INIT_MRD_CONCURRENCY = 10
+
+try:
+    DEFAULT_CREATE_MRD_CONCURRENCY = int(
+        os.environ.get("GCSFS_CREATE_MRD_CONCURRENCY", "16")
+    )
+except ValueError:
+    DEFAULT_CREATE_MRD_CONCURRENCY = 16
 
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
@@ -49,13 +61,13 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
-def _get_slot_fd(slot: int, lock_dir: str, uid: str) -> int:
-    path = os.path.join(lock_dir, f".gcsfs_alts_lock_{uid}_{slot}.lock")
+def _get_slot_fd(slot: int, lock_dir: str, uid: str, name: str = "alts") -> int:
+    path = os.path.join(lock_dir, f".gcsfs_{name}_lock_{uid}_{slot}.lock")
     return os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
 
 
-def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str) -> int:
-    path = os.path.join(lock_dir, f".gcsfs_alts_counter_{uid}.txt")
+def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str, name: str = "alts") -> int:
+    path = os.path.join(lock_dir, f".gcsfs_{name}_counter_{uid}.txt")
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -84,20 +96,40 @@ def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str) -> int:
 async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
     """
     Limits the number of concurrent ALTS handshakes across ALL processes on this machine.
-    Distributes requests perfectly across 16 slots to minimize queue depth and max latency.
+    Distributes requests perfectly across slots to minimize queue depth and max latency.
     """
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
 
     # Perfect bin-packing using a shared atomic counter
-    slot = _get_next_slot(max_concurrency, lock_dir, uid)
-    fd = _get_slot_fd(slot, lock_dir, uid)
+    slot = _get_next_slot(max_concurrency, lock_dir, uid, name="alts")
+    fd = _get_slot_fd(slot, lock_dir, uid, name="alts")
 
-    # Execute blocking flock directly. For single-threaded workloads, thread pools
-    # add latency. For multi-threaded, this might block the event loop briefly,
-    # but the ALTS handshake is the bottleneck anyway.
     fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
+
+@contextlib.asynccontextmanager
+async def acquire_create_mrd_slot(max_concurrency=DEFAULT_CREATE_MRD_CONCURRENCY):
+    """
+    Limits the number of concurrent create_mrd (BidiReadObject) calls across ALL processes on this machine.
+    Avoids thundering herd / load shedding on remote FastPusher storage tasks during multi-process burst starts.
+    """
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+
+    # Perfect bin-packing using a shared atomic counter
+    slot = _get_next_slot(max_concurrency, lock_dir, uid, name="create_mrd")
+    fd = _get_slot_fd(slot, lock_dir, uid, name="create_mrd")
+
+    fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         yield
     finally:
@@ -143,9 +175,10 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
 
     try:
         t_mrd = time.perf_counter()
-        mrd = await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation
-        )
+        async with acquire_create_mrd_slot():
+            mrd = await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "

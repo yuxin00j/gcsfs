@@ -1379,3 +1379,16 @@ def test_direct_memmove_buffer_pypy_fallback():
     assert isinstance(buf._result_bytes, bytearray)
 
     executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_acquire_init_mrd_slot():
+    async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=4):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_acquire_create_mrd_slot():
+    async with zb_hns_utils.acquire_create_mrd_slot(max_concurrency=4):
+        pass
+
