@@ -316,9 +316,9 @@ def main():
         container_cmd = [
             "apt-get update -qq && apt-get install -y -qq procps tar > /dev/null 2>&1 && "
             "pip install --no-cache-dir google-cloud-storage fsspec grpcio protobuf > /dev/null 2>&1 && "
-            "mkdir -p /scripts/src && "
-            "base64 -d /scripts/gcsfs_pkg.b64 | tar -xzf - -C /scripts/src && "
-            "export PYTHONPATH=/scripts/src:$PYTHONPATH && "
+            "mkdir -p /tmp/src && "
+            "base64 -d /scripts/gcsfs_pkg.b64 | tar -xzf - -C /tmp/src && "
+            "export PYTHONPATH=/tmp/src:$PYTHONPATH && "
             "python3 -u /scripts/worker.py"
         ]
     else:
