@@ -5,6 +5,8 @@ import contextlib
 import ctypes
 import logging
 import os
+import tempfile
+import fcntl
 import threading
 import weakref
 from io import BytesIO
@@ -23,6 +25,10 @@ try:
     DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "4"))
 except ValueError:
     DEFAULT_CONCURRENCY = 4
+
+# ALTS handshake concurrency limit
+DEFAULT_INIT_MRD_CONCURRENCY = 16
+
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
@@ -42,18 +48,94 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+def _get_slot_fd(slot: int, lock_dir: str, uid: str) -> int:
+    path = os.path.join(lock_dir, f".gcsfs_alts_lock_{uid}_{slot}.lock")
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+
+
+def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str) -> int:
+    path = os.path.join(lock_dir, f".gcsfs_alts_counter_{uid}.txt")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        val_bytes = os.read(fd, 32)
+        if not val_bytes:
+            val = 0
+        else:
+            try:
+                val = int(val_bytes.decode('utf-8').strip())
+            except ValueError:
+                val = 0
+        next_val = (val + 1) % max_concurrency
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(next_val).encode('utf-8'))
+        return val
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+@contextlib.asynccontextmanager
+async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+    """
+    Limits the number of concurrent ALTS handshakes across ALL processes on this machine.
+    Distributes requests perfectly across 16 slots to minimize queue depth and max latency.
+    """
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+
+    # Perfect bin-packing using a shared atomic counter
+    slot = _get_next_slot(max_concurrency, lock_dir, uid)
+    fd = _get_slot_fd(slot, lock_dir, uid)
+
+    # Execute blocking flock directly. For single-threaded workloads, thread pools
+    # add latency. For multi-threaded, this might block the event loop briefly,
+    # but the ALTS handshake is the bottleneck anyway.
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+_warmed_channels = weakref.WeakKeyDictionary()
+_channel_warm_locks = weakref.WeakKeyDictionary()
+
+def _get_channel_lock(grpc_client):
+    if grpc_client not in _channel_warm_locks:
+        _channel_warm_locks[grpc_client] = asyncio.Lock()
+    return _channel_warm_locks[grpc_client]
+
 async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     """
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
+    lock = _get_channel_lock(grpc_client)
+    async with lock:
+        if not _warmed_channels.get(grpc_client):
+            async with acquire_init_mrd_slot():
+                try:
+                    channel = grpc_client.grpc_client.transport.grpc_channel
+                    await channel.channel_ready()
+                except Exception as e:
+                    logger.debug(f"Failed to explicitly warm channel: {e}")
+            _warmed_channels[grpc_client] = True
+
     try:
         return await AsyncMultiRangeDownloader.create_mrd(
             grpc_client, bucket_name, object_name, generation
         )
     except NotFound:
-        # We wrap the error here to match standard Python error handling
-        # and avoid leaking Google API exceptions to users.
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
 
 
