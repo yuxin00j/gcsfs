@@ -207,16 +207,18 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_grpc_client(self):
         if self._grpc_client is None:
-            client_options = ClientOptions(quota_project_id=self._user_project)
-            if self._location:
-                # client_options expects only the host:port, without any protocol or path components.
-                endpoint = self._location.split("://")[-1].split("/")[0]
-                client_options.api_endpoint = endpoint
-            self._grpc_client = AsyncGrpcClient(
-                credentials=self.credential,
-                client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
-                client_options=client_options,
-            )
+            async with zb_hns_utils.acquire_init_mrd_slot():
+                if self._grpc_client is None:
+                    client_options = ClientOptions(quota_project_id=self._user_project)
+                    if self._location:
+                        # client_options expects only the host:port, without any protocol or path components.
+                        endpoint = self._location.split("://")[-1].split("/")[0]
+                        client_options.api_endpoint = endpoint
+                    self._grpc_client = AsyncGrpcClient(
+                        credentials=self.credential,
+                        client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
+                        client_options=client_options,
+                    )
         return self._grpc_client
 
     async def _get_control_plane_client(self):
