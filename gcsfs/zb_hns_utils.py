@@ -101,16 +101,18 @@ async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
 
-    # Perfect bin-packing using a shared atomic counter
-    slot = _get_next_slot(max_concurrency, lock_dir, uid, name="alts")
+    loop = asyncio.get_running_loop()
+    slot = await loop.run_in_executor(
+        None, _get_next_slot, max_concurrency, lock_dir, uid, "alts"
+    )
     fd = _get_slot_fd(slot, lock_dir, uid, name="alts")
 
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
     try:
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_UN)
         except OSError:
             pass
         os.close(fd)
@@ -125,16 +127,18 @@ async def acquire_create_mrd_slot(max_concurrency=DEFAULT_CREATE_MRD_CONCURRENCY
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
 
-    # Perfect bin-packing using a shared atomic counter
-    slot = _get_next_slot(max_concurrency, lock_dir, uid, name="create_mrd")
+    loop = asyncio.get_running_loop()
+    slot = await loop.run_in_executor(
+        None, _get_next_slot, max_concurrency, lock_dir, uid, "create_mrd"
+    )
     fd = _get_slot_fd(slot, lock_dir, uid, name="create_mrd")
 
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
     try:
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_UN)
         except OSError:
             pass
         os.close(fd)
