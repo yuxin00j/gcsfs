@@ -27,7 +27,7 @@ except ValueError:
     DEFAULT_CONCURRENCY = 4
 
 # ALTS handshake concurrency limit
-DEFAULT_INIT_MRD_CONCURRENCY = 16
+DEFAULT_INIT_MRD_CONCURRENCY = 10
 
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
@@ -120,16 +120,17 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
-    lock = _get_channel_lock(grpc_client)
-    async with lock:
-        if not _warmed_channels.get(grpc_client):
-            async with acquire_init_mrd_slot():
-                try:
-                    channel = grpc_client.grpc_client.transport.grpc_channel
-                    await channel.channel_ready()
-                except Exception as e:
-                    logger.debug(f"Failed to explicitly warm channel: {e}")
-            _warmed_channels[grpc_client] = True
+    if not _warmed_channels.get(grpc_client):
+        lock = _get_channel_lock(grpc_client)
+        async with lock:
+            if not _warmed_channels.get(grpc_client):
+                async with acquire_init_mrd_slot():
+                    try:
+                        channel = grpc_client.grpc_client.transport.grpc_channel
+                        await channel.channel_ready()
+                    except Exception as e:
+                        logger.debug(f"Failed to explicitly warm channel: {e}")
+                _warmed_channels[grpc_client] = True
 
     try:
         return await AsyncMultiRangeDownloader.create_mrd(
