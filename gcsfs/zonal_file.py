@@ -118,7 +118,7 @@ class ZonalFile(GCSFile):
             size=object_size,
             **kwargs,
         )
-        logger.debug(
+        logger.info(
             f"[custom log] ZonalFile({path}, mode={mode}) initialized in {(time.perf_counter() - t0) * 1000:.2f} ms"
         )
 
