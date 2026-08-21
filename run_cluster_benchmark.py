@@ -7,15 +7,17 @@ On each node, it starts N processes, each process spawns M threads,
 and each thread opens a distinct file from the dataset via gcsfs.
 
 Features:
+- Multi-Wave Benchmark Support:
+    * Wave 1: Cold start synchronized opens across all processes/threads
+    * Sleep 5 seconds (using same processes & fs instances)
+    * Wave 2: Warm steady-state synchronized opens across all processes/threads
 - Global Distributed Barrier across all nodes:
     * All pods register readiness to GCS barrier prefix.
     * Once all pods are ready, Leader calculates synchronized target epoch timestamp.
-    * All 1,024 processes across all 8 physical nodes precision spin-wait and fire simultaneously.
-- Inside each node pod:
-    * Spawns N processes
-    * Each process spawns M threads
-    * Each thread opens a distinct file (no overlap within process, distinct shards across cluster)
-    * Measures pure open latency and returns structured JSON metrics
+    * All processes across all physical nodes precision spin-wait and fire simultaneously.
+- Metrics & Analysis:
+    * Separate percentile metrics for Wave 1, Wave 2, and Overall.
+    * Per-node and full-cluster aggregate summaries.
 - Supports --local-pkg: Packages local gcsfs source into ConfigMap directly for sub-second iteration without git push.
 - Supports --scalar: Prints cluster Max latency in seconds as the final stdout line for metric scrapers.
 """
@@ -54,7 +56,7 @@ def thread_task(fs, file_path):
         return False, latency_ms
 
 def process_worker(args):
-    node_index, proc_id, num_procs, num_threads, file_paths, target_time = args
+    node_index, proc_id, num_procs, num_threads, file_paths, target_time, sleep_between_waves = args
     
     # Precision spin-wait to synchronize all processes across all nodes to exact millisecond
     if target_time > 0:
@@ -67,19 +69,64 @@ def process_worker(args):
     import gcsfs
     fs = gcsfs.GCSFileSystem()
     
-    results = []
+    wave1_results = []
+    wave2_results = []
+    
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = []
+        # --- WAVE 1: Cold start opens ---
+        futures1 = []
         for t in range(num_threads):
             global_worker_id = (node_index * num_procs + proc_id) * num_threads + t
             file_path = file_paths[global_worker_id % len(file_paths)]
-            futures.append(executor.submit(thread_task, fs, file_path))
+            futures1.append(executor.submit(thread_task, fs, file_path))
             
-        for f in futures:
+        for f in futures1:
             success, lat = f.result()
-            results.append((success, lat))
+            wave1_results.append((success, lat))
             
-    return results
+        # Sleep between waves in the same process
+        if sleep_between_waves > 0:
+            time.sleep(sleep_between_waves)
+            
+        # --- WAVE 2: Warm channel opens ---
+        futures2 = []
+        total_cluster_workers = int(os.environ.get("TOTAL_NODES", "8")) * num_procs * num_threads
+        for t in range(num_threads):
+            # Select distinct files for wave 2
+            global_worker_id = (node_index * num_procs + proc_id) * num_threads + t + total_cluster_workers
+            file_path = file_paths[global_worker_id % len(file_paths)]
+            futures2.append(executor.submit(thread_task, fs, file_path))
+            
+        for f in futures2:
+            success, lat = f.result()
+            wave2_results.append((success, lat))
+            
+    return {"wave1": wave1_results, "wave2": wave2_results}
+
+def calc_stats(results_list):
+    success_lats = [lat for s, lat in results_list if s]
+    fail_lats = [lat for s, lat in results_list if not s]
+    success_lats.sort()
+    
+    p50 = statistics.median(success_lats) if success_lats else 0
+    p90 = success_lats[int(len(success_lats) * 0.90)] if success_lats else 0
+    p95 = success_lats[int(len(success_lats) * 0.95)] if success_lats else 0
+    p99 = success_lats[int(len(success_lats) * 0.99)] if success_lats else 0
+    max_lat = max(success_lats) if success_lats else 0
+    min_lat = min(success_lats) if success_lats else 0
+    
+    return {
+        "total": len(results_list),
+        "success": len(success_lats),
+        "failure": len(fail_lats),
+        "min_ms": min_lat,
+        "p50_ms": p50,
+        "p90_ms": p90,
+        "p95_ms": p95,
+        "p99_ms": p99,
+        "max_ms": max_lat,
+        "latencies_ms": success_lats
+    }
 
 def main():
     try:
@@ -93,11 +140,13 @@ def main():
     num_nodes = int(os.environ.get("TOTAL_NODES", "8"))
     num_procs = int(os.environ.get("NUM_PROCESSES", "128"))
     num_threads = int(os.environ.get("NUM_THREADS", "1"))
+    sleep_between_waves = float(os.environ.get("SLEEP_BETWEEN_WAVES", "5.0"))
     bucket = os.environ.get("BUCKET", "gs://hf-pile-deduplicated-us-central1-b-gcsfs")
     barrier_dir = os.environ.get("BARRIER_DIR", "gs://yuxinj-us-central1-b-test/benchmark_barriers/default")
 
     print(f"=== Starting Worker on Node {node_index} ({node_name}) ===", flush=True)
-    print(f"Processes: {num_procs}, Threads per Process: {num_threads}, Total opens: {num_procs * num_threads}", flush=True)
+    print(f"Processes: {num_procs}, Threads per Process: {num_threads}, Total opens per wave: {num_procs * num_threads}", flush=True)
+    print(f"Sleep between waves: {sleep_between_waves}s", flush=True)
     print(f"Target Bucket: {bucket}", flush=True)
 
     import gcsfs
@@ -106,7 +155,7 @@ def main():
     all_files = fs_init.ls(clean_bucket)
     file_paths = [f"gs://{p}" for p in all_files if not p.endswith("/")]
     if not file_paths:
-        file_paths = [f"{bucket}/dummy_files/dummy_{i}.bin" for i in range(2048)]
+        file_paths = [f"{bucket}/dummy_files/dummy_{i}.bin" for i in range(4096)]
 
     print(f"Discovered {len(file_paths)} files in dataset.", flush=True)
 
@@ -158,38 +207,35 @@ def main():
         print("Warning: Barrier timed out! Proceeding without synchronization.", flush=True)
     else:
         remaining = target_time - time.time()
-        print(f"Synchronized barrier active. All {num_nodes} nodes will fire in {remaining:.2f} seconds.", flush=True)
+        print(f"Synchronized barrier active. All {num_nodes} nodes will fire Wave 1 in {remaining:.2f} seconds.", flush=True)
 
-    tasks = [(node_index, p, num_procs, num_threads, file_paths, target_time) for p in range(num_procs)]
+    tasks = [
+        (node_index, p, num_procs, num_threads, file_paths, target_time, sleep_between_waves)
+        for p in range(num_procs)
+    ]
 
     ctx = mp.get_context("forkserver")
     t_start = time.time()
 
     with ctx.Pool(num_procs) as pool:
-        process_results = pool.map(process_worker, tasks)
+        worker_outputs = pool.map(process_worker, tasks)
 
     t_end = time.time()
     wall_time = t_end - (target_time if target_time > 0 and target_time < t_end else t_start)
 
-    all_results = []
-    for r_list in process_results:
-        all_results.extend(r_list)
+    all_w1 = []
+    all_w2 = []
+    for out in worker_outputs:
+        all_w1.extend(out["wave1"])
+        all_w2.extend(out["wave2"])
 
-    success_lats = [lat for s, lat in all_results if s]
-    fail_lats = [lat for s, lat in all_results if not s]
-
-    success_lats.sort()
-    
-    p50 = statistics.median(success_lats) if success_lats else 0
-    p90 = success_lats[int(len(success_lats) * 0.90)] if success_lats else 0
-    p95 = success_lats[int(len(success_lats) * 0.95)] if success_lats else 0
-    p99 = success_lats[int(len(success_lats) * 0.99)] if success_lats else 0
-    max_lat = max(success_lats) if success_lats else 0
-    min_lat = min(success_lats) if success_lats else 0
+    stats_w1 = calc_stats(all_w1)
+    stats_w2 = calc_stats(all_w2)
+    stats_all = calc_stats(all_w1 + all_w2)
 
     print(f"\n=== Node {node_index} Completed in {wall_time:.2f}s ===", flush=True)
-    print(f"Success: {len(success_lats)}/{len(all_results)}, Failures: {len(fail_lats)}", flush=True)
-    print(f"P50: {p50:.1f}ms | P95: {p95:.1f}ms | Max: {max_lat:.1f}ms", flush=True)
+    print(f"Wave 1 (Cold) -> P50: {stats_w1['p50_ms']:.1f}ms | P95: {stats_w1['p95_ms']:.1f}ms | Max: {stats_w1['max_ms']:.1f}ms (Success: {stats_w1['success']}/{stats_w1['total']})", flush=True)
+    print(f"Wave 2 (Warm) -> P50: {stats_w2['p50_ms']:.1f}ms | P95: {stats_w2['p95_ms']:.1f}ms | Max: {stats_w2['max_ms']:.1f}ms (Success: {stats_w2['success']}/{stats_w2['total']})", flush=True)
 
     report = {
         "node_index": node_index,
@@ -197,17 +243,10 @@ def main():
         "pod_name": pod_name,
         "processes": num_procs,
         "threads": num_threads,
-        "total_opens": len(all_results),
-        "success_count": len(success_lats),
-        "failure_count": len(fail_lats),
         "wall_time": wall_time,
-        "min_ms": min_lat,
-        "p50_ms": p50,
-        "p90_ms": p90,
-        "p95_ms": p95,
-        "p99_ms": p99,
-        "max_ms": max_lat,
-        "latencies_ms": success_lats
+        "wave1": stats_w1,
+        "wave2": stats_w2,
+        "overall": stats_all
     }
 
     print("\n__JSON_REPORT_BEGIN__", flush=True)
@@ -245,13 +284,39 @@ def package_local_gcsfs():
                 tar.add(full_p, arcname=rel_p)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
+def print_table(title, lats, num_nodes, processes, threads, total_opens, success_count, fail_count, max_wall_time):
+    print("\n" + "=" * 80)
+    print(f" {title.upper()}")
+    print("=" * 80)
+    print(f"Total Physical Nodes:   {num_nodes}")
+    print(f"Processes per Node (n): {processes}")
+    print(f"Threads per Proc (m):   {threads}")
+    print(f"Total Requests:         {total_opens}")
+    print(f"Successful Requests:    {success_count} ({success_count/max(1, total_opens)*100:.1f}%)")
+    print(f"Failed Requests:        {fail_count}")
+    if max_wall_time > 0:
+        print(f"Max Node Wall Time:     {max_wall_time:.2f} seconds")
+    print()
+
+    if lats:
+        lats.sort()
+        print("--- Latency Percentiles ---")
+        print(f"Min:  {min(lats):.2f} ms")
+        print(f"P50:  {statistics.median(lats):.2f} ms")
+        print(f"P90:  {lats[int(len(lats) * 0.90)]:.2f} ms")
+        print(f"P95:  {lats[int(len(lats) * 0.95)]:.2f} ms")
+        print(f"P99:  {lats[int(len(lats) * 0.99)]:.2f} ms")
+        print(f"Max:  {max(lats):.2f} ms")
+    print("=" * 80)
+
 def main():
-    parser = argparse.ArgumentParser(description="Run GKE Cluster Open Latency Benchmark with Global Synchronization Barrier")
+    parser = argparse.ArgumentParser(description="Run Multi-Wave GKE Cluster Open Latency Benchmark with Global Synchronization Barrier")
     parser.add_argument("--cluster", type=str, default="yuxinj-8node-n4-cluster", help="GKE cluster name")
     parser.add_argument("--zone", type=str, default="us-central1-b", help="GKE cluster zone")
     parser.add_argument("--project", type=str, default="gcs-aiml-clients-testing-101", help="GCP project ID")
-    parser.add_argument("--processes", "-n", type=int, default=128, help="Number of processes per node (default: 128)")
-    parser.add_argument("--threads", "-m", type=int, default=1, help="Number of threads per process (default: 1)")
+    parser.add_argument("--processes", "-n", type=int, default=32, help="Number of processes per node (default: 32)")
+    parser.add_argument("--threads", "-m", type=int, default=10, help="Number of threads per process (default: 10)")
+    parser.add_argument("--sleep-waves", type=float, default=5.0, help="Sleep in seconds between Wave 1 and Wave 2 (default: 5.0)")
     parser.add_argument("--bucket", type=str, default="gs://hf-pile-deduplicated-us-central1-b-gcsfs", help="Target GCS bucket")
     parser.add_argument("--barrier-bucket", type=str, default="gs://yuxinj-us-central1-b-test", help="Bucket for distributed barrier coordination")
     parser.add_argument("--branch", type=str, default="main", help="GCSFS git branch/tag to benchmark (default: main)")
@@ -261,15 +326,16 @@ def main():
     args = parser.parse_args()
 
     if not args.scalar:
-        print("=" * 70)
-        print(" GKE DISTRIBUTED CLUSTER BENCHMARK (WITH GLOBAL SYNCHRONIZATION BARRIER)")
+        print("=" * 75)
+        print(" GKE MULTI-WAVE DISTRIBUTED CLUSTER BENCHMARK (SYNCHRONIZED GLOBAL BARRIER)")
         print(f" Cluster:                {args.cluster} ({args.zone})")
         print(f" Project:                {args.project}")
         print(f" Processes per Node (n): {args.processes}")
         print(f" Threads per Proc (m):   {args.threads}")
+        print(f" Sleep Between Waves:    {args.sleep_waves}s")
         print(f" Target Bucket:          {args.bucket}")
         print(f" Package Mode:           {'Local working copy' if args.local_pkg else f'Remote git branch: {args.branch}'}")
-        print("=" * 70)
+        print("=" * 75)
 
     # 1. Connect to GKE Cluster
     if not args.scalar:
@@ -287,9 +353,10 @@ def main():
         sys.exit(1)
 
     total_cluster_procs = num_nodes * args.processes
-    total_cluster_opens = total_cluster_procs * args.threads
+    total_opens_per_wave = total_cluster_procs * args.threads
+    total_all_opens = total_opens_per_wave * 2
     if not args.scalar:
-        print(f"Total cluster workload: {num_nodes} nodes × {args.processes} procs × {args.threads} threads = {total_cluster_opens} concurrent opens")
+        print(f"Cluster Workload: {num_nodes} nodes × {args.processes} procs × {args.threads} threads = {total_opens_per_wave} opens per wave ({total_all_opens} total across 2 waves)")
 
     job_id = f"gcsfs-bench-{uuid.uuid4().hex[:6]}"
     configmap_name = f"{job_id}-cm"
@@ -366,6 +433,7 @@ def main():
                                 {"name": "TOTAL_NODES", "value": str(num_nodes)},
                                 {"name": "NUM_PROCESSES", "value": str(args.processes)},
                                 {"name": "NUM_THREADS", "value": str(args.threads)},
+                                {"name": "SLEEP_BETWEEN_WAVES", "value": str(args.sleep_waves)},
                                 {"name": "BUCKET", "value": args.bucket},
                                 {"name": "BARRIER_DIR", "value": barrier_dir},
                                 {"name": "GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT", "value": "true"},
@@ -418,7 +486,7 @@ def main():
         if not args.scalar:
             print(f"Status ({int(time.time() - t_wait_start)}s): {completed_count}/{num_nodes} completed, {failed_count} failed. Active Pods: {running_count}")
 
-        if (completed_count + failed_count >= num_nodes and completed_count > 0) or (running_count == 0 and len(lines) > 0):
+        if completed_count + failed_count >= num_nodes and len(lines) > 0:
             completed = True
             break
             
@@ -429,15 +497,22 @@ def main():
 
     # 7. Fetch Logs & Collect Results
     if not args.scalar:
-        print(f"\n[5/5] Collecting and aggregating results from all pods...")
+        print(f"\n[5/5] Collecting and aggregating multi-wave results from all pods...")
     pods_out, _, _ = run_cmd(f"kubectl get pods -l app={job_id} -o jsonpath='{{.items[*].metadata.name}}'")
     pod_names = pods_out.split()
 
     node_reports = []
-    cluster_all_lats = []
-    cluster_total_opens = 0
-    cluster_success_count = 0
-    cluster_fail_count = 0
+    all_w1_lats = []
+    all_w2_lats = []
+    all_comb_lats = []
+
+    total_w1_opens = 0
+    total_w1_success = 0
+    total_w1_fail = 0
+
+    total_w2_opens = 0
+    total_w2_success = 0
+    total_w2_fail = 0
 
     for pod in sorted(pod_names):
         pod_log, _, _ = run_cmd(f"kubectl logs {pod} --tail=100", check=False)
@@ -446,10 +521,22 @@ def main():
                 json_str = pod_log.split("__JSON_REPORT_BEGIN__")[1].split("__JSON_REPORT_END__")[0].strip()
                 rep = json.loads(json_str)
                 node_reports.append(rep)
-                cluster_all_lats.extend(rep.get("latencies_ms", []))
-                cluster_total_opens += rep.get("total_opens", 0)
-                cluster_success_count += rep.get("success_count", 0)
-                cluster_fail_count += rep.get("failure_count", 0)
+                
+                w1 = rep.get("wave1", {})
+                w2 = rep.get("wave2", {})
+                
+                all_w1_lats.extend(w1.get("latencies_ms", []))
+                total_w1_opens += w1.get("total", 0)
+                total_w1_success += w1.get("success", 0)
+                total_w1_fail += w1.get("failure", 0)
+                
+                all_w2_lats.extend(w2.get("latencies_ms", []))
+                total_w2_opens += w2.get("total", 0)
+                total_w2_success += w2.get("success", 0)
+                total_w2_fail += w2.get("failure", 0)
+                
+                all_comb_lats.extend(w1.get("latencies_ms", []))
+                all_comb_lats.extend(w2.get("latencies_ms", []))
             except Exception as e:
                 if not args.scalar:
                     print(f"Error parsing JSON from {pod}: {e}")
@@ -466,44 +553,61 @@ def main():
 
     if not args.scalar:
         # Display Per-Node Table
-        print("\n" + "=" * 80)
-        print(" PER-NODE BENCHMARK RESULTS")
-        print("=" * 80)
-        print(f"{'Node Index':<12} {'Node Name':<28} {'Success/Total':<15} {'P50 (ms)':<10} {'P95 (ms)':<10} {'Max (ms)':<10} {'Wall Time':<10}")
-        print("-" * 80)
+        print("\n" + "=" * 90)
+        print(" PER-NODE MULTI-WAVE RESULTS")
+        print("=" * 90)
+        print(f"{'Node':<6} {'Node Name':<28} {'W1 P50':<10} {'W1 Max':<10} {'W2 P50':<10} {'W2 Max':<10} {'Wall Time':<10}")
+        print("-" * 90)
         for rep in sorted(node_reports, key=lambda x: x["node_index"]):
-            succ_tot = f"{rep['success_count']}/{rep['total_opens']}"
-            print(f"{rep['node_index']:<12} {rep['node_name'][:26]:<28} {succ_tot:<15} {rep['p50_ms']:<10.1f} {rep['p95_ms']:<10.1f} {rep['max_ms']:<10.1f} {rep['wall_time']:<10.2f}s")
-        print("=" * 80)
+            w1 = rep.get("wave1", {})
+            w2 = rep.get("wave2", {})
+            print(f"{rep['node_index']:<6} {rep['node_name'][:26]:<28} {w1.get('p50_ms', 0):<10.1f} {w1.get('max_ms', 0):<10.1f} {w2.get('p50_ms', 0):<10.1f} {w2.get('max_ms', 0):<10.1f} {rep['wall_time']:<10.2f}s")
+        print("=" * 90)
 
-        # Display Cluster Aggregate Table
-        cluster_all_lats.sort()
         max_wall_time = max([r["wall_time"] for r in node_reports]) if node_reports else 0
 
-        print("\n" + "=" * 80)
-        print(" FULL CLUSTER AGGREGATE RESULTS")
-        print("=" * 80)
-        print(f"Total Physical Nodes:   {num_nodes}")
-        print(f"Processes per Node (n): {args.processes}")
-        print(f"Threads per Proc (m):   {args.threads}")
-        print(f"Total Requests:         {cluster_total_opens}")
-        print(f"Successful Requests:    {cluster_success_count} ({cluster_success_count/max(1, cluster_total_opens)*100:.1f}%)")
-        print(f"Failed Requests:        {cluster_fail_count}")
-        print(f"Max Node Wall Time:     {max_wall_time:.2f} seconds\n")
+        # Wave 1 Table
+        print_table(
+            "Wave 1: Cold-Start Synchronized Burst",
+            all_w1_lats,
+            num_nodes,
+            args.processes,
+            args.threads,
+            total_w1_opens,
+            total_w1_success,
+            total_w1_fail,
+            0
+        )
 
-        if cluster_all_lats:
-            print("--- Cluster Latency Percentiles ---")
-            print(f"Min:  {min(cluster_all_lats):.2f} ms")
-            print(f"P50:  {statistics.median(cluster_all_lats):.2f} ms")
-            print(f"P90:  {cluster_all_lats[int(len(cluster_all_lats) * 0.90)]:.2f} ms")
-            print(f"P95:  {cluster_all_lats[int(len(cluster_all_lats) * 0.95)]:.2f} ms")
-            print(f"P99:  {cluster_all_lats[int(len(cluster_all_lats) * 0.99)]:.2f} ms")
-            print(f"Max:  {max(cluster_all_lats):.2f} ms")
-        print("=" * 80)
+        # Wave 2 Table
+        print_table(
+            f"Wave 2: Warm-Channel Burst (After {args.sleep_waves}s Sleep)",
+            all_w2_lats,
+            num_nodes,
+            args.processes,
+            args.threads,
+            total_w2_opens,
+            total_w2_success,
+            total_w2_fail,
+            0
+        )
+
+        # Combined Aggregate Table
+        print_table(
+            "Overall Cluster Aggregate (Both Waves Combined)",
+            all_comb_lats,
+            num_nodes,
+            args.processes,
+            args.threads,
+            total_w1_opens + total_w2_opens,
+            total_w1_success + total_w2_success,
+            total_w1_fail + total_w2_fail,
+            max_wall_time
+        )
 
     # For autoresearch metric parser
-    if cluster_all_lats:
-        max_sec = max(cluster_all_lats) / 1000.0
+    if all_comb_lats:
+        max_sec = max(all_comb_lats) / 1000.0
         print(f"{max_sec:.3f}")
     else:
         print("999.000")
