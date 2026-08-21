@@ -357,7 +357,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         logger.debug(
-            f"open() on {path} (mode={mode}, type={bucket_type.name}) completed in {latency_ms:.2f} ms"
+            f"[custom log] open() on {path} (mode={mode}, type={bucket_type.name}) completed in {latency_ms:.2f} ms"
         )
         return file_obj
 

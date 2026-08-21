@@ -137,7 +137,7 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                 _warmed_channels[grpc_client] = True
                 warmed = True
                 logger.debug(
-                    f"ALTS channel warmup for {bucket_name}/{object_name} completed in "
+                    f"[custom log] ALTS channel warmup for {bucket_name}/{object_name} completed in "
                     f"{(time.perf_counter() - t_warm) * 1000:.2f} ms"
                 )
 
@@ -147,7 +147,7 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
             grpc_client, bucket_name, object_name, generation
         )
         logger.debug(
-            f"init_mrd for {bucket_name}/{object_name} completed in "
+            f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "
             f"(create_mrd: {(time.perf_counter() - t_mrd) * 1000:.2f} ms, warmed={warmed})"
         )

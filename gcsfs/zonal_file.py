@@ -119,7 +119,7 @@ class ZonalFile(GCSFile):
             **kwargs,
         )
         logger.debug(
-            f"ZonalFile({path}, mode={mode}) initialized in {(time.perf_counter() - t0) * 1000:.2f} ms"
+            f"[custom log] ZonalFile({path}, mode={mode}) initialized in {(time.perf_counter() - t0) * 1000:.2f} ms"
         )
 
     async def _init_mrd(self, bucket_name, object_name, generation=None):
