@@ -624,8 +624,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # Work around various permission settings. Prefer an object get (storage.objects.get), but
         # fall back to a bucket list + filter to object name (storage.objects.list).
         try:
-            async with acquire_info_slot(128):
-                res = await self._call(
+            res = await self._call(
                     "GET", "b/{}/o/{}", bucket, key, json_out=True, generation=generation
                 )
         except OSError as e:
@@ -1091,6 +1090,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
+        import random, asyncio
+        await asyncio.sleep(random.random() * 1.5)
+
         path = self._strip_protocol(path).rstrip("/")
         if "/" not in path:
             try:
