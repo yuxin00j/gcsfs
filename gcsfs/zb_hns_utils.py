@@ -35,12 +35,7 @@ try:
 except ValueError:
     DEFAULT_INIT_MRD_CONCURRENCY = 8
 
-try:
-    DEFAULT_CREATE_MRD_CONCURRENCY = int(
-        os.environ.get("GCSFS_CREATE_MRD_CONCURRENCY", "32")
-    )
-except ValueError:
-    DEFAULT_CREATE_MRD_CONCURRENCY = 32
+
 
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
@@ -144,30 +139,7 @@ def sync_acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
         os.close(fd)
 
 
-@contextlib.asynccontextmanager
-async def acquire_create_mrd_slot(max_concurrency=DEFAULT_CREATE_MRD_CONCURRENCY):
-    """
-    Limits the number of concurrent create_mrd (BidiReadObject) calls across ALL processes on this machine.
-    Avoids thundering herd / load shedding on remote FastPusher storage tasks during multi-process burst starts.
-    """
-    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
-    uid = os.getuid() if hasattr(os, "getuid") else "default"
 
-    loop = asyncio.get_running_loop()
-    slot = await loop.run_in_executor(
-        None, _get_next_slot, max_concurrency, lock_dir, uid, "create_mrd"
-    )
-    fd = _get_slot_fd(slot, lock_dir, uid, name="create_mrd")
-
-    await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
-    try:
-        yield
-    finally:
-        try:
-            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
 
 
 _warmed_channels = weakref.WeakKeyDictionary()
@@ -210,17 +182,15 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
 
     try:
         t_mrd_wait = time.perf_counter()
-        async with acquire_create_mrd_slot():
-            t_mrd_call = time.perf_counter()
-            mrd = await AsyncMultiRangeDownloader.create_mrd(
-                grpc_client, bucket_name, object_name, generation
-            )
-            t_mrd_end = time.perf_counter()
+        t_mrd_call = time.perf_counter()
+        mrd = await AsyncMultiRangeDownloader.create_mrd(
+            grpc_client, bucket_name, object_name, generation
+        )
+        t_mrd_end = time.perf_counter()
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "
-            f"(create_mrd wait+call: {(time.perf_counter() - t_mrd_wait) * 1000:.2f} ms, "
-            f"pure network: {(t_mrd_end - t_mrd_call) * 1000:.2f} ms, warmed={warmed})"
+            f"(create_mrd pure network: {(t_mrd_end - t_mrd_call) * 1000:.2f} ms, warmed={warmed})"
         )
         return mrd
     except NotFound:
