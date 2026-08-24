@@ -1,4 +1,3 @@
-from gcsfs.zb_hns_utils import acquire_control_plane_slot
 import time
 import asyncio
 import contextlib
@@ -296,8 +295,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             if bucket in self._storage_layout_cache:
                 return self._storage_layout_cache[bucket]
 
-            async with acquire_control_plane_slot(8):
-                bucket_type = await self._get_bucket_type(bucket)
+            bucket_type = await self._get_bucket_type(bucket)
             # Don't cache UNKNOWN type.
             # This ensures that subsequent operations will retry the lookup,
             # allowing it to recover when the transient error resolves.
