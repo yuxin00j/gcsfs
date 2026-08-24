@@ -197,13 +197,13 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                 logger.info(
                     f"[custom log] ALTS channel warmup for {bucket_name}/{object_name} completed in "
                     f"{(time.perf_counter() - t_warm) * 1000:.2f} ms"
-            )
+                )
 
     try:
         t_mrd = time.perf_counter()
-            mrd = await AsyncMultiRangeDownloader.create_mrd(
-                grpc_client, bucket_name, object_name, generation
-            )
+        mrd = await AsyncMultiRangeDownloader.create_mrd(
+            grpc_client, bucket_name, object_name, generation
+        )
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "
