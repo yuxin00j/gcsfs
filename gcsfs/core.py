@@ -1,3 +1,4 @@
+from gcsfs.zb_hns_utils import acquire_info_slot
 """
 Google Cloud Storage pythonic interface
 """
@@ -623,9 +624,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # Work around various permission settings. Prefer an object get (storage.objects.get), but
         # fall back to a bucket list + filter to object name (storage.objects.list).
         try:
-            res = await self._call(
-                "GET", "b/{}/o/{}", bucket, key, json_out=True, generation=generation
-            )
+            async with acquire_info_slot(128):
+                res = await self._call(
+                    "GET", "b/{}/o/{}", bucket, key, json_out=True, generation=generation
+                )
         except OSError as e:
             if not str(e).startswith("Forbidden"):
                 raise
