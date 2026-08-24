@@ -1,4 +1,5 @@
 import time
+import threading
 import asyncio
 import contextlib
 import logging
@@ -81,6 +82,11 @@ async def _get_mrd_size(mrd_or_pool):
         return m.persisted_size
 
 
+_GLOBAL_STORAGE_LAYOUT_CACHE = {}
+_GLOBAL_STORAGE_LAYOUT_LOCK = threading.Lock()
+_GLOBAL_STORAGE_LAYOUT_EVENTS = {}
+
+
 class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     """
     This class will be used when GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT env variable is set to true.
@@ -125,7 +131,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         # By default, files in zonal buckets are left unfinalized to allow appends.
         self.finalize_on_close = finalize_on_close
         self._grpc_client = None
+        self._grpc_client_lock = None
         self._storage_control_client = None
+        self._storage_control_client_lock = None
+        self._bucket_lookup_lock = None
         # Adds user-passed credentials to ExtendedGcsFileSystem to pass to gRPC/Storage Control clients.
         # We unwrap the nested credentials here because self.credentials is a GCSFS wrapper,
         # but the clients expect the underlying google.auth credentials object.
@@ -207,7 +216,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_grpc_client(self):
         if self._grpc_client is None:
-            async with zb_hns_utils.acquire_init_mrd_slot():
+            if self._grpc_client_lock is None:
+                self._grpc_client_lock = asyncio.Lock()
+            async with self._grpc_client_lock:
                 if self._grpc_client is None:
                     client_options = ClientOptions(quota_project_id=self._user_project)
                     if self._location:
@@ -223,7 +234,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_control_plane_client(self):
         if self._storage_control_client is None:
-            async with zb_hns_utils.acquire_init_mrd_slot():
+            if self._storage_control_client_lock is None:
+                self._storage_control_client_lock = asyncio.Lock()
+            async with self._storage_control_client_lock:
                 if self._storage_control_client is None:
                     # Initialize the storage control plane client for bucket
                     # metadata operations
@@ -277,18 +290,65 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self._grpc_client = None
 
     async def _lookup_bucket_type(self, bucket):
-        if bucket in self._storage_layout_cache:
-            return self._storage_layout_cache[bucket]
-        bucket_type = await self._get_bucket_type(bucket)
-        # Don't cache UNKNOWN type.
-        # This ensures that subsequent operations will retry the lookup,
-        # allowing it to recover when the transient error resolves.
-        if bucket_type == BucketType.UNKNOWN:
-            return bucket_type
-        self._storage_layout_cache[bucket] = bucket_type
-        return self._storage_layout_cache[bucket]
+        with _GLOBAL_STORAGE_LAYOUT_LOCK:
+            if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
 
-    _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
+        if self._bucket_lookup_lock is None:
+            self._bucket_lookup_lock = asyncio.Lock()
+
+        async with self._bucket_lookup_lock:
+            with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                    return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
+
+            bucket_type = await self._get_bucket_type(bucket)
+            # Don't cache UNKNOWN type.
+            # This ensures that subsequent operations will retry the lookup,
+            # allowing it to recover when the transient error resolves.
+            if bucket_type == BucketType.UNKNOWN:
+                return bucket_type
+            with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                _GLOBAL_STORAGE_LAYOUT_CACHE[bucket] = bucket_type
+            self._storage_layout_cache[bucket] = bucket_type
+            return bucket_type
+
+    def _sync_lookup_bucket_type(self, bucket):
+        # 1. Fast path: check global process cache
+        with _GLOBAL_STORAGE_LAYOUT_LOCK:
+            if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
+
+            # 2. Check if another thread is already fetching storage layout for this bucket
+            if bucket in _GLOBAL_STORAGE_LAYOUT_EVENTS:
+                event = _GLOBAL_STORAGE_LAYOUT_EVENTS[bucket]
+                leader = False
+            else:
+                event = threading.Event()
+                _GLOBAL_STORAGE_LAYOUT_EVENTS[bucket] = event
+                leader = True
+
+        if not leader:
+            # Wait for the in-flight leader thread to finish
+            event.wait(timeout=30.0)
+            with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                    return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+
+        try:
+            bucket_type = asyn.sync(self.loop, self._lookup_bucket_type, bucket)
+            return bucket_type
+        finally:
+            if leader:
+                with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                    _GLOBAL_STORAGE_LAYOUT_EVENTS.pop(bucket, None)
+                    event.set()
 
     async def _get_bucket_type(self, bucket):
         try:

@@ -197,11 +197,10 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                 logger.info(
                     f"[custom log] ALTS channel warmup for {bucket_name}/{object_name} completed in "
                     f"{(time.perf_counter() - t_warm) * 1000:.2f} ms"
-                )
+            )
 
     try:
         t_mrd = time.perf_counter()
-        async with acquire_create_mrd_slot():
             mrd = await AsyncMultiRangeDownloader.create_mrd(
                 grpc_client, bucket_name, object_name, generation
             )
@@ -372,7 +371,7 @@ class PartialView:
                     f"Attempted to write {size} bytes "
                     f"at offset {self.current_offset}. "
                     f"Max capacity is {self.expected_size} bytes."
-                )
+            )
                 raise BufferError(error_msg)
 
             abs_offset = self.start_offset + self.current_offset
@@ -466,7 +465,7 @@ class DirectMemmoveBuffer:
                     raise ValueError(
                         f"Overlapping view requested: [{start}, {end}) "
                         f"overlaps with already allocated view [{a_start}, {a_end})"
-                    )
+                )
 
             self._allocated_intervals.append((start, end))
 
@@ -514,19 +513,19 @@ class DirectMemmoveBuffer:
                     if HAS_CPYTHON_API:
                         self._result_bytes = PyBytes_FromStringAndSize(
                             None, self.expected_size
-                        )
+                    )
                         self._start_address = PyBytes_AsString(self._result_bytes)
                     else:
                         self._result_bytes = bytearray(self.expected_size)
                         self._start_address = (
                             -1
-                        )  # Dummy value to pass the defensive check below
+                    )  # Dummy value to pass the defensive check below
 
                 # Defensive programming: gracefully catch internal overwrite attempts
                 if self._start_address is None:
                     raise BufferError(
                         "Attempted to execute standard write over a Zero-Copied payload."
-                    )
+                )
 
                 if self._pending_count == 0:
                     self._done_event.clear()
@@ -556,7 +555,7 @@ class DirectMemmoveBuffer:
                 # Slow path, schedule it on executor.
                 return self.executor.submit(
                     self._do_memmove, dest_offset, data_bytes, size
-                )
+            )
             except BaseException as e:
                 with self._lock:
                     self._error = e
@@ -603,7 +602,7 @@ class DirectMemmoveBuffer:
                     f"Buffer incomplete: Expected {self.expected_size} bytes but "
                     f"only populated {self._total_bytes_written}. Returning this "
                     f"payload would leak uninitialized memory."
-                )
+            )
 
             if not isinstance(self._result_bytes, bytes):
                 return bytes(self._result_bytes)
@@ -991,3 +990,19 @@ class MRDPoolCache:
         self._evictable_keys.clear()
         self._closed = True
         await _close_mrds(mrds_to_close, raise_exception=True)
+
+@contextlib.contextmanager
+def acquire_auth_slot_sync(max_concurrency=8):
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+    slot = _get_next_slot(max_concurrency, lock_dir, uid, "auth")
+    fd = _get_slot_fd(slot, lock_dir, uid, name="auth")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)

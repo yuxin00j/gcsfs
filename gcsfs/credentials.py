@@ -122,7 +122,7 @@ class GoogleCredentials:
     def _connect_google_default(self):
         from gcsfs import zb_hns_utils
 
-        with zb_hns_utils.acquire_init_mrd_slot_sync():
+        with zb_hns_utils.acquire_auth_slot_sync():
             with requests.Session() as session:
                 req = Request(session)
                 credentials, project = gauth.default(scopes=[self.scope], request=req)
