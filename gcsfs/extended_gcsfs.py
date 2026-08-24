@@ -1,4 +1,5 @@
 import time
+import threading
 import asyncio
 import contextlib
 import logging
@@ -79,6 +80,11 @@ async def _get_mrd_size(mrd_or_pool):
         return None
     async with _get_mrd_from_pool_or_mrd(mrd_or_pool) as m:
         return m.persisted_size
+
+
+_GLOBAL_STORAGE_LAYOUT_CACHE = {}
+_GLOBAL_STORAGE_LAYOUT_LOCK = threading.Lock()
+_GLOBAL_STORAGE_LAYOUT_EVENTS = {}
 
 
 class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
@@ -284,14 +290,19 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self._grpc_client = None
 
     async def _lookup_bucket_type(self, bucket):
-        if bucket in self._storage_layout_cache:
-            return self._storage_layout_cache[bucket]
+        with _GLOBAL_STORAGE_LAYOUT_LOCK:
+            if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
 
         if self._bucket_lookup_lock is None:
             self._bucket_lookup_lock = asyncio.Lock()
 
         async with self._bucket_lookup_lock:
-            # Double check cache inside lock
+            with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                    return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
             if bucket in self._storage_layout_cache:
                 return self._storage_layout_cache[bucket]
 
@@ -301,10 +312,43 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             # allowing it to recover when the transient error resolves.
             if bucket_type == BucketType.UNKNOWN:
                 return bucket_type
+            with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                _GLOBAL_STORAGE_LAYOUT_CACHE[bucket] = bucket_type
             self._storage_layout_cache[bucket] = bucket_type
-            return self._storage_layout_cache[bucket]
+            return bucket_type
 
-    _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
+    def _sync_lookup_bucket_type(self, bucket):
+        # 1. Fast path: check global process cache
+        with _GLOBAL_STORAGE_LAYOUT_LOCK:
+            if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
+
+            # 2. Check if another thread is already fetching storage layout for this bucket
+            if bucket in _GLOBAL_STORAGE_LAYOUT_EVENTS:
+                event = _GLOBAL_STORAGE_LAYOUT_EVENTS[bucket]
+                leader = False
+            else:
+                event = threading.Event()
+                _GLOBAL_STORAGE_LAYOUT_EVENTS[bucket] = event
+                leader = True
+
+        if not leader:
+            # Wait for the in-flight leader thread to finish
+            event.wait(timeout=30.0)
+            with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                if bucket in _GLOBAL_STORAGE_LAYOUT_CACHE:
+                    return _GLOBAL_STORAGE_LAYOUT_CACHE[bucket]
+
+        try:
+            bucket_type = asyn.sync(self.loop, self._lookup_bucket_type, bucket)
+            return bucket_type
+        finally:
+            if leader:
+                with _GLOBAL_STORAGE_LAYOUT_LOCK:
+                    _GLOBAL_STORAGE_LAYOUT_EVENTS.pop(bucket, None)
+                    event.set()
 
     async def _get_bucket_type(self, bucket):
         try:
