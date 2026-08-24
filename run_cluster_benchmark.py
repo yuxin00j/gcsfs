@@ -42,7 +42,10 @@ import json
 import resource
 import statistics
 import threading
+import logging
 import multiprocessing as mp
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 from concurrent.futures import ThreadPoolExecutor
 
 def thread_task(fs, file_path):
