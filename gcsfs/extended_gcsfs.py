@@ -125,7 +125,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         # By default, files in zonal buckets are left unfinalized to allow appends.
         self.finalize_on_close = finalize_on_close
         self._grpc_client = None
+        self._grpc_client_lock = None
         self._storage_control_client = None
+        self._storage_control_client_lock = None
+        self._bucket_lookup_lock = None
         # Adds user-passed credentials to ExtendedGcsFileSystem to pass to gRPC/Storage Control clients.
         # We unwrap the nested credentials here because self.credentials is a GCSFS wrapper,
         # but the clients expect the underlying google.auth credentials object.
@@ -207,45 +210,53 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_grpc_client(self):
         if self._grpc_client is None:
-            async with zb_hns_utils.acquire_init_mrd_slot():
+            if self._grpc_client_lock is None:
+                self._grpc_client_lock = asyncio.Lock()
+            async with self._grpc_client_lock:
                 if self._grpc_client is None:
-                    client_options = ClientOptions(quota_project_id=self._user_project)
-                    if self._location:
-                        # client_options expects only the host:port, without any protocol or path components.
-                        endpoint = self._location.split("://")[-1].split("/")[0]
-                        client_options.api_endpoint = endpoint
-                    self._grpc_client = AsyncGrpcClient(
-                        credentials=self.credential,
-                        client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
-                        client_options=client_options,
-                    )
+                    async with zb_hns_utils.acquire_init_mrd_slot():
+                        if self._grpc_client is None:
+                            client_options = ClientOptions(quota_project_id=self._user_project)
+                            if self._location:
+                                # client_options expects only the host:port, without any protocol or path components.
+                                endpoint = self._location.split("://")[-1].split("/")[0]
+                                client_options.api_endpoint = endpoint
+                            self._grpc_client = AsyncGrpcClient(
+                                credentials=self.credential,
+                                client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
+                                client_options=client_options,
+                            )
         return self._grpc_client
 
     async def _get_control_plane_client(self):
         if self._storage_control_client is None:
-            # Initialize the storage control plane client for bucket
-            # metadata operations
-            transport_cls = (
-                storage_control_v2.StorageControlAsyncClient.get_transport_class(
-                    "grpc_asyncio"
-                )
-            )
-            channel_kwargs = {
-                "credentials": self.credential,
-                "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
-                "quota_project_id": self._user_project,
-            }
-            if self._location:
-                # Extract host:port safely (strips protocol and trailing URL paths if any).
-                endpoint = self._location.split("://")[-1].split("/")[0]
-                channel_kwargs["host"] = endpoint
+            if self._storage_control_client_lock is None:
+                self._storage_control_client_lock = asyncio.Lock()
+            async with self._storage_control_client_lock:
+                if self._storage_control_client is None:
+                    # Initialize the storage control plane client for bucket
+                    # metadata operations
+                    transport_cls = (
+                        storage_control_v2.StorageControlAsyncClient.get_transport_class(
+                            "grpc_asyncio"
+                        )
+                    )
+                    channel_kwargs = {
+                        "credentials": self.credential,
+                        "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
+                        "quota_project_id": self._user_project,
+                    }
+                    if self._location:
+                        # Extract host:port safely (strips protocol and trailing URL paths if any).
+                        endpoint = self._location.split("://")[-1].split("/")[0]
+                        channel_kwargs["host"] = endpoint
 
-            channel = transport_cls.create_channel(**channel_kwargs)
+                    channel = transport_cls.create_channel(**channel_kwargs)
 
-            transport = transport_cls(channel=channel)
-            self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
-                transport=transport
-            )
+                    transport = transport_cls(channel=channel)
+                    self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
+                        transport=transport
+                    )
         return self._storage_control_client
 
     async def _close_resources(self):
@@ -277,14 +288,23 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     async def _lookup_bucket_type(self, bucket):
         if bucket in self._storage_layout_cache:
             return self._storage_layout_cache[bucket]
-        bucket_type = await self._get_bucket_type(bucket)
-        # Don't cache UNKNOWN type.
-        # This ensures that subsequent operations will retry the lookup,
-        # allowing it to recover when the transient error resolves.
-        if bucket_type == BucketType.UNKNOWN:
-            return bucket_type
-        self._storage_layout_cache[bucket] = bucket_type
-        return self._storage_layout_cache[bucket]
+
+        if self._bucket_lookup_lock is None:
+            self._bucket_lookup_lock = asyncio.Lock()
+
+        async with self._bucket_lookup_lock:
+            # Double check cache inside lock
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
+
+            bucket_type = await self._get_bucket_type(bucket)
+            # Don't cache UNKNOWN type.
+            # This ensures that subsequent operations will retry the lookup,
+            # allowing it to recover when the transient error resolves.
+            if bucket_type == BucketType.UNKNOWN:
+                return bucket_type
+            self._storage_layout_cache[bucket] = bucket_type
+            return self._storage_layout_cache[bucket]
 
     _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
 
