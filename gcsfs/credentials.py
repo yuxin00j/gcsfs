@@ -1,3 +1,8 @@
+
+import threading
+from gcsfs.zb_hns_utils import acquire_auth_slot_sync
+
+
 import json
 import logging
 import os
@@ -122,7 +127,8 @@ class GoogleCredentials:
     def _connect_google_default(self):
         with requests.Session() as session:
             req = Request(session)
-            credentials, project = gauth.default(scopes=[self.scope], request=req)
+            with acquire_auth_slot_sync():
+                credentials, project = gauth.default(scopes=[self.scope], request=req)
 
         msg = textwrap.dedent(
             """\
@@ -145,7 +151,8 @@ class GoogleCredentials:
         try:
             with requests.Session() as session:
                 req = Request(session)
-                self.credentials.refresh(req)
+                with acquire_auth_slot_sync():
+                        self.credentials.refresh(req)
         except gauth.exceptions.RefreshError as error:
             raise ValueError("Invalid gcloud credentials") from error
 
@@ -253,7 +260,8 @@ class GoogleCredentials:
 
                 logger.debug("GCS refresh")
                 try:
-                    self.credentials.refresh(req)
+                    with acquire_auth_slot_sync():
+                        self.credentials.refresh(req)
                 except gauth.exceptions.RefreshError as error:
                     # There may be scenarios where this error is raised from the client side due
                     # to missing necessary attributes to refresh the token, For instance
