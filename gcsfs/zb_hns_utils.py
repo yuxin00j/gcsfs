@@ -983,7 +983,7 @@ class MRDPoolCache:
         self._closed = True
         await _close_mrds(mrds_to_close, raise_exception=True)
 
-@asynccontextmanager
+@contextlib.asynccontextmanager
 async def acquire_alts_slot(max_concurrency=DEFAULT_ALTS_CONCURRENCY):
     """
     Acquires a slot for ALTS channel_ready() using a file lock.
