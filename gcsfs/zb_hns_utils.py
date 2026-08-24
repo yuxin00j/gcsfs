@@ -122,6 +122,28 @@ async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
         os.close(fd)
 
 
+@contextlib.contextmanager
+def sync_acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+    """
+    Synchronous version of acquire_init_mrd_slot.
+    """
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+
+    slot = _get_next_slot(max_concurrency, lock_dir, uid, "alts")
+    fd = _get_slot_fd(slot, lock_dir, uid, name="alts")
+
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 @contextlib.asynccontextmanager
 async def acquire_create_mrd_slot(max_concurrency=DEFAULT_CREATE_MRD_CONCURRENCY):
     """
@@ -171,26 +193,34 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                 async with acquire_init_mrd_slot():
                     try:
                         channel = grpc_client.grpc_client.transport.grpc_channel
+                        t_channel_ready_start = time.perf_counter()
                         await channel.channel_ready()
+                        t_channel_ready_end = time.perf_counter()
+                        channel_ready_ms = (t_channel_ready_end - t_channel_ready_start) * 1000
                     except Exception as e:
                         logger.debug(f"Failed to explicitly warm channel: {e}")
+                        channel_ready_ms = 0
                 _warmed_channels[grpc_client] = True
                 warmed = True
                 logger.info(
                     f"[custom log] ALTS channel warmup for {bucket_name}/{object_name} completed in "
-                    f"{(time.perf_counter() - t_warm) * 1000:.2f} ms"
+                    f"{(time.perf_counter() - t_warm) * 1000:.2f} ms "
+                    f"(pure channel_ready network: {channel_ready_ms:.2f} ms)"
                 )
 
     try:
-        t_mrd = time.perf_counter()
+        t_mrd_wait = time.perf_counter()
         async with acquire_create_mrd_slot():
+            t_mrd_call = time.perf_counter()
             mrd = await AsyncMultiRangeDownloader.create_mrd(
                 grpc_client, bucket_name, object_name, generation
             )
+            t_mrd_end = time.perf_counter()
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "
-            f"(create_mrd: {(time.perf_counter() - t_mrd) * 1000:.2f} ms, warmed={warmed})"
+            f"(create_mrd wait+call: {(time.perf_counter() - t_mrd_wait) * 1000:.2f} ms, "
+            f"pure network: {(t_mrd_end - t_mrd_call) * 1000:.2f} ms, warmed={warmed})"
         )
         return mrd
     except NotFound:
