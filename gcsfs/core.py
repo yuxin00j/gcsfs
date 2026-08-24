@@ -1,4 +1,3 @@
-from gcsfs.zb_hns_utils import acquire_info_slot
 """
 Google Cloud Storage pythonic interface
 """
@@ -625,8 +624,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # fall back to a bucket list + filter to object name (storage.objects.list).
         try:
             res = await self._call(
-                    "GET", "b/{}/o/{}", bucket, key, json_out=True, generation=generation
-                )
+                "GET", "b/{}/o/{}", bucket, key, json_out=True, generation=generation
+            )
         except OSError as e:
             if not str(e).startswith("Forbidden"):
                 raise
@@ -1090,9 +1089,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     async def _info(self, path, generation=None, **kwargs):
         """File information about this path."""
-        import random, asyncio
-        await asyncio.sleep(random.random() * 1.5)
-
         path = self._strip_protocol(path).rstrip("/")
         if "/" not in path:
             try:

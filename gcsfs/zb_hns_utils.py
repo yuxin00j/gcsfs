@@ -984,49 +984,6 @@ class MRDPoolCache:
         await _close_mrds(mrds_to_close, raise_exception=True)
 
 
-@contextlib.contextmanager
-def acquire_auth_slot_sync(max_concurrency=16):
-    """
-    Acquires a slot for Auth credentials fetching using a file lock.
-    """
-    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
-    uid = os.getuid() if hasattr(os, "getuid") else "default"
-    
-    acquired = False
-    fd = -1
-    for slot in range(max_concurrency):
-        lock_file = os.path.join(lock_dir, f".gcsfs_auth_slot_{uid}_{slot}.lock")
-        try:
-            fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-            break
-        except (IOError, OSError):
-            if fd != -1:
-                os.close(fd)
-                fd = -1
-            continue
-            
-    if not acquired:
-        # If all slots are full, block on a random slot
-        import random
-        slot = random.randint(0, max_concurrency - 1)
-        lock_file = os.path.join(lock_dir, f".gcsfs_auth_slot_{uid}_{slot}.lock")
-        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        
-    try:
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
-
-
-
-
 @contextlib.asynccontextmanager
 async def acquire_control_plane_slot(max_concurrency=4):
     """
@@ -1055,47 +1012,6 @@ async def acquire_control_plane_slot(max_concurrency=4):
         import random
         slot = random.randint(0, max_concurrency - 1)
         lock_file = os.path.join(lock_dir, f".gcsfs_control_slot_{uid}_{slot}.lock")
-        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
-        await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
-        
-    try:
-        yield
-    finally:
-        try:
-            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
-
-
-@contextlib.asynccontextmanager
-async def acquire_info_slot(max_concurrency=128):
-    """
-    Acquires a slot for GCS API calls (like _info) using a file lock.
-    """
-    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
-    uid = os.getuid() if hasattr(os, "getuid") else "default"
-    loop = asyncio.get_running_loop()
-    
-    acquired = False
-    fd = -1
-    for slot in range(max_concurrency):
-        lock_file = os.path.join(lock_dir, f".gcsfs_info_slot_{uid}_{slot}.lock")
-        try:
-            fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
-            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-            break
-        except (IOError, OSError):
-            if fd != -1:
-                os.close(fd)
-                fd = -1
-            continue
-            
-    if not acquired:
-        import random
-        slot = random.randint(0, max_concurrency - 1)
-        lock_file = os.path.join(lock_dir, f".gcsfs_info_slot_{uid}_{slot}.lock")
         fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
         await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
         
