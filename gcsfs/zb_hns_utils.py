@@ -94,24 +94,6 @@ def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str, name: str = "a
 
 
 
-@contextlib.contextmanager
-def acquire_init_mrd_slot_sync(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
-    """
-    Synchronous rate-limiter for credentials acquisition and metadata server calls.
-    """
-    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
-    uid = os.getuid() if hasattr(os, "getuid") else "default"
-    slot = _get_next_slot(max_concurrency, lock_dir, uid, "alts")
-    fd = _get_slot_fd(slot, lock_dir, uid, name="alts")
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    try:
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
 
 
 @contextlib.asynccontextmanager
