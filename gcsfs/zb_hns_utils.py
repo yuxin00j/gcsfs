@@ -29,11 +29,11 @@ except ValueError:
 
 # ALTS handshake and create_mrd concurrency limits
 try:
-    DEFAULT_INIT_MRD_CONCURRENCY = int(
-        os.environ.get("GCSFS_ALTS_CONCURRENCY", "8")
+    DEFAULT_AUTH_CONCURRENCY = int(
+        os.environ.get("GCSFS_AUTH_CONCURRENCY", "16")
     )
 except ValueError:
-    DEFAULT_INIT_MRD_CONCURRENCY = 8
+    DEFAULT_AUTH_CONCURRENCY = 16
 
 
 
@@ -92,7 +92,7 @@ def _get_next_slot(max_concurrency: int, lock_dir: str, uid: str, name: str = "a
 
 
 @contextlib.asynccontextmanager
-async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+async def acquire_auth_slot(max_concurrency=DEFAULT_AUTH_CONCURRENCY):
     """
     Limits the number of concurrent ALTS handshakes across ALL processes on this machine.
     Distributes requests perfectly across slots to minimize queue depth and max latency.
@@ -118,9 +118,9 @@ async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
 
 
 @contextlib.contextmanager
-def sync_acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+def sync_acquire_auth_slot(max_concurrency=DEFAULT_AUTH_CONCURRENCY):
     """
-    Synchronous version of acquire_init_mrd_slot.
+    Synchronous version of acquire_auth_slot.
     """
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
@@ -162,16 +162,15 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
         async with lock:
             if not _warmed_channels.get(grpc_client):
                 t_warm = time.perf_counter()
-                async with acquire_init_mrd_slot():
-                    try:
-                        channel = grpc_client.grpc_client.transport.grpc_channel
-                        t_channel_ready_start = time.perf_counter()
-                        await channel.channel_ready()
-                        t_channel_ready_end = time.perf_counter()
-                        channel_ready_ms = (t_channel_ready_end - t_channel_ready_start) * 1000
-                    except Exception as e:
-                        logger.debug(f"Failed to explicitly warm channel: {e}")
-                        channel_ready_ms = 0
+                try:
+                    channel = grpc_client.grpc_client.transport.grpc_channel
+                    t_channel_ready_start = time.perf_counter()
+                    await channel.channel_ready()
+                    t_channel_ready_end = time.perf_counter()
+                    channel_ready_ms = (t_channel_ready_end - t_channel_ready_start) * 1000
+                except Exception as e:
+                    logger.debug(f"Failed to explicitly warm channel: {e}")
+                    channel_ready_ms = 0
                 _warmed_channels[grpc_client] = True
                 warmed = True
                 logger.info(

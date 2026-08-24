@@ -1382,8 +1382,8 @@ def test_direct_memmove_buffer_pypy_fallback():
 
 
 @pytest.mark.asyncio
-async def test_acquire_init_mrd_slot():
-    async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=4):
+async def test_acquire_auth_slot():
+    async with zb_hns_utils.acquire_auth_slot(max_concurrency=4):
         pass
 
 

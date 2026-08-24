@@ -214,7 +214,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 self._grpc_client_lock = asyncio.Lock()
             async with self._grpc_client_lock:
                 if self._grpc_client is None:
-                    async with zb_hns_utils.acquire_init_mrd_slot():
+                    async with zb_hns_utils.acquire_auth_slot():
                         if self._grpc_client is None:
                             client_options = ClientOptions(quota_project_id=self._user_project)
                             if self._location:

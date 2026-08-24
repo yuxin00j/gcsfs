@@ -120,10 +120,10 @@ class GoogleCredentials:
             warnings.warn("Saving token cache failed: " + str(e))
 
     def _connect_google_default(self):
-        from gcsfs.zb_hns_utils import sync_acquire_init_mrd_slot
+        from gcsfs.zb_hns_utils import sync_acquire_auth_slot
         with requests.Session() as session:
             req = Request(session)
-            with sync_acquire_init_mrd_slot():
+            with sync_acquire_auth_slot():
                 credentials, project = gauth.default(scopes=[self.scope], request=req)
 
         msg = textwrap.dedent(
@@ -147,8 +147,8 @@ class GoogleCredentials:
         try:
             with requests.Session() as session:
                 req = Request(session)
-                from gcsfs.zb_hns_utils import sync_acquire_init_mrd_slot
-                with sync_acquire_init_mrd_slot():
+                from gcsfs.zb_hns_utils import sync_acquire_auth_slot
+                with sync_acquire_auth_slot():
                     self.credentials.refresh(req)
         except gauth.exceptions.RefreshError as error:
             raise ValueError("Invalid gcloud credentials") from error
@@ -257,8 +257,8 @@ class GoogleCredentials:
 
                 logger.debug("GCS refresh")
                 try:
-                    from gcsfs.zb_hns_utils import sync_acquire_init_mrd_slot
-                    with sync_acquire_init_mrd_slot():
+                    from gcsfs.zb_hns_utils import sync_acquire_auth_slot
+                    with sync_acquire_auth_slot():
                         self.credentials.refresh(req)
                 except gauth.exceptions.RefreshError as error:
                     # There may be scenarios where this error is raised from the client side due
