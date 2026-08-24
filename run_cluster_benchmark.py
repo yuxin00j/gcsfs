@@ -41,6 +41,7 @@ import time
 import json
 import resource
 import statistics
+import threading
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 
@@ -56,14 +57,14 @@ def thread_task(fs, file_path):
         return False, latency_ms
 
 def process_worker(args):
-    node_index, proc_id, num_procs, num_threads, file_paths, target_time, sleep_between_waves = args
+    node_index, proc_id, num_procs, num_threads, file_paths, target_time_w1, w1_done_counter, w1_done_lock, w2_target_time, w2_ready_event = args
     
-    # Precision spin-wait to synchronize all processes across all nodes to exact millisecond
-    if target_time > 0:
-        sleep_dur = target_time - time.time()
+    # Precision spin-wait to synchronize all processes across all nodes to exact millisecond for Wave 1
+    if target_time_w1 > 0:
+        sleep_dur = target_time_w1 - time.time()
         if sleep_dur > 0.05:
             time.sleep(sleep_dur - 0.02)
-        while time.time() < target_time:
+        while time.time() < target_time_w1:
             pass
             
     import gcsfs
@@ -84,9 +85,21 @@ def process_worker(args):
             success, lat = f.result()
             wave1_results.append((success, lat))
             
-        # Sleep between waves in the same process
-        if sleep_between_waves > 0:
-            time.sleep(sleep_between_waves)
+        # Signal Wave 1 completion for this process
+        with w1_done_lock:
+            w1_done_counter.value += 1
+            
+        # Wait for Wave 2 cluster synchronization signal
+        w2_ready_event.wait()
+        
+        # Precision spin-wait to synchronize all processes across all nodes for Wave 2
+        t_w2 = w2_target_time.value
+        if t_w2 > 0:
+            sleep_dur = t_w2 - time.time()
+            if sleep_dur > 0.05:
+                time.sleep(sleep_dur - 0.02)
+            while time.time() < t_w2:
+                pass
             
         # --- WAVE 2: Warm channel opens ---
         futures2 = []
@@ -160,16 +173,16 @@ def main():
     print(f"Discovered {len(file_paths)} files in dataset.", flush=True)
 
     # ----------------------------------------------------
-    # Distributed Synchronization Barrier Across All Pods
+    # Distributed Synchronization Barrier Across All Pods (Wave 1)
     # ----------------------------------------------------
     ready_file = f"{barrier_dir}/ready_{node_index}.txt"
     start_file = f"{barrier_dir}/start_time.json"
 
     with fs_init.open(ready_file, "w") as f:
         f.write(f"ready {node_index} {time.time()}")
-    print(f"Node {node_index} registered readiness. Waiting for all {num_nodes} nodes to reach barrier...", flush=True)
+    print(f"Node {node_index} registered readiness. Waiting for all {num_nodes} nodes to reach Wave 1 barrier...", flush=True)
 
-    target_time = 0
+    target_time_w1 = 0
     t_barrier_wait = time.time()
     clean_barrier_dir = barrier_dir.replace("gs://", "")
 
@@ -178,14 +191,14 @@ def main():
         while time.time() - t_barrier_wait < 180:
             try:
                 fs_init.invalidate_cache(clean_barrier_dir)
-                ready_files = [p for p in fs_init.ls(clean_barrier_dir, refresh=True) if "ready_" in p]
+                ready_files = [p for p in fs_init.ls(clean_barrier_dir, refresh=True) if "ready_" in p and "ready_w2" not in p]
                 if len(ready_files) >= num_nodes:
-                    target_time = time.time() + 5.0  # Fire 5.0 seconds in the future
+                    target_time_w1 = time.time() + 5.0  # Fire 5.0 seconds in the future
                     with fs_init.open(start_file, "w") as f:
-                        f.write(json.dumps({"target_time": target_time}))
-                    print(f"All {num_nodes} nodes ready! Set synchronized start time to: {target_time:.3f}", flush=True)
+                        f.write(json.dumps({"target_time": target_time_w1}))
+                    print(f"All {num_nodes} nodes ready! Set synchronized Wave 1 start time to: {target_time_w1:.3f}", flush=True)
                     break
-            except Exception as e:
+            except Exception:
                 pass
             time.sleep(0.5)
     else:
@@ -196,32 +209,95 @@ def main():
                 if fs_init.exists(start_file):
                     content = fs_init.cat(start_file).decode("utf-8")
                     data = json.loads(content)
-                    target_time = data["target_time"]
-                    print(f"Received synchronized start time: {target_time:.3f}", flush=True)
+                    target_time_w1 = data["target_time"]
+                    print(f"Received synchronized Wave 1 start time: {target_time_w1:.3f}", flush=True)
                     break
-            except Exception as e:
+            except Exception:
                 pass
             time.sleep(0.5)
 
-    if target_time == 0:
-        print("Warning: Barrier timed out! Proceeding without synchronization.", flush=True)
+    if target_time_w1 == 0:
+        print("Warning: Wave 1 barrier timed out! Proceeding without synchronization.", flush=True)
     else:
-        remaining = target_time - time.time()
+        remaining = target_time_w1 - time.time()
         print(f"Synchronized barrier active. All {num_nodes} nodes will fire Wave 1 in {remaining:.2f} seconds.", flush=True)
 
+    ctx = mp.get_context("forkserver")
+    manager = ctx.Manager()
+    w1_done_counter = manager.Value('i', 0)
+    w1_done_lock = manager.Lock()
+    w2_target_time = manager.Value('d', 0.0)
+    w2_ready_event = manager.Event()
+
     tasks = [
-        (node_index, p, num_procs, num_threads, file_paths, target_time, sleep_between_waves)
+        (node_index, p, num_procs, num_threads, file_paths, target_time_w1, w1_done_counter, w1_done_lock, w2_target_time, w2_ready_event)
         for p in range(num_procs)
     ]
 
-    ctx = mp.get_context("forkserver")
+    def coordinate_wave2_barrier():
+        # 1. Wait until all local processes on this node finish Wave 1
+        while w1_done_counter.value < num_procs:
+            time.sleep(0.01)
+            
+        ready_w2_file = f"{barrier_dir}/ready_w2_{node_index}.txt"
+        start_w2_file = f"{barrier_dir}/start_time_w2.json"
+        
+        with fs_init.open(ready_w2_file, "w") as f:
+            f.write(f"ready_w2 {node_index} {time.time()}")
+        print(f"Node {node_index} finished Wave 1. Registered for Wave 2 barrier...", flush=True)
+        
+        t_w2_barrier_wait = time.time()
+        target_time_w2 = 0
+        
+        if node_index == 0:
+            while time.time() - t_w2_barrier_wait < 180:
+                try:
+                    fs_init.invalidate_cache(clean_barrier_dir)
+                    ready_w2_files = [p for p in fs_init.ls(clean_barrier_dir, refresh=True) if "ready_w2_" in p]
+                    if len(ready_w2_files) >= num_nodes:
+                        target_time_w2 = time.time() + sleep_between_waves
+                        with fs_init.open(start_w2_file, "w") as f:
+                            f.write(json.dumps({"target_time_w2": target_time_w2}))
+                        print(f"All {num_nodes} nodes finished Wave 1! Set synchronized Wave 2 start time to: {target_time_w2:.3f}", flush=True)
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        else:
+            while time.time() - t_w2_barrier_wait < 180:
+                try:
+                    fs_init.invalidate_cache(clean_barrier_dir)
+                    if fs_init.exists(start_w2_file):
+                        content = fs_init.cat(start_w2_file).decode("utf-8")
+                        data = json.loads(content)
+                        target_time_w2 = data["target_time_w2"]
+                        print(f"Received synchronized Wave 2 start time: {target_time_w2:.3f}", flush=True)
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                
+        if target_time_w2 == 0:
+            target_time_w2 = time.time() + sleep_between_waves
+            print(f"Warning: Wave 2 barrier timed out, fallback start time: {target_time_w2:.3f}", flush=True)
+            
+        w2_target_time.value = target_time_w2
+        w2_ready_event.set()
+
+    coord_thread = threading.Thread(target=coordinate_wave2_barrier)
+    coord_thread.daemon = True
+    coord_thread.start()
+
     t_start = time.time()
 
     with ctx.Pool(num_procs) as pool:
         worker_outputs = pool.map(process_worker, tasks)
 
+    coord_thread.join()
+    manager.shutdown()
+
     t_end = time.time()
-    wall_time = t_end - (target_time if target_time > 0 and target_time < t_end else t_start)
+    wall_time = t_end - (target_time_w1 if target_time_w1 > 0 and target_time_w1 < t_end else t_start)
 
     all_w1 = []
     all_w2 = []
