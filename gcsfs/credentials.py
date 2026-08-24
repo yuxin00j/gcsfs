@@ -120,15 +120,9 @@ class GoogleCredentials:
             warnings.warn("Saving token cache failed: " + str(e))
 
     def _connect_google_default(self):
-        import time
-        import logging
-        logger = logging.getLogger('gcsfs')
-        t0 = time.perf_counter()
         with requests.Session() as session:
             req = Request(session)
             credentials, project = gauth.default(scopes=[self.scope], request=req)
-        t1 = time.perf_counter()
-        logger.info(f"[custom log] google.auth.default() took {(t1-t0)*1000:.2f} ms")
 
         msg = textwrap.dedent(
             """\
@@ -151,13 +145,7 @@ class GoogleCredentials:
         try:
             with requests.Session() as session:
                 req = Request(session)
-                import time
-                import logging
-                logger = logging.getLogger('gcsfs')
-                t0 = time.perf_counter()
                 self.credentials.refresh(req)
-                t1 = time.perf_counter()
-                logger.info(f"[custom log] credentials.refresh() took {(t1-t0)*1000:.2f} ms")
         except gauth.exceptions.RefreshError as error:
             raise ValueError("Invalid gcloud credentials") from error
 
@@ -263,17 +251,9 @@ class GoogleCredentials:
                 if self._credentials_valid(refresh_buffer):
                     return  # repeat check to avoid race conditions
 
-                import logging
-                logger = logging.getLogger("gcsfs")
                 logger.debug("GCS refresh")
                 try:
-                    import time
-                    import logging
-                    logger = logging.getLogger('gcsfs')
-                    t0 = time.perf_counter()
                     self.credentials.refresh(req)
-                    t1 = time.perf_counter()
-                    logger.info(f"[custom log] credentials.refresh() took {(t1-t0)*1000:.2f} ms")
                 except gauth.exceptions.RefreshError as error:
                     # There may be scenarios where this error is raised from the client side due
                     # to missing necessary attributes to refresh the token, For instance

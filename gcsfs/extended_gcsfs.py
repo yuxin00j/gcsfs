@@ -140,7 +140,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         if self.credentials.token == "anon":
             self.credential = AnonymousCredentials()
         self._storage_layout_cache = {}
-        self._storage_layout_lock = __import__('asyncio').Lock()
         self._memmove_executor = ThreadPoolExecutor(
             max_workers=kwargs.get("memmove_max_workers", 8)
         )
