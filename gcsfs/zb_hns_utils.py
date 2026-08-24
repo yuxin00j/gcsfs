@@ -34,6 +34,15 @@ try:
     )
 except ValueError:
     DEFAULT_AUTH_CONCURRENCY = 16
+try:
+    DEFAULT_ALTS_CONCURRENCY = int(os.environ.get("GCSFS_ALTS_CONCURRENCY", "32"))
+except ValueError:
+    DEFAULT_ALTS_CONCURRENCY = 32
+
+try:
+    DEFAULT_ALTS_CONCURRENCY = int(os.environ.get("GCSFS_ALTS_CONCURRENCY", "32"))
+except ValueError:
+    DEFAULT_ALTS_CONCURRENCY = 32
 
 
 
@@ -165,7 +174,8 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                 try:
                     channel = grpc_client.grpc_client.transport.grpc_channel
                     t_channel_ready_start = time.perf_counter()
-                    await channel.channel_ready()
+                    async with acquire_alts_slot():
+                        await channel.channel_ready()
                     t_channel_ready_end = time.perf_counter()
                     channel_ready_ms = (t_channel_ready_end - t_channel_ready_start) * 1000
                 except Exception as e:
@@ -972,3 +982,41 @@ class MRDPoolCache:
         self._evictable_keys.clear()
         self._closed = True
         await _close_mrds(mrds_to_close, raise_exception=True)
+
+@asynccontextmanager
+async def acquire_alts_slot(max_concurrency=DEFAULT_ALTS_CONCURRENCY):
+    """
+    Acquires a slot for ALTS channel_ready() using a file lock.
+    """
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+    loop = asyncio.get_running_loop()
+    
+    acquired = False
+    fd = -1
+    for slot in range(max_concurrency):
+        lock_file = os.path.join(lock_dir, f".gcsfs_alts_slot_{uid}_{slot}.lock")
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except (IOError, OSError):
+            if fd != -1:
+                os.close(fd)
+            fd = -1
+
+    if not acquired:
+        slot = random.randint(0, max_concurrency - 1)
+        lock_file = os.path.join(lock_dir, f".gcsfs_alts_slot_{uid}_{slot}.lock")
+        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
+
+    try:
+        yield
+    finally:
+        try:
+            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
