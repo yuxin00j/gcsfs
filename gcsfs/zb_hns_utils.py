@@ -39,12 +39,6 @@ try:
 except ValueError:
     DEFAULT_ALTS_CONCURRENCY = 16
 
-try:
-    DEFAULT_ALTS_CONCURRENCY = int(os.environ.get("GCSFS_ALTS_CONCURRENCY", "16"))
-except ValueError:
-    DEFAULT_ALTS_CONCURRENCY = 16
-
-
 
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
