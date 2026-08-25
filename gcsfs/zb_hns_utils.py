@@ -46,15 +46,15 @@ def _get_next_slot(max_concurrency, lock_dir, uid, name="alts"):
         os.close(fd)
 
 @contextlib.asynccontextmanager
-async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY, name="alts"):
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
 
     loop = asyncio.get_running_loop()
     slot = await loop.run_in_executor(
-        None, _get_next_slot, max_concurrency, lock_dir, uid
+        None, _get_next_slot, max_concurrency, lock_dir, uid, name
     )
-    fd = _get_slot_fd(slot, lock_dir, uid)
+    fd = _get_slot_fd(slot, lock_dir, uid, name)
 
     await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
     try:
@@ -142,9 +142,10 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                 )
     try:
         t_mrd = time.perf_counter()
-        mrd = await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation
-        )
+        async with acquire_init_mrd_slot(name="create_mrd"):
+            mrd = await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "
