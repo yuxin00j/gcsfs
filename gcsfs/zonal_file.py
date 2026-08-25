@@ -1,5 +1,5 @@
-import time
 import logging
+import time
 
 from fsspec import asyn
 from google.cloud.storage.asyncio.async_appendable_object_writer import (

@@ -1,18 +1,15 @@
-import weakref
 import asyncio
 import collections
 import concurrent.futures
 import contextlib
 import fcntl
-import tempfile
-import asyncio
 import os
+import tempfile
 import time
+import weakref
 
 try:
-    GCSFS_ALTS_CONCURRENCY = int(
-        os.environ.get("GCSFS_ALTS_CONCURRENCY", "8")
-    )
+    GCSFS_ALTS_CONCURRENCY = int(os.environ.get("GCSFS_ALTS_CONCURRENCY", "8"))
 except ValueError:
     GCSFS_ALTS_CONCURRENCY = 8
 
@@ -23,9 +20,11 @@ try:
 except ValueError:
     GCSFS_CREATE_MRD_CONCURRENCY = 32
 
+
 def _get_slot_fd(slot, lock_dir, uid, name="alts"):
     lock_file = os.path.join(lock_dir, f"gcsfs_{name}_{uid}_{slot}.lock")
     return os.open(lock_file, os.O_CREAT | os.O_RDWR)
+
 
 def _get_next_slot(max_concurrency, lock_dir, uid, name="alts"):
     counter_file = os.path.join(lock_dir, f"gcsfs_{name}_{uid}_counter.lock")
@@ -37,13 +36,13 @@ def _get_next_slot(max_concurrency, lock_dir, uid, name="alts"):
             val = 0
         else:
             try:
-                val = int(val_bytes.decode('utf-8').strip())
+                val = int(val_bytes.decode("utf-8").strip())
             except ValueError:
                 val = 0
         next_val = (val + 1) % max_concurrency
         os.lseek(fd, 0, os.SEEK_SET)
         os.ftruncate(fd, 0)
-        os.write(fd, str(next_val).encode('utf-8'))
+        os.write(fd, str(next_val).encode("utf-8"))
         return val
     finally:
         try:
@@ -51,6 +50,7 @@ def _get_next_slot(max_concurrency, lock_dir, uid, name="alts"):
         except OSError:
             pass
         os.close(fd)
+
 
 @contextlib.asynccontextmanager
 async def acquire_init_mrd_slot(max_concurrency=None, name="alts"):
@@ -79,11 +79,12 @@ async def acquire_init_mrd_slot(max_concurrency=None, name="alts"):
             pass
         os.close(fd)
 
+
 import ctypes
 import logging
 import os
-import time
 import threading
+import time
 import weakref
 from io import BytesIO
 
@@ -120,14 +121,15 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
-
 _warmed_channels = weakref.WeakKeyDictionary()
 _channel_warm_locks = weakref.WeakKeyDictionary()
+
 
 def _get_channel_lock(grpc_client):
     if grpc_client not in _channel_warm_locks:
         _channel_warm_locks[grpc_client] = asyncio.Lock()
     return _channel_warm_locks[grpc_client]
+
 
 async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     t0 = time.perf_counter()
@@ -142,7 +144,7 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                     try:
                         channel = grpc_client.grpc_client.transport.grpc_channel
                         await channel.channel_ready()
-                    except Exception as e:
+                    except Exception:
                         pass
                     t_warm_exec_end = time.perf_counter()
                 _warmed_channels[grpc_client] = True
@@ -154,15 +156,20 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                     f"exec_ready: {(t_warm_exec_end - t_warm_exec) * 1000:.2f} ms)"
                 )
     try:
-        t_mrd = time.perf_counter()
+        t_mrd_wait = time.perf_counter()
         async with acquire_init_mrd_slot(name="create_mrd"):
+            t_mrd_exec = time.perf_counter()
             mrd = await AsyncMultiRangeDownloader.create_mrd(
                 grpc_client, bucket_name, object_name, generation
             )
+            t_mrd_exec_end = time.perf_counter()
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
             f"{(time.perf_counter() - t0) * 1000:.2f} ms "
-            f"(create_mrd: {(time.perf_counter() - t_mrd) * 1000:.2f} ms, warmed={warmed})"
+            f"(create_mrd_total: {(t_mrd_exec_end - t_mrd_wait) * 1000:.2f} ms, "
+            f"wait_lock: {(t_mrd_exec - t_mrd_wait) * 1000:.2f} ms, "
+            f"exec_mrd: {(t_mrd_exec_end - t_mrd_exec) * 1000:.2f} ms, "
+            f"warmed={warmed})"
         )
         return mrd
     except NotFound:
