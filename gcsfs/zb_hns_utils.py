@@ -123,18 +123,22 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
         lock = _get_channel_lock(grpc_client)
         async with lock:
             if not _warmed_channels.get(grpc_client):
-                t_warm = time.perf_counter()
+                t_warm_wait = time.perf_counter()
                 async with acquire_init_mrd_slot():
+                    t_warm_exec = time.perf_counter()
                     try:
                         channel = grpc_client.grpc_client.transport.grpc_channel
                         await channel.channel_ready()
                     except Exception as e:
                         pass
+                    t_warm_exec_end = time.perf_counter()
                 _warmed_channels[grpc_client] = True
                 warmed = True
                 logger.info(
                     f"[custom log] ALTS channel warmup for {bucket_name}/{object_name} completed in "
-                    f"{(time.perf_counter() - t_warm) * 1000:.2f} ms"
+                    f"{(time.perf_counter() - t_warm_wait) * 1000:.2f} ms "
+                    f"(wait_lock: {(t_warm_exec - t_warm_wait) * 1000:.2f} ms, "
+                    f"exec_ready: {(t_warm_exec_end - t_warm_exec) * 1000:.2f} ms)"
                 )
     try:
         t_mrd = time.perf_counter()
