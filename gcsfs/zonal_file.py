@@ -118,6 +118,9 @@ class ZonalFile(GCSFile):
             size=object_size,
             **kwargs,
         )
+        logger.info(
+            f"[custom log] ZonalFile({path}, mode={mode}) initialized in {(time.perf_counter() - t_open) * 1000:.2f} ms"
+        )
 
     async def _init_mrd(self, bucket_name, object_name, generation=None):
         """
