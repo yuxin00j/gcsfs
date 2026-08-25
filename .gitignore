@@ -108,3 +108,8 @@ libs/*.whl
 
 gcsfs/tests/perf/microbenchmarks/__run__
 gcsfs/tests/perf/subsystembenchmarks/__run__
+*.txt
+*.py
+*.sh
+*.json
+autoresearch-results/
