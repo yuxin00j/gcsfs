@@ -10,11 +10,18 @@ import os
 import time
 
 try:
-    DEFAULT_INIT_MRD_CONCURRENCY = int(
+    GCSFS_ALTS_CONCURRENCY = int(
         os.environ.get("GCSFS_ALTS_CONCURRENCY", "8")
     )
 except ValueError:
-    DEFAULT_INIT_MRD_CONCURRENCY = 8
+    GCSFS_ALTS_CONCURRENCY = 8
+
+try:
+    GCSFS_CREATE_MRD_CONCURRENCY = int(
+        os.environ.get("GCSFS_CREATE_MRD_CONCURRENCY", "32")
+    )
+except ValueError:
+    GCSFS_CREATE_MRD_CONCURRENCY = 32
 
 def _get_slot_fd(slot, lock_dir, uid, name="alts"):
     lock_file = os.path.join(lock_dir, f"gcsfs_{name}_{uid}_{slot}.lock")
@@ -46,7 +53,13 @@ def _get_next_slot(max_concurrency, lock_dir, uid, name="alts"):
         os.close(fd)
 
 @contextlib.asynccontextmanager
-async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY, name="alts"):
+async def acquire_init_mrd_slot(max_concurrency=None, name="alts"):
+    if max_concurrency is None:
+        if name == "create_mrd":
+            max_concurrency = GCSFS_CREATE_MRD_CONCURRENCY
+        else:
+            max_concurrency = GCSFS_ALTS_CONCURRENCY
+
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
 
