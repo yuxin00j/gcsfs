@@ -1,3 +1,4 @@
+import time
 import logging
 
 from fsspec import asyn
@@ -57,6 +58,7 @@ class ZonalFile(GCSFile):
         of `_MAX_CHUNK_SIZE_BYTES` (2 MiB). Note that this higher default value may
         increase memory usage.
         """
+        t_open = time.perf_counter()
         bucket, key, path_generation = gcsfs.split_path(path)
         generation = _coalesce_generation(generation, path_generation)
         if not key:
