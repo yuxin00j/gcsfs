@@ -119,10 +119,12 @@ class GoogleCredentials:
         except Exception as e:
             warnings.warn("Saving token cache failed: " + str(e))
 
+    _auth_lock = __import__("threading").Lock()
     def _connect_google_default(self):
-        with requests.Session() as session:
-            req = Request(session)
-            credentials, project = gauth.default(scopes=[self.scope], request=req)
+        with self._auth_lock:
+            with requests.Session() as session:
+                req = Request(session)
+                credentials, project = gauth.default(scopes=[self.scope], request=req)
 
         msg = textwrap.dedent(
             """\
