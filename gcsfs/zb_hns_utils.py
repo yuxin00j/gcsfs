@@ -1,7 +1,70 @@
+import weakref
 import asyncio
 import collections
 import concurrent.futures
 import contextlib
+import fcntl
+import tempfile
+import asyncio
+import os
+
+try:
+    DEFAULT_INIT_MRD_CONCURRENCY = int(
+        os.environ.get("GCSFS_ALTS_CONCURRENCY", "8")
+    )
+except ValueError:
+    DEFAULT_INIT_MRD_CONCURRENCY = 8
+
+def _get_slot_fd(slot, lock_dir, uid, name="alts"):
+    lock_file = os.path.join(lock_dir, f"gcsfs_{name}_{uid}_{slot}.lock")
+    return os.open(lock_file, os.O_CREAT | os.O_RDWR)
+
+def _get_next_slot(max_concurrency, lock_dir, uid, name="alts"):
+    counter_file = os.path.join(lock_dir, f"gcsfs_{name}_{uid}_counter.lock")
+    fd = os.open(counter_file, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        val_bytes = os.read(fd, 32)
+        if not val_bytes:
+            val = 0
+        else:
+            try:
+                val = int(val_bytes.decode('utf-8').strip())
+            except ValueError:
+                val = 0
+        next_val = (val + 1) % max_concurrency
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(next_val).encode('utf-8'))
+        return val
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+@contextlib.asynccontextmanager
+async def acquire_init_mrd_slot(max_concurrency=DEFAULT_INIT_MRD_CONCURRENCY):
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+
+    loop = asyncio.get_running_loop()
+    slot = await loop.run_in_executor(
+        None, _get_next_slot, max_concurrency, lock_dir, uid
+    )
+    fd = _get_slot_fd(slot, lock_dir, uid)
+
+    await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        try:
+            await loop.run_in_executor(None, fcntl.flock, fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
 import ctypes
 import logging
 import os
@@ -42,18 +105,32 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+
+_warmed_channels = weakref.WeakKeyDictionary()
+_channel_warm_locks = weakref.WeakKeyDictionary()
+
+def _get_channel_lock(grpc_client):
+    if grpc_client not in _channel_warm_locks:
+        _channel_warm_locks[grpc_client] = asyncio.Lock()
+    return _channel_warm_locks[grpc_client]
+
 async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
-    """
-    Creates the AsyncMultiRangeDownloader using an existing client.
-    Wraps Google API errors into standard Python exceptions.
-    """
+    if not _warmed_channels.get(grpc_client):
+        lock = _get_channel_lock(grpc_client)
+        async with lock:
+            if not _warmed_channels.get(grpc_client):
+                async with acquire_init_mrd_slot():
+                    try:
+                        channel = grpc_client.grpc_client.transport.grpc_channel
+                        await channel.channel_ready()
+                    except Exception as e:
+                        pass
+                _warmed_channels[grpc_client] = True
     try:
         return await AsyncMultiRangeDownloader.create_mrd(
             grpc_client, bucket_name, object_name, generation
         )
     except NotFound:
-        # We wrap the error here to match standard Python error handling
-        # and avoid leaking Google API exceptions to users.
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
 
 
