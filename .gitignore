@@ -113,3 +113,4 @@ gcsfs/tests/perf/subsystembenchmarks/__run__
 *.sh
 *.json
 autoresearch-results/
+*.md
