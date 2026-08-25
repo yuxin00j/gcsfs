@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -125,6 +126,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         self.finalize_on_close = finalize_on_close
         self._grpc_client = None
         self._storage_control_client = None
+        self._grpc_client_lock = threading.Lock()
+        self._storage_control_client_lock = threading.Lock()
         # Adds user-passed credentials to ExtendedGcsFileSystem to pass to gRPC/Storage Control clients.
         # We unwrap the nested credentials here because self.credentials is a GCSFS wrapper,
         # but the clients expect the underlying google.auth credentials object.
@@ -206,44 +209,47 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_grpc_client(self):
         if self._grpc_client is None:
-            client_options = ClientOptions(quota_project_id=self._user_project)
-            if self._location:
-                # client_options expects only the host:port, without any protocol or path components.
-                endpoint = self._location.split("://")[-1].split("/")[0]
-                client_options.api_endpoint = endpoint
-            self._grpc_client = AsyncGrpcClient(
-                credentials=self.credential,
-                client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
-                client_options=client_options,
-            )
+            with self._grpc_client_lock:
+                if self._grpc_client is None:
+                    client_options = ClientOptions(quota_project_id=self._user_project)
+                    if self._location:
+                        # client_options expects only the host:port, without any protocol or path components.
+                        endpoint = self._location.split("://")[-1].split("/")[0]
+                        client_options.api_endpoint = endpoint
+                    self._grpc_client = AsyncGrpcClient(
+                        credentials=self.credential,
+                        client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
+                        client_options=client_options,
+                    )
         return self._grpc_client
 
     async def _get_control_plane_client(self):
         if self._storage_control_client is None:
+            with self._storage_control_client_lock:
+                if self._storage_control_client is None:
+                    # Initialize the storage control plane client for bucket
+                    # metadata operations
+                    transport_cls = (
+                        storage_control_v2.StorageControlAsyncClient.get_transport_class(
+                            "grpc_asyncio"
+                        )
+                    )
+                    channel_kwargs = {
+                        "credentials": self.credential,
+                        "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
+                        "quota_project_id": self._user_project,
+                    }
+                    if self._location:
+                        # Extract host:port safely (strips protocol and trailing URL paths if any).
+                        endpoint = self._location.split("://")[-1].split("/")[0]
+                        channel_kwargs["host"] = endpoint
 
-            # Initialize the storage control plane client for bucket
-            # metadata operations
-            transport_cls = (
-                storage_control_v2.StorageControlAsyncClient.get_transport_class(
-                    "grpc_asyncio"
-                )
-            )
-            channel_kwargs = {
-                "credentials": self.credential,
-                "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
-                "quota_project_id": self._user_project,
-            }
-            if self._location:
-                # Extract host:port safely (strips protocol and trailing URL paths if any).
-                endpoint = self._location.split("://")[-1].split("/")[0]
-                channel_kwargs["host"] = endpoint
+                    channel = transport_cls.create_channel(**channel_kwargs)
 
-            channel = transport_cls.create_channel(**channel_kwargs)
-
-            transport = transport_cls(channel=channel)
-            self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
-                transport=transport
-            )
+                    transport = transport_cls(channel=channel)
+                    self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
+                        transport=transport
+                    )
         return self._storage_control_client
 
     async def _close_resources(self):
@@ -260,17 +266,21 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             except Exception as e:
                 logger.warning(f"Failed to close MRDPoolCache: {e}")
         if self._storage_control_client is not None:
-            try:
-                await self._storage_control_client.transport.close()
-            except Exception as e:
-                logger.warning(f"Failed to close storage_control_client: {e}")
-            self._storage_control_client = None
+            with self._storage_control_client_lock:
+                if self._storage_control_client is not None:
+                    try:
+                        await self._storage_control_client.transport.close()
+                    except Exception as e:
+                        logger.warning(f"Failed to close storage_control_client: {e}")
+                    self._storage_control_client = None
         if self._grpc_client is not None:
-            try:
-                await self._grpc_client.grpc_client.transport.close()
-            except Exception as e:
-                logger.warning(f"Failed to close grpc_client: {e}")
-            self._grpc_client = None
+            with self._grpc_client_lock:
+                if self._grpc_client is not None:
+                    try:
+                        await self._grpc_client.grpc_client.transport.close()
+                    except Exception as e:
+                        logger.warning(f"Failed to close grpc_client: {e}")
+                    self._grpc_client = None
 
     async def _lookup_bucket_type(self, bucket):
         if not hasattr(self, '_storage_layout_lock'):

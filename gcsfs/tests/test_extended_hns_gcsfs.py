@@ -17,9 +17,11 @@ import uuid
 from unittest import mock
 
 import pytest
+from fsspec import asyn
 from google.api_core import exceptions as api_exceptions
 from google.cloud import storage_control_v2
 
+from gcsfs import zb_hns_utils
 from gcsfs.extended_gcsfs import BucketType, ExtendedGcsFileSystem
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, HttpError
 from gcsfs.tests.conftest import requires_hns
@@ -3154,3 +3156,74 @@ class TestExtendedGcsFileSystemBucketType:
                 bucket_type = await fs._get_bucket_type("error-bucket")
                 assert bucket_type == BucketType.UNKNOWN
                 assert "Could not determine bucket type" in caplog.text
+
+
+def test_grpc_client_thread_safety(extended_gcsfs):
+    """Test that concurrent threads accessing grpc_client only instantiate AsyncGrpcClient once."""
+    import concurrent.futures
+
+    fs = extended_gcsfs
+    fs._grpc_client = None
+
+    with mock.patch("gcsfs.extended_gcsfs.AsyncGrpcClient") as mock_grpc_cls:
+        mock_instance = mock.MagicMock()
+        mock_grpc_cls.return_value = mock_instance
+
+        def get_client():
+            return fs.grpc_client
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(get_client) for _ in range(32)]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        assert len(results) == 32
+        for res in results:
+            assert res == mock_instance
+        # AsyncGrpcClient should have only been instantiated once despite concurrent thread access
+        assert mock_grpc_cls.call_count == 1
+
+
+def test_control_plane_client_thread_safety(extended_gcsfs):
+    """Test that concurrent threads accessing _get_control_plane_client only instantiate StorageControlAsyncClient once."""
+    import concurrent.futures
+
+    fs = extended_gcsfs
+    fs._storage_control_client = None
+
+    with mock.patch("google.cloud.storage_control_v2.StorageControlAsyncClient") as mock_sc_cls, \
+         mock.patch("google.cloud.storage_control_v2.StorageControlAsyncClient.get_transport_class") as mock_transport_getter:
+        mock_transport_cls = mock.MagicMock()
+        mock_transport_getter.return_value = mock_transport_cls
+        mock_instance = mock.MagicMock()
+        mock_sc_cls.return_value = mock_instance
+
+        def get_client():
+            return asyn.sync(fs.loop, fs._get_control_plane_client)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(get_client) for _ in range(32)]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        assert len(results) == 32
+        for res in results:
+            assert res == mock_instance
+        assert mock_sc_cls.call_count == 1
+
+
+def test_channel_lock_thread_safety():
+    """Test that concurrent threads requesting a channel lock for the same client get the same lock."""
+    import concurrent.futures
+
+    mock_client = mock.MagicMock()
+
+    def get_lock():
+        return zb_hns_utils._get_channel_lock(mock_client)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(get_lock) for _ in range(32)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert len(results) == 32
+    first_lock = results[0]
+    for lock in results:
+        assert lock is first_lock

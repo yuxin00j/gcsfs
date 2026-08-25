@@ -1,3 +1,4 @@
+import threading
 import weakref
 import asyncio
 import collections
@@ -5,7 +6,6 @@ import concurrent.futures
 import contextlib
 import fcntl
 import tempfile
-import asyncio
 import os
 import time
 
@@ -110,11 +110,13 @@ except Exception:
 
 _warmed_channels = weakref.WeakKeyDictionary()
 _channel_warm_locks = weakref.WeakKeyDictionary()
+_channel_warm_locks_mutex = threading.Lock()
 
 def _get_channel_lock(grpc_client):
-    if grpc_client not in _channel_warm_locks:
-        _channel_warm_locks[grpc_client] = asyncio.Lock()
-    return _channel_warm_locks[grpc_client]
+    with _channel_warm_locks_mutex:
+        if grpc_client not in _channel_warm_locks:
+            _channel_warm_locks[grpc_client] = asyncio.Lock()
+        return _channel_warm_locks[grpc_client]
 
 async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     t0 = time.perf_counter()
