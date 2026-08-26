@@ -22,19 +22,19 @@ Features:
 - Supports --scalar: Prints cluster Max latency in seconds as the final stdout line for metric scrapers.
 """
 
-import os
-import sys
-import time
-import json
-import uuid
+import argparse
 import base64
 import io
-import tarfile
-import argparse
-import subprocess
+import json
+import os
 import statistics
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
 
-WORKER_SCRIPT = r'''#!/usr/bin/env python3
+WORKER_SCRIPT = r"""#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -60,8 +60,13 @@ def thread_task(fs, file_path):
         return False, latency_ms
 
 def process_worker(args):
-    node_index, proc_id, num_procs, num_threads, file_paths, target_time_w1, w1_done_counter, w1_done_lock, w2_target_time, w2_ready_event = args
-    
+    node_index, proc_id, num_ranks, num_workers, num_threads, file_paths, target_time_w1, w1_done_counter, w1_done_lock, w2_target_time, w2_ready_event = args
+
+    # Define rank and worker:
+    # rank_id in [0, num_ranks - 1], worker_id in [0, num_workers - 1]
+    rank_id = proc_id // num_workers
+    worker_id = proc_id % num_workers
+
     # Precision spin-wait to synchronize all processes across all nodes to exact millisecond for Wave 1
     if target_time_w1 > 0:
         sleep_dur = target_time_w1 - time.time()
@@ -69,32 +74,34 @@ def process_worker(args):
             time.sleep(sleep_dur - 0.02)
         while time.time() < target_time_w1:
             pass
-            
+
     import gcsfs
     fs = gcsfs.GCSFileSystem()
-    
+
     wave1_results = []
     wave2_results = []
-    
+
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         # --- WAVE 1: Cold start opens ---
+        # Workers in a rank all open different files (worker_id * num_threads + t).
+        # Different ranks open the same set of files (independent of rank_id).
         futures1 = []
         for t in range(num_threads):
-            global_worker_id = (node_index * num_procs + proc_id) * num_threads + t
-            file_path = file_paths[global_worker_id % len(file_paths)]
+            file_idx = (worker_id * num_threads + t) % len(file_paths)
+            file_path = file_paths[file_idx]
             futures1.append(executor.submit(thread_task, fs, file_path))
-            
+
         for f in futures1:
             success, lat = f.result()
             wave1_results.append((success, lat))
-            
+
         # Signal Wave 1 completion for this process
         with w1_done_lock:
             w1_done_counter.value += 1
-            
+
         # Wait for Wave 2 cluster synchronization signal
         w2_ready_event.wait()
-        
+
         # Precision spin-wait to synchronize all processes across all nodes for Wave 2
         t_w2 = w2_target_time.value
         if t_w2 > 0:
@@ -103,34 +110,35 @@ def process_worker(args):
                 time.sleep(sleep_dur - 0.02)
             while time.time() < t_w2:
                 pass
-            
+
         # --- WAVE 2: Warm channel opens ---
+        # Offset by (num_workers * num_threads) so Wave 2 opens a distinct set of files,
+        # while preserving: workers within a rank open different files, different ranks open same set.
         futures2 = []
-        total_cluster_workers = int(os.environ.get("TOTAL_NODES", "8")) * num_procs * num_threads
+        wave2_offset = num_workers * num_threads
         for t in range(num_threads):
-            # Select distinct files for wave 2
-            global_worker_id = (node_index * num_procs + proc_id) * num_threads + t + total_cluster_workers
-            file_path = file_paths[global_worker_id % len(file_paths)]
+            file_idx = (worker_id * num_threads + t + wave2_offset) % len(file_paths)
+            file_path = file_paths[file_idx]
             futures2.append(executor.submit(thread_task, fs, file_path))
-            
+
         for f in futures2:
             success, lat = f.result()
             wave2_results.append((success, lat))
-            
+
     return {"wave1": wave1_results, "wave2": wave2_results}
 
 def calc_stats(results_list):
     success_lats = [lat for s, lat in results_list if s]
     fail_lats = [lat for s, lat in results_list if not s]
     success_lats.sort()
-    
+
     p50 = statistics.median(success_lats) if success_lats else 0
     p90 = success_lats[int(len(success_lats) * 0.90)] if success_lats else 0
     p95 = success_lats[int(len(success_lats) * 0.95)] if success_lats else 0
     p99 = success_lats[int(len(success_lats) * 0.99)] if success_lats else 0
     max_lat = max(success_lats) if success_lats else 0
     min_lat = min(success_lats) if success_lats else 0
-    
+
     return {
         "total": len(results_list),
         "success": len(success_lats),
@@ -154,14 +162,18 @@ def main():
     node_name = os.environ.get("NODE_NAME", "unknown-node")
     pod_name = os.environ.get("POD_NAME", "unknown-pod")
     num_nodes = int(os.environ.get("TOTAL_NODES", "8"))
-    num_procs = int(os.environ.get("NUM_PROCESSES", "128"))
-    num_threads = int(os.environ.get("NUM_THREADS", "1"))
+    num_ranks = int(os.environ.get("NUM_RANKS", "8"))
+    num_workers = int(os.environ.get("NUM_WORKERS", "4"))
+    num_procs = int(os.environ.get("NUM_PROCESSES", str(num_ranks * num_workers)))
+    num_threads = int(os.environ.get("NUM_THREADS", "10"))
     sleep_between_waves = float(os.environ.get("SLEEP_BETWEEN_WAVES", "5.0"))
     bucket = os.environ.get("BUCKET", "gs://hf-pile-deduplicated-us-central1-b-gcsfs")
     barrier_dir = os.environ.get("BARRIER_DIR", "gs://yuxinj-us-central1-b-test/benchmark_barriers/default")
 
     print(f"=== Starting Worker on Node {node_index} ({node_name}) ===", flush=True)
-    print(f"Processes: {num_procs}, Threads per Process: {num_threads}, Total opens per wave: {num_procs * num_threads}", flush=True)
+    print(f"Ranks per Node: {num_ranks}, Workers per Rank: {num_workers}, Total Processes: {num_procs}", flush=True)
+    print(f"Threads per Worker: {num_threads}, Total opens per node per wave: {num_procs * num_threads}", flush=True)
+    print(f"File Access Pattern: Workers within a rank open {num_workers * num_threads} distinct files; Different ranks open the same set of files.", flush=True)
     print(f"Sleep between waves: {sleep_between_waves}s", flush=True)
     print(f"Target Bucket: {bucket}", flush=True)
 
@@ -233,7 +245,7 @@ def main():
     w2_ready_event = manager.Event()
 
     tasks = [
-        (node_index, p, num_procs, num_threads, file_paths, target_time_w1, w1_done_counter, w1_done_lock, w2_target_time, w2_ready_event)
+        (node_index, p, num_ranks, num_workers, num_threads, file_paths, target_time_w1, w1_done_counter, w1_done_lock, w2_target_time, w2_ready_event)
         for p in range(num_procs)
     ]
 
@@ -241,17 +253,17 @@ def main():
         # 1. Wait until all local processes on this node finish Wave 1
         while w1_done_counter.value < num_procs:
             time.sleep(0.01)
-            
+
         ready_w2_file = f"{barrier_dir}/ready_w2_{node_index}.txt"
         start_w2_file = f"{barrier_dir}/start_time_w2.json"
-        
+
         with fs_init.open(ready_w2_file, "w") as f:
             f.write(f"ready_w2 {node_index} {time.time()}")
         print(f"Node {node_index} finished Wave 1. Registered for Wave 2 barrier...", flush=True)
-        
+
         t_w2_barrier_wait = time.time()
         target_time_w2 = 0
-        
+
         if node_index == 0:
             while time.time() - t_w2_barrier_wait < 180:
                 try:
@@ -279,11 +291,11 @@ def main():
                 except Exception:
                     pass
                 time.sleep(0.1)
-                
+
         if target_time_w2 == 0:
             target_time_w2 = time.time() + sleep_between_waves
             print(f"Warning: Wave 2 barrier timed out, fallback start time: {target_time_w2:.3f}", flush=True)
-            
+
         w2_target_time.value = target_time_w2
         w2_ready_event.set()
 
@@ -320,6 +332,8 @@ def main():
         "node_index": node_index,
         "node_name": node_name,
         "pod_name": pod_name,
+        "ranks": num_ranks,
+        "workers": num_workers,
         "processes": num_procs,
         "threads": num_threads,
         "wall_time": wall_time,
@@ -334,13 +348,19 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
+"""
+
 
 def run_cmd(cmd, check=True):
-    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    res = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     if check and res.returncode != 0:
-        raise RuntimeError(f"Command failed (code {res.returncode}): {cmd}\nStderr: {res.stderr}\nStdout: {res.stdout}")
+        raise RuntimeError(
+            f"Command failed (code {res.returncode}): {cmd}\nStderr: {res.stderr}\nStdout: {res.stdout}"
+        )
     return res.stdout.strip(), res.stderr.strip(), res.returncode
+
 
 def package_local_gcsfs():
     repo_dir = os.path.dirname(os.path.abspath(__file__))
@@ -363,18 +383,35 @@ def package_local_gcsfs():
                 tar.add(full_p, arcname=rel_p)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
-def print_table(title, lats, num_nodes, processes, threads, total_opens, success_count, fail_count, max_wall_time):
+
+def print_table(
+    title,
+    lats,
+    num_nodes,
+    ranks,
+    workers,
+    processes,
+    threads,
+    total_opens,
+    success_count,
+    fail_count,
+    max_wall_time,
+):
     print("\n" + "=" * 80)
     print(f" {title.upper()}")
     print("=" * 80)
-    print(f"Total Physical Nodes:   {num_nodes}")
-    print(f"Processes per Node (n): {processes}")
-    print(f"Threads per Proc (m):   {threads}")
-    print(f"Total Requests:         {total_opens}")
-    print(f"Successful Requests:    {success_count} ({success_count/max(1, total_opens)*100:.1f}%)")
-    print(f"Failed Requests:        {fail_count}")
+    print(f"Total Physical Nodes:    {num_nodes}")
+    print(f"Ranks per Node (r):      {ranks}")
+    print(f"Workers per Rank (w):    {workers}")
+    print(f"Processes per Node (n):  {processes} ({ranks} ranks × {workers} workers)")
+    print(f"Threads per Worker (m):  {threads}")
+    print(f"Total Requests:          {total_opens}")
+    print(
+        f"Successful Requests:     {success_count} ({success_count/max(1, total_opens)*100:.1f}%)"
+    )
+    print(f"Failed Requests:         {fail_count}")
     if max_wall_time > 0:
-        print(f"Max Node Wall Time:     {max_wall_time:.2f} seconds")
+        print(f"Max Node Wall Time:      {max_wall_time:.2f} seconds")
     print()
 
     if lats:
@@ -388,54 +425,165 @@ def print_table(title, lats, num_nodes, processes, threads, total_opens, success
         print(f"Max:  {max(lats):.2f} ms")
     print("=" * 80)
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Run Multi-Wave GKE Cluster Open Latency Benchmark with Global Synchronization Barrier")
-    parser.add_argument("--cluster", type=str, default="yuxinj-8node-n4-cluster", help="GKE cluster name")
-    parser.add_argument("--zone", type=str, default="us-central1-b", help="GKE cluster zone")
-    parser.add_argument("--project", type=str, default="gcs-aiml-clients-testing-101", help="GCP project ID")
-    parser.add_argument("--processes", "-n", type=int, default=32, help="Number of processes per node (default: 32)")
-    parser.add_argument("--threads", "-m", type=int, default=10, help="Number of threads per process (default: 10)")
-    parser.add_argument("--sleep-waves", type=float, default=5.0, help="Sleep in seconds between Wave 1 and Wave 2 (default: 5.0)")
-    parser.add_argument("--bucket", type=str, default="gs://hf-pile-deduplicated-us-central1-b-gcsfs", help="Target GCS bucket")
-    parser.add_argument("--barrier-bucket", type=str, default="gs://yuxinj-us-central1-b-test", help="Bucket for distributed barrier coordination")
-    parser.add_argument("--branch", type=str, default="main", help="GCSFS git branch/tag to benchmark (default: main)")
-    parser.add_argument("--local-pkg", action="store_true", help="Package local gcsfs repository files directly into ConfigMap")
-    parser.add_argument("--scalar", action="store_true", help="Print only cluster max latency in seconds on last line")
+    parser = argparse.ArgumentParser(
+        description="Run Multi-Wave GKE Cluster Open Latency Benchmark with Global Synchronization Barrier"
+    )
+    parser.add_argument(
+        "--cluster",
+        type=str,
+        default="yuxinj-8node-n4-cluster",
+        help="GKE cluster name",
+    )
+    parser.add_argument(
+        "--zone", type=str, default="us-central1-b", help="GKE cluster zone"
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default="gcs-aiml-clients-testing-101",
+        help="GCP project ID",
+    )
+    parser.add_argument(
+        "--ranks",
+        "-r",
+        type=int,
+        default=8,
+        help="Number of ranks (e.g. GPUs) per node (default: 8)",
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=4,
+        help="Number of DataLoader worker processes per rank (default: 4)",
+    )
+    parser.add_argument(
+        "--processes",
+        "-n",
+        type=int,
+        default=None,
+        help="Total processes per node (if set, overrides ranks * workers)",
+    )
+    parser.add_argument(
+        "--threads",
+        "-m",
+        type=int,
+        default=10,
+        help="Number of threads per worker process (default: 10)",
+    )
+    parser.add_argument(
+        "--sleep-waves",
+        type=float,
+        default=5.0,
+        help="Sleep in seconds between Wave 1 and Wave 2 (default: 5.0)",
+    )
+    parser.add_argument(
+        "--bucket",
+        type=str,
+        default="gs://hf-pile-deduplicated-us-central1-b-gcsfs",
+        help="Target GCS bucket",
+    )
+    parser.add_argument(
+        "--barrier-bucket",
+        type=str,
+        default="gs://yuxinj-us-central1-b-test",
+        help="Bucket for distributed barrier coordination",
+    )
+    parser.add_argument(
+        "--branch",
+        type=str,
+        default="main",
+        help="GCSFS git branch/tag to benchmark (default: main)",
+    )
+    parser.add_argument(
+        "--local-pkg",
+        action="store_true",
+        help="Package local gcsfs repository files directly into ConfigMap",
+    )
+    parser.add_argument(
+        "--scalar",
+        action="store_true",
+        help="Print only cluster max latency in seconds on last line",
+    )
+    parser.add_argument(
+        "--alts-concurrency",
+        type=int,
+        default=8,
+        help="GCSFS_ALTS_CONCURRENCY limit per node (default: 8)",
+    )
+    parser.add_argument(
+        "--create-mrd-concurrency",
+        type=int,
+        default=32,
+        help="GCSFS_CREATE_MRD_CONCURRENCY limit per node (default: 32, 0 to disable)",
+    )
     parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds")
     args = parser.parse_args()
 
+    if args.processes is not None:
+        num_procs = args.processes
+        if args.ranks is not None and args.ranks > 0 and num_procs % args.ranks == 0:
+            num_ranks = args.ranks
+            num_workers = num_procs // num_ranks
+        else:
+            num_ranks = 8 if num_procs % 8 == 0 else 1
+            num_workers = max(1, num_procs // num_ranks)
+            num_procs = num_ranks * num_workers
+    else:
+        num_ranks = args.ranks
+        num_workers = args.workers
+        num_procs = num_ranks * num_workers
+
     if not args.scalar:
         print("=" * 75)
-        print(" GKE MULTI-WAVE DISTRIBUTED CLUSTER BENCHMARK (SYNCHRONIZED GLOBAL BARRIER)")
+        print(
+            " GKE MULTI-WAVE DISTRIBUTED CLUSTER BENCHMARK (SYNCHRONIZED GLOBAL BARRIER)"
+        )
         print(f" Cluster:                {args.cluster} ({args.zone})")
         print(f" Project:                {args.project}")
-        print(f" Processes per Node (n): {args.processes}")
-        print(f" Threads per Proc (m):   {args.threads}")
+        print(f" Ranks per Node (r):     {num_ranks}")
+        print(f" Workers per Rank (w):   {num_workers}")
+        print(f" Processes per Node (n): {num_procs} ({num_ranks} ranks × {num_workers} workers)")
+        print(f" Threads per Worker (m): {args.threads}")
+        print(f" Opens per Node / Wave:  {num_procs * args.threads}")
         print(f" Sleep Between Waves:    {args.sleep_waves}s")
         print(f" Target Bucket:          {args.bucket}")
-        print(f" Package Mode:           {'Local working copy' if args.local_pkg else f'Remote git branch: {args.branch}'}")
+        print(
+            f" Package Mode:           {'Local working copy' if args.local_pkg else f'Remote git branch: {args.branch}'}"
+        )
         print("=" * 75)
 
     # 1. Connect to GKE Cluster
     if not args.scalar:
         print(f"\n[1/5] Getting credentials for cluster {args.cluster}...")
-    run_cmd(f"gcloud container clusters get-credentials {args.cluster} --zone={args.zone} --project={args.project}")
+    run_cmd(
+        f"gcloud container clusters get-credentials {args.cluster} --zone={args.zone} --project={args.project}"
+    )
 
     # 2. Get Node Count
     out, _, _ = run_cmd("kubectl get nodes -o jsonpath='{.items[*].metadata.name}'")
     nodes = out.split()
     num_nodes = len(nodes)
     if not args.scalar:
-        print(f"Detected {num_nodes} active physical nodes in cluster: {', '.join(nodes)}")
+        print(
+            f"Detected {num_nodes} active physical nodes in cluster: {', '.join(nodes)}"
+        )
     if num_nodes == 0:
         print("Error: No nodes found in cluster!")
         sys.exit(1)
 
-    total_cluster_procs = num_nodes * args.processes
+    total_cluster_procs = num_nodes * num_procs
     total_opens_per_wave = total_cluster_procs * args.threads
     total_all_opens = total_opens_per_wave * 2
     if not args.scalar:
-        print(f"Cluster Workload: {num_nodes} nodes × {args.processes} procs × {args.threads} threads = {total_opens_per_wave} opens per wave ({total_all_opens} total across 2 waves)")
+        print(
+            f"Cluster Workload: {num_nodes} nodes × {num_ranks} ranks × {num_workers} workers × {args.threads} threads = {total_opens_per_wave} opens per wave ({total_all_opens} total across 2 waves)"
+        )
+        print(
+            f"File Distribution: Workers in each rank open distinct files ({num_workers * args.threads} unique files per rank); All ranks open the same set of files."
+        )
 
     job_id = f"gcsfs-bench-{uuid.uuid4().hex[:6]}"
     configmap_name = f"{job_id}-cm"
@@ -443,7 +591,9 @@ def main():
 
     # 3. Create ConfigMap with Worker Script
     if not args.scalar:
-        print(f"\n[2/5] Creating ConfigMap {configmap_name} with benchmark worker script...")
+        print(
+            f"\n[2/5] Creating ConfigMap {configmap_name} with benchmark worker script..."
+        )
     cm_data = {"worker.py": WORKER_SCRIPT}
     if args.local_pkg:
         cm_data["gcsfs_pkg.b64"] = package_local_gcsfs()
@@ -452,7 +602,7 @@ def main():
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {"name": configmap_name},
-        "data": cm_data
+        "data": cm_data,
     }
     cm_json = json.dumps(cm_manifest)
     run_cmd(f"cat << 'EOF' | kubectl apply -f -\n{cm_json}\nEOF")
@@ -476,7 +626,9 @@ def main():
 
     # 5. Create Kubernetes Indexed Job to spread 1 Pod per Node
     if not args.scalar:
-        print(f"\n[3/5] Launching Kubernetes Indexed Job {job_id} across {num_nodes} nodes...")
+        print(
+            f"\n[3/5] Launching Kubernetes Indexed Job {job_id} across {num_nodes} nodes..."
+        )
     job_manifest = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -487,9 +639,7 @@ def main():
             "completionMode": "Indexed",
             "backoffLimit": 0,
             "template": {
-                "metadata": {
-                    "labels": {"app": job_id}
-                },
+                "metadata": {"labels": {"app": job_id}},
                 "spec": {
                     "restartPolicy": "Never",
                     "topologySpreadConstraints": [
@@ -497,9 +647,7 @@ def main():
                             "maxSkew": 1,
                             "topologyKey": "kubernetes.io/hostname",
                             "whenUnsatisfiable": "DoNotSchedule",
-                            "labelSelector": {
-                                "matchLabels": {"app": job_id}
-                            }
+                            "labelSelector": {"matchLabels": {"app": job_id}},
                         }
                     ],
                     "containers": [
@@ -510,65 +658,90 @@ def main():
                             "args": container_cmd,
                             "env": [
                                 {"name": "TOTAL_NODES", "value": str(num_nodes)},
-                                {"name": "NUM_PROCESSES", "value": str(args.processes)},
+                                {"name": "NUM_RANKS", "value": str(num_ranks)},
+                                {"name": "NUM_WORKERS", "value": str(num_workers)},
+                                {"name": "NUM_PROCESSES", "value": str(num_procs)},
                                 {"name": "NUM_THREADS", "value": str(args.threads)},
-                                {"name": "SLEEP_BETWEEN_WAVES", "value": str(args.sleep_waves)},
+                                {
+                                    "name": "SLEEP_BETWEEN_WAVES",
+                                    "value": str(args.sleep_waves),
+                                },
                                 {"name": "BUCKET", "value": args.bucket},
                                 {"name": "BARRIER_DIR", "value": barrier_dir},
-                                {"name": "GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT", "value": "true"},
+                                {
+                                    "name": "GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT",
+                                    "value": "true",
+                                },
+                                {
+                                    "name": "GCSFS_ALTS_CONCURRENCY",
+                                    "value": str(args.alts_concurrency),
+                                },
+                                {
+                                    "name": "GCSFS_CREATE_MRD_CONCURRENCY",
+                                    "value": str(args.create_mrd_concurrency),
+                                },
                                 {
                                     "name": "NODE_NAME",
-                                    "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}
+                                    "valueFrom": {
+                                         "fieldRef": {"fieldPath": "spec.nodeName"}
+                                    },
                                 },
                                 {
                                     "name": "POD_NAME",
-                                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}
-                                }
+                                    "valueFrom": {
+                                        "fieldRef": {"fieldPath": "metadata.name"}
+                                    },
+                                },
                             ],
                             "resources": {
                                 "requests": {"cpu": "4", "memory": "8Gi"},
-                                "limits": {"cpu": "64", "memory": "128Gi"}
+                                "limits": {"cpu": "64", "memory": "128Gi"},
                             },
                             "volumeMounts": [
                                 {"name": "script-vol", "mountPath": "/scripts"}
-                            ]
+                            ],
                         }
                     ],
                     "volumes": [
-                        {
-                            "name": "script-vol",
-                            "configMap": {"name": configmap_name}
-                        }
-                    ]
-                }
-            }
-        }
+                        {"name": "script-vol", "configMap": {"name": configmap_name}}
+                    ],
+                },
+            },
+        },
     }
     job_json = json.dumps(job_manifest)
     run_cmd(f"cat << 'EOF' | kubectl apply -f -\n{job_json}\nEOF")
 
     # 6. Monitor Job Progress
     if not args.scalar:
-        print(f"\n[4/5] Waiting for benchmark job {job_id} to finish across all {num_nodes} nodes...")
+        print(
+            f"\n[4/5] Waiting for benchmark job {job_id} to finish across all {num_nodes} nodes..."
+        )
     t_wait_start = time.time()
     completed = False
     while time.time() - t_wait_start < args.timeout:
         pods_status, _, _ = run_cmd(
             f"kubectl get pods -l app={job_id} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers",
-            check=False
+            check=False,
         )
         lines = [l for l in pods_status.splitlines() if l.strip()]
         completed_count = sum(1 for l in lines if "Succeeded" in l or "Completed" in l)
         failed_count = sum(1 for l in lines if "Failed" in l or "Error" in l)
-        running_count = sum(1 for l in lines if "Running" in l or "ContainerCreating" in l or "Pending" in l)
+        running_count = sum(
+            1
+            for l in lines
+            if "Running" in l or "ContainerCreating" in l or "Pending" in l
+        )
 
         if not args.scalar:
-            print(f"Status ({int(time.time() - t_wait_start)}s): {completed_count}/{num_nodes} completed, {failed_count} failed. Active Pods: {running_count}")
+            print(
+                f"Status ({int(time.time() - t_wait_start)}s): {completed_count}/{num_nodes} completed, {failed_count} failed. Active Pods: {running_count}"
+            )
 
         if completed_count + failed_count >= num_nodes and len(lines) > 0:
             completed = True
             break
-            
+
         time.sleep(5)
 
     if not completed and not args.scalar:
@@ -577,7 +750,9 @@ def main():
     # 7. Fetch Logs & Collect Results
     if not args.scalar:
         print(f"\n[5/5] Collecting and aggregating multi-wave results from all pods...")
-    pods_out, _, _ = run_cmd(f"kubectl get pods -l app={job_id} -o jsonpath='{{.items[*].metadata.name}}'")
+    pods_out, _, _ = run_cmd(
+        f"kubectl get pods -l app={job_id} -o jsonpath='{{.items[*].metadata.name}}'"
+    )
     pod_names = pods_out.split()
 
     node_reports = []
@@ -593,27 +768,37 @@ def main():
     total_w2_success = 0
     total_w2_fail = 0
 
+    all_create_mrd_lats = []
     for pod in sorted(pod_names):
-        pod_log, _, _ = run_cmd(f"kubectl logs {pod} --tail=100", check=False)
+        pod_log, _, _ = run_cmd(f"kubectl logs {pod} --tail=5000", check=False)
+        import re
+        mrd_matches = re.findall(r"create_mrd:\s*([0-9.]+)\s*ms", pod_log)
+        for m in mrd_matches:
+            all_create_mrd_lats.append(float(m))
+
         if "__JSON_REPORT_BEGIN__" in pod_log and "__JSON_REPORT_END__" in pod_log:
             try:
-                json_str = pod_log.split("__JSON_REPORT_BEGIN__")[1].split("__JSON_REPORT_END__")[0].strip()
+                json_str = (
+                    pod_log.split("__JSON_REPORT_BEGIN__")[1]
+                    .split("__JSON_REPORT_END__")[0]
+                    .strip()
+                )
                 rep = json.loads(json_str)
                 node_reports.append(rep)
-                
+
                 w1 = rep.get("wave1", {})
                 w2 = rep.get("wave2", {})
-                
+
                 all_w1_lats.extend(w1.get("latencies_ms", []))
                 total_w1_opens += w1.get("total", 0)
                 total_w1_success += w1.get("success", 0)
                 total_w1_fail += w1.get("failure", 0)
-                
+
                 all_w2_lats.extend(w2.get("latencies_ms", []))
                 total_w2_opens += w2.get("total", 0)
                 total_w2_success += w2.get("success", 0)
                 total_w2_fail += w2.get("failure", 0)
-                
+
                 all_comb_lats.extend(w1.get("latencies_ms", []))
                 all_comb_lats.extend(w2.get("latencies_ms", []))
             except Exception as e:
@@ -628,34 +813,45 @@ def main():
         print("\nCleaning up benchmark job & configmap...")
     run_cmd(f"kubectl delete job {job_id} --ignore-not-found=true")
     run_cmd(f"kubectl delete configmap {configmap_name} --ignore-not-found=true")
-    run_cmd(f"python3 -c \"import gcsfs; fs=gcsfs.GCSFileSystem(); fs.rm('{barrier_dir.replace('gs://', '')}', recursive=True)\" 2>/dev/null || true", check=False)
+    run_cmd(
+        f"python3 -c \"import gcsfs; fs=gcsfs.GCSFileSystem(); fs.rm('{barrier_dir.replace('gs://', '')}', recursive=True)\" 2>/dev/null || true",
+        check=False,
+    )
 
     if not args.scalar:
         # Display Per-Node Table
         print("\n" + "=" * 90)
         print(" PER-NODE MULTI-WAVE RESULTS")
         print("=" * 90)
-        print(f"{'Node':<6} {'Node Name':<28} {'W1 P50':<10} {'W1 Max':<10} {'W2 P50':<10} {'W2 Max':<10} {'Wall Time':<10}")
+        print(
+            f"{'Node':<6} {'Node Name':<28} {'W1 P50':<10} {'W1 Max':<10} {'W2 P50':<10} {'W2 Max':<10} {'Wall Time':<10}"
+        )
         print("-" * 90)
         for rep in sorted(node_reports, key=lambda x: x["node_index"]):
             w1 = rep.get("wave1", {})
             w2 = rep.get("wave2", {})
-            print(f"{rep['node_index']:<6} {rep['node_name'][:26]:<28} {w1.get('p50_ms', 0):<10.1f} {w1.get('max_ms', 0):<10.1f} {w2.get('p50_ms', 0):<10.1f} {w2.get('max_ms', 0):<10.1f} {rep['wall_time']:<10.2f}s")
+            print(
+                f"{rep['node_index']:<6} {rep['node_name'][:26]:<28} {w1.get('p50_ms', 0):<10.1f} {w1.get('max_ms', 0):<10.1f} {w2.get('p50_ms', 0):<10.1f} {w2.get('max_ms', 0):<10.1f} {rep['wall_time']:<10.2f}s"
+            )
         print("=" * 90)
 
-        max_wall_time = max([r["wall_time"] for r in node_reports]) if node_reports else 0
+        max_wall_time = (
+            max([r["wall_time"] for r in node_reports]) if node_reports else 0
+        )
 
         # Wave 1 Table
         print_table(
             "Wave 1: Cold-Start Synchronized Burst",
             all_w1_lats,
             num_nodes,
-            args.processes,
+            num_ranks,
+            num_workers,
+            num_procs,
             args.threads,
             total_w1_opens,
             total_w1_success,
             total_w1_fail,
-            0
+            0,
         )
 
         # Wave 2 Table
@@ -663,12 +859,14 @@ def main():
             f"Wave 2: Warm-Channel Burst (After {args.sleep_waves}s Sleep)",
             all_w2_lats,
             num_nodes,
-            args.processes,
+            num_ranks,
+            num_workers,
+            num_procs,
             args.threads,
             total_w2_opens,
             total_w2_success,
             total_w2_fail,
-            0
+            0,
         )
 
         # Combined Aggregate Table
@@ -676,13 +874,30 @@ def main():
             "Overall Cluster Aggregate (Both Waves Combined)",
             all_comb_lats,
             num_nodes,
-            args.processes,
+            num_ranks,
+            num_workers,
+            num_procs,
             args.threads,
             total_w1_opens + total_w2_opens,
             total_w1_success + total_w2_success,
             total_w1_fail + total_w2_fail,
-            max_wall_time
+            max_wall_time,
         )
+
+        if all_create_mrd_lats:
+            print_table(
+                "AsyncMultiRangeDownloader.create_mrd Pure Phase Latency",
+                all_create_mrd_lats,
+                num_nodes,
+                num_ranks,
+                num_workers,
+                num_procs,
+                args.threads,
+                len(all_create_mrd_lats),
+                len(all_create_mrd_lats),
+                0,
+                0,
+            )
 
     # For autoresearch metric parser
     if all_comb_lats:
@@ -690,6 +905,7 @@ def main():
         print(f"{max_sec:.3f}")
     else:
         print("999.000")
+
 
 if __name__ == "__main__":
     main()
