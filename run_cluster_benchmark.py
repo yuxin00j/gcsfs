@@ -769,12 +769,17 @@ def main():
     total_w2_fail = 0
 
     all_create_mrd_lats = []
+    all_alts_lats = []
     for pod in sorted(pod_names):
         pod_log, _, _ = run_cmd(f"kubectl logs {pod} --tail=5000", check=False)
         import re
-        mrd_matches = re.findall(r"create_mrd:\s*([0-9.]+)\s*ms", pod_log)
+        mrd_matches = re.findall(r"(?:exec_mrd|create_mrd):\s*([0-9.]+)\s*ms", pod_log)
         for m in mrd_matches:
             all_create_mrd_lats.append(float(m))
+
+        alts_matches = re.findall(r"exec_ready:\s*([0-9.]+)\s*ms", pod_log)
+        for a in alts_matches:
+            all_alts_lats.append(float(a))
 
         if "__JSON_REPORT_BEGIN__" in pod_log and "__JSON_REPORT_END__" in pod_log:
             try:
@@ -883,6 +888,21 @@ def main():
             total_w1_fail + total_w2_fail,
             max_wall_time,
         )
+
+        if all_alts_lats:
+            print_table(
+                "ALTS Handshake (channel.channel_ready) Pure Execution Time",
+                all_alts_lats,
+                num_nodes,
+                num_ranks,
+                num_workers,
+                num_procs,
+                args.threads,
+                len(all_alts_lats),
+                len(all_alts_lats),
+                0,
+                0,
+            )
 
         if all_create_mrd_lats:
             print_table(
