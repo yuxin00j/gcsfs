@@ -60,6 +60,10 @@ async def acquire_init_mrd_slot(max_concurrency=None, name="alts"):
         else:
             max_concurrency = GCSFS_ALTS_CONCURRENCY
 
+    if max_concurrency <= 0:
+        yield
+        return
+
     lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
     uid = os.getuid() if hasattr(os, "getuid") else "default"
 
@@ -156,15 +160,20 @@ async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
                     f"exec_ready: {(t_warm_exec_end - t_warm_exec) * 1000:.2f} ms)"
                 )
     try:
-        t_mrd = time.perf_counter()
-        mrd = await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation
-        )
-        t_mrd_end = time.perf_counter()
+        t_mrd_wait = time.perf_counter()
+        async with acquire_init_mrd_slot(name="create_mrd"):
+            t_mrd_exec = time.perf_counter()
+            mrd = await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
+            t_mrd_exec_end = time.perf_counter()
         logger.info(
             f"[custom log] init_mrd for {bucket_name}/{object_name} completed in "
-            f"{(t_mrd_end - t0) * 1000:.2f} ms "
-            f"(create_mrd: {(t_mrd_end - t_mrd) * 1000:.2f} ms, warmed={warmed})"
+            f"{(time.perf_counter() - t0) * 1000:.2f} ms "
+            f"(create_mrd_total: {(t_mrd_exec_end - t_mrd_wait) * 1000:.2f} ms, "
+            f"wait_lock: {(t_mrd_exec - t_mrd_wait) * 1000:.2f} ms, "
+            f"exec_mrd: {(t_mrd_exec_end - t_mrd_exec) * 1000:.2f} ms, "
+            f"warmed={warmed})"
         )
         return mrd
     except NotFound:
