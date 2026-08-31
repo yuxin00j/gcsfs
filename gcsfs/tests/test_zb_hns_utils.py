@@ -1379,3 +1379,42 @@ def test_direct_memmove_buffer_pypy_fallback():
     assert isinstance(buf._result_bytes, bytearray)
 
     executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_acquire_init_mrd_slot():
+    """Tests acquire_init_mrd_slot context manager."""
+    # Test zero concurrency bypass
+    async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=0):
+        pass
+
+    # Test normal acquisition
+    async with zb_hns_utils.acquire_init_mrd_slot(max_concurrency=2, name="test_slot"):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_init_mrd_alts_warmup():
+    """Tests that init_mrd warms up channel exactly once per grpc_client."""
+    fake_client = mock.Mock()
+    mock_channel = mock.AsyncMock()
+    fake_client.grpc_client.transport.grpc_channel = mock_channel
+
+    mock_mrd_instance = mock.Mock()
+    with mock.patch(
+        "gcsfs.zb_hns_utils.AsyncMultiRangeDownloader.create_mrd",
+        new_callable=mock.AsyncMock,
+        return_value=mock_mrd_instance,
+    ) as mock_create:
+        # First call warms up channel
+        res1 = await zb_hns_utils.init_mrd(fake_client, "b", "o1")
+        assert res1 is mock_mrd_instance
+        assert mock_channel.channel_ready.await_count == 1
+        assert mock_create.await_count == 1
+
+        # Second call with same client should NOT warm up channel again
+        res2 = await zb_hns_utils.init_mrd(fake_client, "b", "o2")
+        assert res2 is mock_mrd_instance
+        assert mock_channel.channel_ready.await_count == 1
+        assert mock_create.await_count == 2
+

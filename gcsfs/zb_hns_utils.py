@@ -3,8 +3,10 @@ import collections
 import concurrent.futures
 import contextlib
 import ctypes
+import fcntl
 import logging
 import os
+import tempfile
 import threading
 import weakref
 from io import BytesIO
@@ -23,8 +25,63 @@ try:
     DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "4"))
 except ValueError:
     DEFAULT_CONCURRENCY = 4
+
+try:
+    GCSFS_ALTS_CONCURRENCY = int(os.environ.get("GCSFS_ALTS_CONCURRENCY", "8"))
+except ValueError:
+    GCSFS_ALTS_CONCURRENCY = 8
+
+try:
+    GCSFS_CREATE_MRD_CONCURRENCY = int(
+        os.environ.get("GCSFS_CREATE_MRD_CONCURRENCY", "32")
+    )
+except ValueError:
+    GCSFS_CREATE_MRD_CONCURRENCY = 32
+
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
+
+
+@contextlib.asynccontextmanager
+async def acquire_init_mrd_slot(max_concurrency=None, name="alts"):
+    """
+    Acquires an inter-process rate-limiting slot via non-blocking file locks.
+    """
+    if max_concurrency is None:
+        if name == "create_mrd":
+            max_concurrency = GCSFS_CREATE_MRD_CONCURRENCY
+        else:
+            max_concurrency = GCSFS_ALTS_CONCURRENCY
+
+    if max_concurrency <= 0:
+        yield
+        return
+
+    lock_dir = os.environ.get("GCSFS_LOCK_DIR", tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else "default"
+
+    acquired_fd = None
+    while acquired_fd is None:
+        for slot in range(max_concurrency):
+            lock_file = os.path.join(lock_dir, f"gcsfs_{name}_{uid}_{slot}.lock")
+            fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired_fd = fd
+                break
+            except (BlockingIOError, OSError):
+                os.close(fd)
+        if acquired_fd is None:
+            await asyncio.sleep(0.005)
+
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(acquired_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(acquired_fd)
 
 
 try:
@@ -42,15 +99,52 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+_warmed_channels = weakref.WeakKeyDictionary()
+_channel_warm_locks = weakref.WeakKeyDictionary()
+
+
+def _get_channel_lock(grpc_client):
+    if grpc_client not in _channel_warm_locks:
+        _channel_warm_locks[grpc_client] = asyncio.Lock()
+    return _channel_warm_locks[grpc_client]
+
+
 async def init_mrd(grpc_client, bucket_name, object_name, generation=None):
     """
     Creates the AsyncMultiRangeDownloader using an existing client.
+    Performs rate-limited ALTS channel warmup once per client and rate-limits
+    MRD creation across processes.
     Wraps Google API errors into standard Python exceptions.
     """
+    if not _warmed_channels.get(grpc_client):
+        lock = _get_channel_lock(grpc_client)
+        async with lock:
+            if not _warmed_channels.get(grpc_client):
+                async with acquire_init_mrd_slot(name="alts"):
+                    try:
+                        channel = getattr(
+                            getattr(
+                                getattr(grpc_client, "grpc_client", None),
+                                "transport",
+                                None,
+                            ),
+                            "grpc_channel",
+                            None,
+                        )
+                        if channel and hasattr(channel, "channel_ready"):
+                            ready_res = channel.channel_ready()
+                            if asyncio.iscoroutine(ready_res) or hasattr(
+                                ready_res, "__await__"
+                            ):
+                                await ready_res
+                    except Exception:
+                        pass
+                _warmed_channels[grpc_client] = True
     try:
-        return await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation
-        )
+        async with acquire_init_mrd_slot(name="create_mrd"):
+            return await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, bucket_name, object_name, generation
+            )
     except NotFound:
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.
