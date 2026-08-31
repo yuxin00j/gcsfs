@@ -1587,3 +1587,20 @@ def test_extended_gcsfs_garbage_collection():
     gc.collect()
 
     assert ref() is None
+
+
+@pytest.mark.asyncio
+async def test_lookup_bucket_type_coalesces_concurrent_calls():
+    fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+    mock_get_bucket_type = mock.AsyncMock(return_value=BucketType.ZONAL_HIERARCHICAL)
+    fs._get_bucket_type = mock_get_bucket_type
+
+    # Trigger 10 concurrent lookups for the same bucket
+    results = await asyncio.gather(
+        *(fs._lookup_bucket_type("test_coalesce_bucket") for _ in range(10))
+    )
+
+    assert all(r == BucketType.ZONAL_HIERARCHICAL for r in results)
+    # Ensure _get_bucket_type was only invoked ONCE due to _layout_lock
+    assert mock_get_bucket_type.await_count == 1
+

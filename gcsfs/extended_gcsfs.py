@@ -275,14 +275,19 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     async def _lookup_bucket_type(self, bucket):
         if bucket in self._storage_layout_cache:
             return self._storage_layout_cache[bucket]
-        bucket_type = await self._get_bucket_type(bucket)
-        # Don't cache UNKNOWN type.
-        # This ensures that subsequent operations will retry the lookup,
-        # allowing it to recover when the transient error resolves.
-        if bucket_type == BucketType.UNKNOWN:
-            return bucket_type
-        self._storage_layout_cache[bucket] = bucket_type
-        return self._storage_layout_cache[bucket]
+        if not hasattr(self, "_layout_lock") or self._layout_lock is None:
+            self._layout_lock = asyncio.Lock()
+        async with self._layout_lock:
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
+            bucket_type = await self._get_bucket_type(bucket)
+            # Don't cache UNKNOWN type.
+            # This ensures that subsequent operations will retry the lookup,
+            # allowing it to recover when the transient error resolves.
+            if bucket_type == BucketType.UNKNOWN:
+                return bucket_type
+            self._storage_layout_cache[bucket] = bucket_type
+            return self._storage_layout_cache[bucket]
 
     _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
 
