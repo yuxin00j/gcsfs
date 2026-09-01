@@ -4,12 +4,12 @@ common:
   batch_size: 8
   baseline:
     fmt: "text_parquet"
-    file_count: 64
-    rows_per_file: 10920
+    file_count: 1024
+    rows_per_file: 1800
     # Keeps uncompressed pretokenized Parquet row groups below about 30 MB.
     row_group_size: 1800
     access: "shuffled"
-    num_workers: 4
+    num_workers: 16
     prefetch_factor: 2
     split_by_node: true
     world_size: 8
@@ -20,18 +20,4 @@ common:
 scenarios:
   - name: "read"
     scenario: "read"
-    variants:
-      - {axis: "access", access: "sequential"}
-
-      - {axis: "shuffle_split", max_buffer_input_shards: 8}
-
-      - {axis: "workers", num_workers: 0}
-
-      - {axis: "format", fmt: "pretok_parquet"}
-      - {axis: "format", fmt: "pretok_jsonl"}
-
-      - {axis: "climbmix", fmt: "pretok_jsonl", file_count: 100, rows_per_file: 6988}
-
-      - {axis: "scale", file_count: 512, rows_per_file: 1365}
-
-      - {axis: "prefetch", prefetch_factor: 4}
+    variants: []

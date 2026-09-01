@@ -7,6 +7,14 @@ cd "$HOME/gcsfs"
 sudo apt-get update >/dev/null
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   python3-pip python3-venv git >/dev/null
+
+# Increase system and user file descriptor limits
+sudo sh -c 'echo "* soft nofile 1048576" >> /etc/security/limits.conf'
+sudo sh -c 'echo "* hard nofile 1048576" >> /etc/security/limits.conf'
+sudo sh -c 'echo "root soft nofile 1048576" >> /etc/security/limits.conf'
+sudo sh -c 'echo "root hard nofile 1048576" >> /etc/security/limits.conf'
+sudo sysctl -w fs.file-max=2097152 >/dev/null || true
+
 python3 -m venv env
 source env/bin/activate
 pip install --upgrade pip >/dev/null

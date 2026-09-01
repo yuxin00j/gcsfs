@@ -1,0 +1,6 @@
+{
+  "error_type": "AutoresearchError",
+  "message": "Baseline metric command created autoresearch control files: /usr/local/google/home/yuxinj/myrepo/gcsfs/autoresearch-results/init-error.json. Full output: /usr/local/google/home/yuxinj/myrepo/gcsfs/autoresearch-results/logs/0000-baseline-verify.json",
+  "time": "2026-08-07T09:24:07Z",
+  "traceback": "Traceback (most recent call last):\n  File \"/usr/local/google/home/yuxinj/.gemini/config/skills/codex-autoresearch/scripts/autoresearch.py\", line 312, in initialize_run\n    require_no_initialized_state(\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^\n        paths,\n        ^^^^^^\n        command_name=\"Baseline metric command\",\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n        log_path=verify_result.log_path,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/usr/local/google/home/yuxinj/.gemini/config/skills/codex-autoresearch/scripts/autoresearch.py\", line 195, in require_no_initialized_state\n    raise AutoresearchError(\n    ...<3 lines>...\n    )\nautoresearch_core.AutoresearchError: Baseline metric command created autoresearch control files: /usr/local/google/home/yuxinj/myrepo/gcsfs/autoresearch-results/init-error.json. Full output: /usr/local/google/home/yuxinj/myrepo/gcsfs/autoresearch-results/logs/0000-baseline-verify.json\n"
+}

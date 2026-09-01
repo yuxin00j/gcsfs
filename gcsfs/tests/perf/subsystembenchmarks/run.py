@@ -28,6 +28,14 @@ def _setup_environment(args):
         os.environ["GCSFS_SUBSYSTEM_MODEL_ID"] = args.model_id
     os.environ["GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT"] = "true"
     os.environ["STORAGE_EMULATOR_HOST"] = "https://storage.googleapis.com"
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        logging.info("Set RLIMIT_NOFILE to hard limit: %s", hard)
+    except Exception as exc:
+        logging.warning("Could not increase RLIMIT_NOFILE: %s", exc)
 
 
 def _build_parser():
