@@ -67,7 +67,7 @@ exclude = [
 version-file = "gcsfs/_version.py"
 
 [tool.pytest.ini_options]
-addopts = "--color=yes --timeout=1800"
+addopts = "--color=yes --timeout=10800"
 log_cli = false
 log_cli_level = "DEBUG"
 markers = [

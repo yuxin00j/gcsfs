@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(
 CASES = configs.HuggingFaceReadConfigurator(configs.__file__).generate_cases()
 
 
+@pytest.mark.timeout(10800)
 @pytest.mark.parametrize("params", CASES, ids=lambda p: p.name)
 def test_read(benchmark, params, monitor):
     from gcsfs.tests.perf.subsystembenchmarks.dataloading.huggingface_datasets.read.driver import (

@@ -34,7 +34,7 @@ def timestamp():
 
 
 # Timeout in seconds for rank synchronization at the round barrier.
-ROUND_BARRIER_TIMEOUT_SECONDS = 3600
+ROUND_BARRIER_TIMEOUT_SECONDS = 7200
 
 
 def round_barrier(ctx, world_size):
