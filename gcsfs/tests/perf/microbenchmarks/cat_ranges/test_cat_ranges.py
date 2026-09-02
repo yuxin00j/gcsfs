@@ -40,7 +40,7 @@ def _generate_ranges(
 
         # 2. Pick range size for this specific range
         if isinstance(chunk_sizes_bytes, list) and len(chunk_sizes_bytes) > 0:
-            range_size = chunk_sizes_bytes[i % len(chunk_sizes_bytes)]
+            range_size = rng.choice(chunk_sizes_bytes)
         else:
             range_size = chunk_sizes_bytes
 
