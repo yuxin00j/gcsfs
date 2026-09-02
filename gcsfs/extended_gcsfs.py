@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
+import io
 import logging
 import os
 import uuid
 import weakref
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from glob import has_magic
@@ -29,7 +31,13 @@ from gcsfs import __version__ as version
 from gcsfs import zb_hns_utils
 from gcsfs._dircache import HnsDirCacheUpdater
 from gcsfs.concurrency import split_range
-from gcsfs.core import GCSFile, GCSFileSystem, _get_prefetcher_and_cache_config
+from gcsfs.core import (
+    GCSFile,
+    GCSFileSystem,
+    _coalesce_ranges,
+    _get_prefetcher_and_cache_config,
+    _validate_cat_ranges_input,
+)
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
 from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
@@ -354,57 +362,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             **kwargs,
         )
 
-    # Replacement method for _process_limits to support new params (offset and length) for MRD.
-    async def _process_limits_to_offset_and_length(
-        self, path, start, end, file_size=None
-    ):
-        """
-        Calculates the read offset and length from start and end parameters.
-
-        Args:
-            path (str): The path to the file.
-            start (int | None): The starting byte position.
-            end (int | None): The ending byte position.
-            file_size (int | None): The total size of the file. If None, it will be fetched via _info().
-
-        Returns:
-            tuple: A tuple containing (offset, length).
-        """
-        size = file_size
-
-        async def _get_size():
-            nonlocal size
-            if size is None:
-                size = (await self._info(path))["size"]
-            return size
-
-        if start is None:
-            offset = 0
-        elif start < 0:
-            offset = max(0, await _get_size() + start)
-        else:
-            offset = start
-
-        if end is None:
-            effective_end = await _get_size()
-        elif end < 0:
-            effective_end = await _get_size() + end
-        else:
-            effective_end = end
-
-        # If the requested end is before/ same as the start, return empty.
-        if effective_end <= offset:
-            return offset, 0
-        else:
-            length = effective_end - offset  # Normal case
-            s = await _get_size()
-            if effective_end > s:
-                length = max(0, s - offset)  # Clamp and ensure non-negative
-
-        return offset, length
-
     sync_process_limits_to_offset_and_length = asyn.sync_wrapper(
-        _process_limits_to_offset_and_length
+        GCSFileSystem._process_limits_to_offset_and_length
     )
 
     async def _is_zonal_bucket(self, bucket):
@@ -656,6 +615,180 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             # If we created a temporary pool specifically for this _cat_file call, clean it up
             if pool_created_here:
                 await mrd.close()
+
+    async def _cat_ranges(
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        batch_size=None,
+        on_error="return",
+        **kwargs,
+    ):
+        """Get the contents of byte ranges, leveraging bulk AsyncMultiRangeDownloader for Zonal buckets.
+
+        Parameters
+        ----------
+        paths: list of str
+            A list of filepaths on this filesystem.
+        starts, ends: int or list of int
+            Byte limits of the read. If using a single int, the same value will be
+            used for all files.
+        max_gap: int, optional
+            If specified and >= 0, adjacent byte ranges on the same file with a gap
+            <= max_gap will be coalesced into a single larger read request.
+        batch_size: int, optional
+            Number of concurrent range fetches. Defaults to self.batch_size.
+        on_error: "return" or "raise"
+            If "return" (default), any per-range exception is placed in the output
+            list at the corresponding position. Otherwise the first such exception
+            is raised.
+
+        Returns
+        -------
+        list of bytes or memoryview (when coalescing is active)
+        """
+        paths, starts, ends = _validate_cat_ranges_input(paths, starts, ends)
+
+        n = len(paths)
+        if n == 0:
+            return []
+
+        # 1. Group requests by file path, tracking original caller indices
+        file_groups = defaultdict(list)
+        for orig_idx, (p, s, e) in enumerate(zip(paths, starts, ends)):
+            file_groups[p].append((s, e, orig_idx))
+
+        # Check unique buckets to avoid redundant _is_zonal_bucket checks
+        bucket_zonal_map = {}
+        for path in file_groups.keys():
+            bucket, _, _ = self.split_path(path)
+            if bucket not in bucket_zonal_map:
+                bucket_zonal_map[bucket] = await self._is_zonal_bucket(bucket)
+
+        results = [None] * n
+        non_zonal_paths, non_zonal_starts, non_zonal_ends, non_zonal_indices = (
+            [],
+            [],
+            [],
+            [],
+        )
+        zonal_files = []
+        for path, items in file_groups.items():
+            bucket, object_name, generation = self.split_path(path)
+            if not bucket_zonal_map[bucket]:
+                for s, e, idx in items:
+                    non_zonal_paths.append(path)
+                    non_zonal_starts.append(s)
+                    non_zonal_ends.append(e)
+                    non_zonal_indices.append(idx)
+            else:
+                zonal_files.append((path, items, bucket, object_name, generation))
+
+        async def _fetch_zonal_file(path, items, bucket, object_name, generation):
+            # 2. Zonal Bucket: Acquire MRD from pool cache
+            try:
+                mrd_pool = await self._mrd_pool_cache.get(
+                    bucket, object_name, generation, pool_size=1
+                )
+            except Exception as exc:
+                if on_error != "return":
+                    raise exc
+                for _, _, idx in items:
+                    results[idx] = exc
+                return
+
+            try:
+                valid_items = await self._normalize_file_ranges(
+                    path,
+                    items,
+                    results,
+                    on_error=on_error,
+                    get_size_fn=lambda: _get_mrd_size(mrd_pool),
+                )
+                if not valid_items:
+                    return
+
+                # 3. Construct multi-range request for this file
+                if max_gap is not None and max_gap >= 0:
+                    merged_ranges = _coalesce_ranges(valid_items, max_gap)
+                else:
+                    merged_ranges = [
+                        (s, e, [(idx, 0, e - s)]) for s, e, idx in valid_items
+                    ]
+
+                effective_batch_size = self._compute_effective_batch_size(
+                    batch_size, self.batch_size, len(merged_ranges)
+                )
+
+                for i in range(0, len(merged_ranges), effective_batch_size):
+                    batch_merged = merged_ranges[i : i + effective_batch_size]
+                    buffers = [io.BytesIO() for _ in range(len(batch_merged))]
+                    mrd_spec = [
+                        (s, e - s, buf) for (s, e, _), buf in zip(batch_merged, buffers)
+                    ]
+
+                    try:
+                        async with _get_mrd_from_pool_or_mrd(mrd_pool) as m_client:
+                            await m_client.download_ranges(mrd_spec)
+
+                        for buf, (_, _, slice_list) in zip(buffers, batch_merged):
+                            merged_chunk = buf.getvalue()
+                            if max_gap is None or max_gap < 0:
+                                for idx, rel_s, rel_e in slice_list:
+                                    results[idx] = merged_chunk[rel_s:rel_e]
+                            else:
+                                view = memoryview(merged_chunk)
+                                for idx, rel_s, rel_e in slice_list:
+                                    results[idx] = view[rel_s:rel_e]
+                    except Exception as exc:
+                        if on_error != "return":
+                            raise exc
+                        for _, _, slice_list in batch_merged:
+                            for idx, _, _ in slice_list:
+                                results[idx] = exc
+            finally:
+                await mrd_pool.close()
+
+        async def _run_non_zonal():
+            if not non_zonal_paths:
+                return
+            nz_results = await super(ExtendedGcsFileSystem, self)._cat_ranges(
+                non_zonal_paths,
+                non_zonal_starts,
+                non_zonal_ends,
+                max_gap=max_gap,
+                batch_size=batch_size,
+                on_error=on_error,
+                **kwargs,
+            )
+            for idx, res in zip(non_zonal_indices, nz_results):
+                results[idx] = res
+
+        # Bound total active download jobs across all files using semaphore
+        effective_file_limit = (
+            batch_size
+            if (batch_size is not None and batch_size > 0)
+            else (self.batch_size or 32)
+        )
+        file_concurrency = min(len(zonal_files) or 1, effective_file_limit)
+        sem = asyncio.Semaphore(file_concurrency)
+
+        async def _fetch_with_sem(file_args):
+            async with sem:
+                return await _fetch_zonal_file(*file_args)
+
+        tasks = [_fetch_with_sem(args) for args in zonal_files]
+        if non_zonal_paths:
+            tasks.append(_run_non_zonal())
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        return results
+
+    cat_ranges = asyn.sync_wrapper(_cat_ranges)
 
     async def _is_bucket_hns_enabled(self, bucket):
         """Checks if a bucket has Hierarchical Namespace enabled."""
