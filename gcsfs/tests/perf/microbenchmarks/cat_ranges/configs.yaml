@@ -10,7 +10,8 @@ common:
   batch_sizes:
     - 64
   max_gaps:
-    - 1048576 # 1 MB
+    - 0
+
   rounds: 3
 
 scenarios:
