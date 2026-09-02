@@ -58,6 +58,6 @@ scenarios:
     num_ranges_list:
       - 1000
     batch_sizes:
-      - 128
+      - 64
     chunk_sizes_mb:
       - [0.0625, 1, 4, 16]
