@@ -6,9 +6,11 @@ common:
   file_sizes_mb:
     - 1024 # 1 GB
   num_ranges_list:
-    - 200 # larger than common batch_size (64)
+    - 200
   batch_sizes:
     - 64
+  max_gaps:
+    - 1048576 # 1 MB
   rounds: 3
 
 scenarios:
@@ -40,7 +42,7 @@ scenarios:
     pattern: "rand"
     files: 1
     num_ranges_list:
-      - 200 # larger than batch_sizes (16, 64, 128)
+      - 200
     batch_sizes:
       - 16
       - 64
@@ -54,7 +56,7 @@ scenarios:
     file_sizes_mb:
       - 10240 # 10 GB
     num_ranges_list:
-      - 1000 # larger than batch_size (128)
+      - 1000
     batch_sizes:
       - 128
     chunk_sizes_mb:
