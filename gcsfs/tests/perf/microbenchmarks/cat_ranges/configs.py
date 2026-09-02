@@ -24,17 +24,20 @@ class CatRangesConfigurator(BaseBenchmarkConfigurator):
         raw_chunk_sizes = scenario.get(
             "chunk_sizes_mb", common_config.get("chunk_sizes_mb", [[1]])
         )
-        if raw_chunk_sizes and not isinstance(raw_chunk_sizes[0], list):
+        if not raw_chunk_sizes:
+            raw_chunk_sizes = [[1]]
+
+        if not isinstance(raw_chunk_sizes[0], list):
             chunk_size_combinations = [raw_chunk_sizes]
         else:
             chunk_size_combinations = raw_chunk_sizes
 
         batch_sizes = scenario.get(
             "batch_sizes", common_config.get("batch_sizes", [None])
-        )
-        max_gaps = scenario.get(
-            "max_gaps", common_config.get("max_gaps", [None])
-        )
+        ) or [None]
+        max_gaps = scenario.get("max_gaps", common_config.get("max_gaps", [None])) or [
+            None
+        ]
 
         cases = []
         param_combinations = itertools.product(

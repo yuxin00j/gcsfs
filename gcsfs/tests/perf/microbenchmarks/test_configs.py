@@ -412,3 +412,56 @@ def test_cat_ranges_configurator(mock_config_dependencies):
         int(16 * MB),
     ]
 
+
+def test_cat_ranges_configurator_empty_fallbacks(mock_config_dependencies):
+    """Test CatRangesConfigurator falls back cleanly when optional lists are empty or None."""
+    common = {"rounds": 1}
+    scenario = {
+        "name": "empty_fallbacks",
+        "chunk_sizes_mb": None,
+        "batch_sizes": None,
+        "max_gaps": None,
+    }
+    configurator = CatRangesConfigurator("dummy")
+    cases = configurator.build_cases(scenario, common)
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.chunk_sizes_bytes == [int(1 * MB)]
+    assert case.batch_size is None
+    assert case.max_gap is None
+
+
+def test_cat_ranges_generate_ranges_sequential_stop():
+    """Test sequential range generation stops when offset exceeds file bound."""
+    from gcsfs.tests.perf.microbenchmarks.cat_ranges.test_cat_ranges import (
+        _generate_ranges,
+    )
+
+    # 100 MB file with 30 MB chunks: max_offset is 70 MB.
+    # Offsets: 0, 30, 60. Next is 90 > 70, so it should stop at 3 ranges even if 10 requested.
+    paths, starts, ends = _generate_ranges(
+        file_paths=["test.bin"],
+        file_size_bytes=100 * MB,
+        chunk_sizes_bytes=30 * MB,
+        num_ranges=10,
+        pattern="seq",
+    )
+    assert len(paths) == len(starts) == len(ends) == 3
+    assert starts == [0, 30 * MB, 60 * MB]
+    assert ends == [30 * MB, 60 * MB, 90 * MB]
+
+
+def test_cat_ranges_generate_ranges_oversized_chunk():
+    """Test range generation raises ValueError if chunk size exceeds file size."""
+    from gcsfs.tests.perf.microbenchmarks.cat_ranges.test_cat_ranges import (
+        _generate_ranges,
+    )
+
+    with pytest.raises(ValueError, match="exceeds file size"):
+        _generate_ranges(
+            file_paths=["test.bin"],
+            file_size_bytes=10 * MB,
+            chunk_sizes_bytes=20 * MB,
+            num_ranges=1,
+            pattern="seq",
+        )
