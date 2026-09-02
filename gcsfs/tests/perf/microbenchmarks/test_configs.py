@@ -3,6 +3,10 @@ import unittest.mock as mock
 import pytest
 
 from gcsfs.tests.perf.microbenchmarks import configs
+from gcsfs.tests.perf.microbenchmarks.cat_ranges.configs import (
+    CatRangesConfigurator,
+    get_cat_ranges_benchmark_cases,
+)
 from gcsfs.tests.perf.microbenchmarks.comparison.configs import (
     ComparisonConfigurator,
     get_comparison_benchmark_cases,
@@ -337,6 +341,10 @@ def test_validate_actual_yaml_configs():
         cases = get_comparison_benchmark_cases()
         assert len(cases) > 0, "Comparison config produced no cases"
 
+        # Cat Ranges
+        cases = get_cat_ranges_benchmark_cases()
+        assert len(cases) > 0, "Cat ranges config produced no cases"
+
 
 def test_comparison_configurator(mock_config_dependencies):
     """Test that ComparisonConfigurator correctly builds benchmark parameters."""
@@ -361,3 +369,46 @@ def test_comparison_configurator(mock_config_dependencies):
     assert case.processes == 1
     assert case.rounds == 3
     assert case.bucket_type == "regional"
+
+
+def test_cat_ranges_configurator(mock_config_dependencies):
+    """Test that CatRangesConfigurator correctly builds benchmark parameters."""
+    common = {
+        "bucket_types": ["regional"],
+        "file_sizes_mb": [256],
+        "num_ranges_list": [200],
+        "rounds": 1,
+    }
+    scenario = {
+        "name": "cat_ranges_test",
+        "pattern": "mixed",
+        "files": 1,
+        "chunk_sizes_mb": [[0.0625, 1, 4, 16]],
+        "batch_sizes": [64],
+        "max_gaps": [1024],
+    }
+
+    configurator = CatRangesConfigurator("dummy")
+    cases = configurator.build_cases(scenario, common)
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert (
+        case.name
+        == "cat_ranges_test_256MB_file_1files_mixed_0.0625_1_4_16MB_chunk_200ranges_64batch_1024maxgap_mixed_regional"
+    )
+    assert case.files == 1
+    assert case.threads == 1
+    assert case.processes == 1
+    assert case.num_ranges == 200
+    assert case.batch_size == 64
+    assert case.max_gap == 1024
+    assert case.pattern == "mixed"
+    assert case.file_size_bytes == 256 * MB
+    assert case.chunk_sizes_bytes == [
+        int(0.0625 * MB),
+        int(1 * MB),
+        int(4 * MB),
+        int(16 * MB),
+    ]
+
