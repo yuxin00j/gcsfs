@@ -2323,40 +2323,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 GoogleCredentials.load_tokens()
 
 
-def _get_prefetcher_and_cache_config(cache_type, kwargs):
-    """
-    Resolves effective cache_type, whether prefetch reader should be enabled,
-    and cache_source ("explicit" vs "default").
-
-    Rules:
-    - If user explicitly sets cache_type (cache_type is not None), prefetcher is disabled,
-      cache_type is used, and cache_source is "explicit".
-    - If cache_type is None and prefetcher is enabled (default), cache_type is "none",
-      prefetcher is active, and cache_source is "default".
-    - If cache_type is None and prefetcher is disabled, fallback to default_cache_type ("readahead"),
-      and cache_source is "default".
-    """
-    if cache_type is not None:
-        use_prefetch_reader = False
-        cache_source = "explicit"
-    else:
-        cache_source = "default"
-        if "use_experimental_adaptive_prefetching" in kwargs:
-            val = kwargs["use_experimental_adaptive_prefetching"]
-            use_prefetch_reader = (
-                val.lower() in ("true", "1") if isinstance(val, str) else bool(val)
-            )
-        else:
-            use_prefetch_reader = os.environ.get(
-                "USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", "true"
-            ).lower() in (
-                "true",
-                "1",
-            )
-        cache_type = "none" if use_prefetch_reader else "readahead"
-    return cache_type, use_prefetch_reader, cache_source
-
-
 def _on_loop_thread(loop):
     if loop is None:
         return False
@@ -2410,8 +2376,6 @@ def _defer_close(file):
     if work is None:  # pragma: no cover
         work = _start_deferred_close_worker()
     work.put(_run)
-
-
 class GCSFile(fsspec.spec.AbstractBufferedFile):
     _close_deferred = False
 
@@ -2422,7 +2386,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         mode="rb",
         block_size=DEFAULT_BLOCK_SIZE,
         autocommit=True,
-        cache_type=None,
+        cache_type="readahead",
         cache_options=None,
         acl=None,
         consistency="md5",
@@ -2485,10 +2449,6 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             raise OSError("Attempt to open a bucket")
         self.generation = _coalesce_generation(generation, path_generation)
         self.concurrency = kwargs.get("concurrency", DEFAULT_CONCURRENCY)
-        cache_type, use_prefetch_reader, self.cache_source = (
-            _get_prefetcher_and_cache_config(cache_type, kwargs)
-        )
-
         super().__init__(
             gcsfs,
             path,
@@ -2506,6 +2466,34 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self.acl = acl
         self.consistency = consistency
         self.checker = get_consistency_checker(consistency)
+
+        # Ideally, all of these fields should be part of `cache_options`. Because current
+        # `fsspec` caches do not accept arbitrary `*args` and `**kwargs`, passing them
+        # there currently causes instantiation errors. We are holding off on introducing
+        # them as explicit keyword arguments to ensure existing user workloads are not
+        # disrupted. This will be refactored once the upstream `fsspec` changes are merged.
+        use_prefetch_reader = kwargs.get(
+            "use_experimental_adaptive_prefetching", False
+        ) or os.environ.get(
+            "USE_EXPERIMENTAL_ADAPTIVE_PREFETCHING", "false"
+        ).lower() in (
+            "true",
+            "1",
+        )
+
+        if "r" in mode and use_prefetch_reader:
+            max_prefetch_size = kwargs.get("max_prefetch_size", MAX_PREFETCH_SIZE)
+            from .prefetcher import BackgroundPrefetcher
+
+            self._prefetch_engine = BackgroundPrefetcher(
+                self._async_fetch_range,
+                self.size,
+                max_prefetch_size=max_prefetch_size,
+                concurrency=self.concurrency,
+                loop=self.gcsfs.loop,
+            )
+        else:
+            self._prefetch_engine = None
 
         # _supports_append is an internal argument not meant to be used directly.
         # If True, allows opening file in append mode. This is generally not supported
@@ -2538,20 +2526,6 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
                 warnings.warn("Setting block size to minimum value, 2**18")
                 self.blocksize = GCS_MIN_BLOCK_SIZE
             self.location = None
-
-        if "r" in mode and use_prefetch_reader:
-            max_prefetch_size = kwargs.get("max_prefetch_size", MAX_PREFETCH_SIZE)
-            from .prefetcher import BackgroundPrefetcher
-
-            self._prefetch_engine = BackgroundPrefetcher(
-                self._async_fetch_range,
-                self.size,
-                max_prefetch_size=max_prefetch_size,
-                concurrency=self.concurrency,
-                loop=self.gcsfs.loop,
-            )
-        else:
-            self._prefetch_engine = None
 
     @property
     def details(self):
