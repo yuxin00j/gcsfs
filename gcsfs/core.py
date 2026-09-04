@@ -36,6 +36,7 @@ from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
 from .inventory_report import InventoryReport
 from .retry import errs, retry_request, validate_response
+from .lock import AsyncProcessFileLock, get_intra_process_lock
 from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE
 
 logger = logging.getLogger("gcsfs")
@@ -2179,13 +2180,18 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         max_prefetch_size = kwargs.pop(
             "max_prefetch_size", 2 * concurrency * chunk_size
         )
+        lock = kwargs.pop("lock", True)
+        cache_ok = kwargs.pop("cache_ok", True)
+        lock_timeout = kwargs.pop("lock_timeout", 600.0)
 
-        try:
+        abs_lpath = os.path.abspath(lpath)
+
+        async def _do_download(target_path):
             # The concurrent path uses `_cat_file` to interact with gcsfs which doesn't take headers as argument.
             if concurrency > 1 and "headers" not in kwargs:
                 await self._get_file_concurrent(
                     rpath,
-                    lpath,
+                    target_path,
                     concurrency,
                     callback=callback,
                     chunk_size=chunk_size,
@@ -2193,11 +2199,45 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     **kwargs,
                 )
             else:
-                await self._get_file_request(rpath, lpath, callback=callback, **kwargs)
-        except BaseException:
-            if os.path.exists(lpath):
-                os.remove(lpath)
-            raise
+                await self._get_file_request(rpath, target_path, callback=callback, **kwargs)
+
+        if not lock:
+            try:
+                await _do_download(lpath)
+            except BaseException:
+                if os.path.exists(lpath):
+                    os.remove(lpath)
+                raise
+            return
+
+        lock_path = abs_lpath + ".lock"
+        intra_lock = await get_intra_process_lock(abs_lpath)
+        async with intra_lock:
+            async with AsyncProcessFileLock(lock_path, timeout=lock_timeout):
+                # Fast path: check if local file is already valid and fully downloaded
+                if cache_ok and os.path.exists(abs_lpath):
+                    try:
+                        info = await self._info(rpath)
+                        if os.path.getsize(abs_lpath) == info.get("size", 0):
+                            logger.debug("Reusing cached local file %s for %s", abs_lpath, rpath)
+                            return
+                    except Exception as e:
+                        logger.debug("Cache validation failed for %s, re-downloading: %s", abs_lpath, e)
+
+                lparent = os.path.dirname(abs_lpath) or os.curdir
+                os.makedirs(lparent, exist_ok=True)
+                staging_path = os.path.join(
+                    lparent, f".{os.path.basename(abs_lpath)}.tmp.{uuid.uuid4().hex}"
+                )
+                try:
+                    await _do_download(staging_path)
+                    os.replace(staging_path, abs_lpath)
+                finally:
+                    if os.path.exists(staging_path):
+                        try:
+                            os.remove(staging_path)
+                        except OSError:
+                            pass
 
     def _open(
         self,
