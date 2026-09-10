@@ -552,7 +552,10 @@ def pytest_benchmark_generate_json(config, benchmarks, machine_info, commit_info
 
 
 def publish_benchmark_extra_info(
-    benchmark: Any, params: Any, benchmark_group: str
+    benchmark: Any,
+    params: Any,
+    benchmark_group: str,
+    total_bytes: int | None = None,
 ) -> None:
     """
     Helper function to publish benchmark parameters to the extra_info property.
@@ -577,6 +580,14 @@ def publish_benchmark_extra_info(
     benchmark.extra_info["max_gap"] = getattr(params, "max_gap", "N/A")
     benchmark.extra_info["batch_size"] = getattr(params, "batch_size", "N/A")
     benchmark.extra_info["runtime"] = getattr(params, "runtime", "N/A")
+    if total_bytes is None:
+        file_size = getattr(params, "file_size_bytes", None)
+        files = getattr(params, "files", 1)
+        if file_size is not None and file_size != "N/A":
+            total_bytes = file_size * files
+    benchmark.extra_info["total_bytes"] = (
+        total_bytes if total_bytes is not None else "N/A"
+    )
     benchmark.extra_info["threads"] = params.threads
     benchmark.extra_info["rounds"] = params.rounds
     benchmark.extra_info["bucket_name"] = params.bucket_name

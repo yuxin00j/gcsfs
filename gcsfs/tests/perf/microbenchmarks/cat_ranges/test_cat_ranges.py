@@ -27,12 +27,29 @@ def _generate_ranges(
     Supports uniform chunk size (int) or varying chunk sizes (list of ints)
     within the same test case.
     """
+    chunk_sizes = (
+        chunk_sizes_bytes
+        if isinstance(chunk_sizes_bytes, list)
+        else [chunk_sizes_bytes]
+    )
+    if max(chunk_sizes) > file_size_bytes:
+        raise ValueError(
+            f"Range size {max(chunk_sizes)} bytes exceeds file size {file_size_bytes} bytes."
+        )
+    if (
+        pattern == "seq"
+        and (num_ranges / len(file_paths)) * max(chunk_sizes) > file_size_bytes
+    ):
+        raise ValueError(
+            "Requested sequential ranges exceed file size; cannot generate non-overlapping ranges."
+        )
+
     rng = random.Random(seed)
     paths = []
     starts = []
     ends = []
 
-    current_seq_offset = 0
+    per_file_offsets = {p: 0 for p in file_paths}
     for i in range(num_ranges):
         # 1. Path allocation (round-robin across available files)
         path = file_paths[i % len(file_paths)]
@@ -51,12 +68,14 @@ def _generate_ranges(
         # 3. Determine start and end offsets within file bounds
         max_offset = max(0, file_size_bytes - range_size)
         if pattern == "seq":
-            if current_seq_offset > max_offset:
-                break
-            start = current_seq_offset
-            current_seq_offset += range_size
-        else:
+            start = per_file_offsets[path]
+            per_file_offsets[path] += range_size
+        elif pattern == "rand":
             start = rng.randint(0, max_offset) if max_offset > 0 else 0
+        else:
+            raise ValueError(
+                f"Unsupported pattern: {pattern}. Expected 'seq' or 'rand'."
+            )
 
         paths.append(path)
         starts.append(start)
@@ -68,12 +87,16 @@ def _generate_ranges(
 def _cat_ranges_op(gcs, paths, starts, ends, max_gap=None, batch_size=None):
     """Fetch byte ranges from GCS files using cat_ranges."""
     try:
-        kwargs = {}
+        kwargs = {"on_error": "raise"}
         if max_gap is not None:
             kwargs["max_gap"] = max_gap
         if batch_size is not None:
             kwargs["batch_size"] = batch_size
-        return gcs.cat_ranges(paths, starts, ends, **kwargs)
+        results = gcs.cat_ranges(paths, starts, ends, **kwargs)
+        for res in results:
+            if isinstance(res, Exception):
+                raise res
+        return results
     except Exception as e:
         logging.error(f"Error in cat_ranges: {e}")
         raise
@@ -100,6 +123,7 @@ def test_cat_ranges_single_threaded(benchmark, gcsfs_benchmark_cat_ranges, monit
         params.num_ranges,
         params.pattern,
     )
+    total_bytes = sum(end - start for start, end in zip(starts, ends))
     op_args = (gcs, paths, starts, ends, params.max_gap, params.batch_size)
 
     run_single_threaded(
@@ -109,4 +133,5 @@ def test_cat_ranges_single_threaded(benchmark, gcsfs_benchmark_cat_ranges, monit
         _cat_ranges_op,
         op_args,
         BENCHMARK_GROUP,
+        total_bytes=total_bytes,
     )
