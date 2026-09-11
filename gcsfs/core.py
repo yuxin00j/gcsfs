@@ -3,6 +3,7 @@ Google Cloud Storage pythonic interface
 """
 
 import asyncio
+import errno
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import uuid
@@ -338,6 +340,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         endpoint_url=None,
         default_location=None,
         version_aware=False,
+        enable_cross_process_cache=None,
+        cache_dir=None,
+        cache_writable=False,
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -374,6 +379,18 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.credentials = GoogleCredentials(
             project, access, token, on_google=self.on_google
         )
+        self.cache_dir = cache_dir
+        self.enable_cross_process_cache = enable_cross_process_cache
+        self.cache_writable = cache_writable
+        self._cache_manager = None
+
+    @property
+    def cache_manager(self):
+        if self._cache_manager is None:
+            from gcsfs.cache_manager import GCSFileSystemCacheManager
+
+            self._cache_manager = GCSFileSystemCacheManager(cache_dir=self.cache_dir)
+        return self._cache_manager
 
     @property
     def _location(self):
@@ -2166,17 +2183,16 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if check_consistency:
             checker.validate_json_response(details)
 
-    async def _get_file(self, rpath, lpath, callback=None, **kwargs):
-        if os.path.isdir(lpath):
-            return
-
-        callback = callback or NoOpCallback()
-
+    async def _get_file_direct(
+        self, rpath, lpath, callback=None, outfile=None, **kwargs
+    ):
         concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)
         chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
         max_prefetch_size = kwargs.pop(
             "max_prefetch_size", 2 * concurrency * chunk_size
         )
+        if outfile is not None:
+            kwargs["outfile"] = outfile
 
         try:
             # The concurrent path uses `_cat_file` to interact with gcsfs which doesn't take headers as argument.
@@ -2196,6 +2212,111 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if os.path.exists(lpath):
                 os.remove(lpath)
             raise
+
+    async def _get_file(self, rpath, lpath, callback=None, outfile=None, **kwargs):
+        if os.path.isdir(lpath):
+            return
+
+        callback = callback or NoOpCallback()
+
+        if hasattr(lpath, "write"):
+            outfile = lpath
+
+        # Cross-process cache check: controlled by flag (enable_cross_process_cache)
+        # or environment variable (GCSFS_CACHE_ENABLED).
+        # Defaults to False for upstream open-source safety.
+        cache_enabled = getattr(self, "enable_cross_process_cache", None)
+        if cache_enabled is None:
+            cache_enabled = os.environ.get(
+                "GCSFS_CACHE_ENABLED", "false"
+            ).strip().lower() in ("true", "1", "yes", "on")
+
+        if not cache_enabled or outfile is not None:
+            return await self._get_file_direct(
+                rpath, lpath, callback=callback, outfile=outfile, **kwargs
+            )
+
+        info = await self._info(rpath)
+        generation = str(info.get("generation") or "")
+        size = int(info.get("size") or 0)
+        writable = kwargs.pop(
+            "writable",
+            getattr(self, "cache_writable", False)
+            or (os.environ.get("GCSFS_CACHE_WRITABLE", "false").lower() == "true"),
+        )
+
+        cache_mgr = self.cache_manager
+        cache_key = cache_mgr.get_cache_key(rpath, generation=generation, size=size)
+        cache_file = cache_mgr.data_dir / f"{cache_key}.data"
+        lock_file = cache_mgr.lock_dir / f"{cache_key}.lock"
+
+        # Fast-Path: file already cached and published
+        if cache_file.exists() and (size == 0 or cache_file.stat().st_size == size):
+            callback.set_size(size)
+            callback.relative_update(size)
+            await asyncio.to_thread(
+                cache_mgr.materialize, cache_file, lpath, rpath=rpath, writable=writable
+            )
+            return
+
+        downloaded = False
+        # Intra-Process lock coordinates coroutines on the same event loop
+        async with cache_mgr.get_intra_lock(cache_key):
+            # Double check inside intra-lock
+            if not (
+                cache_file.exists() and (size == 0 or cache_file.stat().st_size == size)
+            ):
+                # Cross-Process lock coordinates processes across the host
+                from gcsfs.cache_manager import AsyncProcessFileLock
+
+                async with AsyncProcessFileLock(lock_file):
+                    # Double check inside cross-process lock: did another process finish downloading while we waited?
+                    if not (
+                        cache_file.exists()
+                        and (size == 0 or cache_file.stat().st_size == size)
+                    ):
+                        tmp_staging = (
+                            cache_mgr.data_dir
+                            / f".{cache_key}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+                        )
+                        try:
+                            # Fast pre-flight space check without blocking tmpfs memory allocation
+                            if size > 0:
+                                total, used, free = shutil.disk_usage(
+                                    cache_mgr.data_dir
+                                )
+                                if free < size:
+                                    raise OSError(
+                                        errno.ENOSPC,
+                                        f"Insufficient disk space in {cache_mgr.data_dir}: "
+                                        f"{free} bytes free, need {size} bytes",
+                                    )
+
+                            # Stream download to staging file using direct downloader
+                            await self._get_file_direct(
+                                rpath, str(tmp_staging), callback=callback, **kwargs
+                            )
+                            downloaded = True
+
+                            staged_size = tmp_staging.stat().st_size
+                            if size and staged_size != size:
+                                raise IOError(
+                                    f"Truncated download: expected {size} bytes, got {staged_size}"
+                                )
+
+                            os.chmod(tmp_staging, 0o444)
+                            os.replace(tmp_staging, cache_file)
+                        finally:
+                            if tmp_staging.exists():
+                                tmp_staging.unlink(missing_ok=True)
+
+        # Materialize to destination concurrently outside exclusive locks
+        if not downloaded:
+            callback.set_size(size)
+            callback.relative_update(size)
+        await asyncio.to_thread(
+            cache_mgr.materialize, cache_file, lpath, rpath=rpath, writable=writable
+        )
 
     def _open(
         self,
