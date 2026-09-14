@@ -1,5 +1,4 @@
 import asyncio
-import collections
 import errno
 
 try:
@@ -10,12 +9,16 @@ except ImportError:
     fcntl = None
     HAS_FCNTL = False
 import hashlib
+import logging
 import os
 import shutil
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Optional, Union
+
+logger = logging.getLogger("gcsfs.cache")
 
 
 class AsyncProcessFileLock:
@@ -34,8 +37,15 @@ class AsyncProcessFileLock:
 
     async def __aenter__(self):
         if not HAS_FCNTL:
-            return self
+            # Never silently hand back an unlocked context manager: callers rely
+            # on this for single-flight election. Callers must gate on HAS_FCNTL
+            # (see GCSFileSystem._cache_enabled) before constructing the lock.
+            raise RuntimeError(
+                "AsyncProcessFileLock requires fcntl, which is unavailable on "
+                "this platform. The gcsfs cross-process cache must be disabled."
+            )
         start_time = time.monotonic()
+
         self._fd = await asyncio.to_thread(
             os.open, self.lock_path, os.O_CREAT | os.O_RDWR, 0o666
         )
@@ -90,6 +100,9 @@ class AsyncProcessFileLock:
 class GCSFileSystemCacheManager:
     """Manages single-flight downloads and zero-copy materialization for GCSFS (Milestone 1 MVP)."""
 
+    # Process-wide latch so the cross-mount warning is emitted only once.
+    _warned_exdev = False
+
     def __init__(self, cache_dir: Optional[str] = None):
         base_dir = cache_dir or os.environ.get("GCSFS_CACHE_DIR", "~/.cache/gcsfs")
         self.cache_dir = Path(os.path.expanduser(base_dir))
@@ -97,7 +110,7 @@ class GCSFileSystemCacheManager:
         self.lock_dir = self.cache_dir / "locks"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock_dir.mkdir(parents=True, exist_ok=True)
-        self._intra_locks = collections.defaultdict(asyncio.Lock)
+        self._intra_locks = weakref.WeakValueDictionary()
 
     def get_cache_key(
         self, rpath: str, generation: Optional[str] = None, size: Optional[int] = None
@@ -106,7 +119,19 @@ class GCSFileSystemCacheManager:
         return hashlib.sha256(raw_identity).hexdigest()
 
     def get_intra_lock(self, cache_key: str) -> asyncio.Lock:
-        return self._intra_locks[cache_key]
+        """Return the per-key intra-process lock, creating it on first use.
+
+        Entries are weakly held so the registry cannot grow without bound: a
+        caller holding (or awaiting) the lock keeps it alive, and it is
+        reclaimed once nothing references it. There must be no ``await``
+        between the lookup and the insert, which makes this atomic with
+        respect to the event loop.
+        """
+        lock = self._intra_locks.get(cache_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._intra_locks[cache_key] = lock
+        return lock
 
     def materialize(
         self,
@@ -177,8 +202,32 @@ class GCSFileSystemCacheManager:
                     errno.EACCES,
                 ):
                     raise
+                if (
+                    e.errno == errno.EXDEV
+                    and not GCSFileSystemCacheManager._warned_exdev
+                ):
+                    GCSFileSystemCacheManager._warned_exdev = True
+                    logger.warning(
+                        "gcsfs cache: %s and %s are on different mounts, so the "
+                        "zero-copy hardlink is unavailable and every destination "
+                        "costs a full copy. Set GCSFS_CACHE_DIR to a directory on "
+                        "the same filesystem as your download destinations.",
+                        cache_file,
+                        dest,
+                    )
+                else:
+                    logger.debug(
+                        "gcsfs cache: hardlink %s -> %s failed (%s); falling back "
+                        "to copy",
+                        cache_file,
+                        dest,
+                        errno.errorcode.get(e.errno, e.errno),
+                    )
 
         # 3. Priority 2: Isolated Chunked Copy (EXDEV, EMLINK, EPERM, or writable=True)
+        logger.debug(
+            "gcsfs cache: copying %s -> %s (writable=%s)", cache_file, dest, writable
+        )
         tmp_target = (
             dest.parent / f".{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         )
