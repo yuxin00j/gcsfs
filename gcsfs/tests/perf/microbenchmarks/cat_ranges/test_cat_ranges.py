@@ -90,7 +90,13 @@ def _cat_ranges_op(gcs, paths, starts, ends, max_gap=None, batch_size=None):
             kwargs["max_gap"] = max_gap
         if batch_size is not None:
             kwargs["batch_size"] = batch_size
-        results = gcs.cat_ranges(paths, starts, ends, **kwargs)
+        try:
+            results = gcs.cat_ranges(paths, starts, ends, **kwargs)
+        except NotImplementedError:
+            # Baseline fsspec AsyncFileSystem._cat_ranges raises NotImplementedError
+            # when max_gap is not None. Fall back to uncoalesced execution.
+            kwargs.pop("max_gap", None)
+            results = gcs.cat_ranges(paths, starts, ends, **kwargs)
         for res in results:
             if isinstance(res, Exception):
                 raise res

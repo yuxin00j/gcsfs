@@ -36,7 +36,7 @@
       {"name": "engine", "type": "STRING"},
       {"name": "method", "type": "STRING"},
       {"name": "batch_size", "type": "INTEGER"},
-      {"name": "max_gap", "type": "INTEGER"},
+      {"name": "max_gap", "type": "STRING"},
       {"name": "num_ranges", "type": "INTEGER"},
       {"name": "total_bytes", "type": "INTEGER"},
       {"name": "min", "type": "FLOAT"},

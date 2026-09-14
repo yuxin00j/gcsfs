@@ -9,6 +9,10 @@ common:
     - 200
   batch_sizes:
     - 64
+  max_gaps:
+    - "auto" # adaptive gap derived per file from requested chunk sizes
+    - null # coalescing disabled (baseline)
+    - 0 # coalesce contiguous ranges only
   rounds: 3
 
 scenarios:
@@ -59,3 +63,26 @@ scenarios:
       - 64
     chunk_sizes_mb:
       - [0.0625, 1, 4, 16]
+
+  # Full-object reads issued as a single range. These bound the small-object
+  # end of the workload: there is nothing to coalesce, so they measure the
+  # floor that the coalesced multi-range scenarios above are working toward.
+  - name: "cat_ranges_full_file_single_range_5mb"
+    pattern: "seq"
+    files: 1
+    file_sizes_mb:
+      - 5
+    num_ranges_list:
+      - 1
+    chunk_sizes_mb:
+      - [5] # single range spanning the whole 5 MB file
+
+  - name: "cat_ranges_full_file_single_range_16mb"
+    pattern: "seq"
+    files: 1
+    file_sizes_mb:
+      - 16
+    num_ranges_list:
+      - 1
+    chunk_sizes_mb:
+      - [16] # single range spanning the whole 16 MB file

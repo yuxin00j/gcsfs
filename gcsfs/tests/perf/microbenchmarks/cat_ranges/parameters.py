@@ -18,8 +18,8 @@ class CatRangesBenchmarkParameters(IOBenchmarkParameters):
     # List of chunk sizes (in bytes) used across ranges within a single test case
     chunk_sizes_bytes: list[int] | None = None
 
-    # Maximum gap in bytes for merging adjacent ranges in cat_ranges (defaults to None)
-    max_gap: int | None = None
+    # Maximum gap in bytes or "auto" for merging adjacent ranges in cat_ranges (defaults to None)
+    max_gap: int | str | None = None
 
     # Batch size for async concurrent range execution in cat_ranges (defaults to None)
     batch_size: int | None = None

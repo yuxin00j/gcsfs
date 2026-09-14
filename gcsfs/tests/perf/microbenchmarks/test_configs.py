@@ -661,3 +661,26 @@ def test_cat_ranges_op_error_handling():
     mock_gcs.cat_ranges.return_value = [b"data1", OSError("Failed read")]
     with pytest.raises(OSError, match="Failed read"):
         _cat_ranges_op(mock_gcs, paths=["a", "b"], starts=[0, 10], ends=[10, 20])
+
+    # Test fallback when baseline fsspec raises NotImplementedError for max_gap
+    mock_gcs_fallback = mock.MagicMock()
+    mock_gcs_fallback.cat_ranges.side_effect = [
+        NotImplementedError("max_gap is not implemented"),
+        [b"fallback1", b"fallback2"],
+    ]
+    res_fb = _cat_ranges_op(
+        mock_gcs_fallback,
+        paths=["a", "b"],
+        starts=[0, 10],
+        ends=[10, 20],
+        max_gap="auto",
+        batch_size=64,
+    )
+    assert res_fb == [b"fallback1", b"fallback2"]
+    assert mock_gcs_fallback.cat_ranges.call_count == 2
+    mock_gcs_fallback.cat_ranges.assert_any_call(
+        ["a", "b"], [0, 10], [10, 20], on_error="raise", max_gap="auto", batch_size=64
+    )
+    mock_gcs_fallback.cat_ranges.assert_called_with(
+        ["a", "b"], [0, 10], [10, 20], on_error="raise", batch_size=64
+    )
