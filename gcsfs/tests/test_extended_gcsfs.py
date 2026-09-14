@@ -12,6 +12,7 @@ from itertools import chain
 from unittest import mock
 
 import pytest
+from fsspec import asyn
 from google.cloud.storage.asyncio.async_appendable_object_writer import (
     AsyncAppendableObjectWriter,
 )
@@ -1596,3 +1597,725 @@ def test_extended_gcsfs_garbage_collection():
     gc.collect()
 
     assert ref() is None
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_non_zonal_delegation():
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=False):
+        with mock.patch(
+            "gcsfs.core.GCSFileSystem._cat_ranges",
+            return_value=[b"chunk1", b"chunk2"],
+        ) as mock_super:
+            res = await fs._cat_ranges(
+                ["reg-bucket/f1", "reg-bucket/f2"],
+                starts=[0, 10],
+                ends=[5, 15],
+                max_gap=5,
+            )
+            assert res == [b"chunk1", b"chunk2"]
+            assert mock_super.call_count == 1
+
+            await fs._cat_ranges(
+                ["reg-bucket/f1", "reg-bucket/f2"],
+                starts=[0, 10],
+                ends=[5, 15],
+                auto_max_gap=True,
+            )
+            assert mock_super.call_args.kwargs["auto_max_gap"] is True
+
+            await fs._cat_ranges(
+                ["reg-bucket/f1", "reg-bucket/f2"],
+                starts=[0, 10],
+                ends=[5, 15],
+                max_gap="auto",
+            )
+            assert mock_super.call_args.kwargs["auto_max_gap"] is True
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_adaptive():
+    fs = ExtendedGcsFileSystem(token="anon")
+    zonal_data = b"x" * 300
+
+    captured_specs = []
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            captured_specs.append([(s, length) for s, length, _ in mrd_spec])
+            for s, length, buf in mrd_spec:
+                buf.write(zonal_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_mrd_instance = MockMRD()
+    mock_pool = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_size", return_value=len(zonal_data)
+        ):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=mock_mrd_instance,
+            ):
+                paths = [
+                    "zonal-bucket/test_file.bin",
+                    "zonal-bucket/test_file.bin",
+                ]
+                starts = [0, 105]
+                ends = [100, 205]
+
+                # 1. auto_max_gap=True -> gap 5 <= adaptive max_gap 5 -> single coalesced range
+                captured_specs.clear()
+                res = await fs._cat_ranges(paths, starts, ends, auto_max_gap=True)
+                assert len(res) == 2
+                assert bytes(res[0]) == b"x" * 100
+                assert bytes(res[1]) == b"x" * 100
+                assert captured_specs == [[(0, 205)]]
+
+                # 2. max_gap="auto" -> single coalesced range
+                captured_specs.clear()
+                res = await fs._cat_ranges(paths, starts, ends, max_gap="auto")
+                assert len(res) == 2
+                assert bytes(res[0]) == b"x" * 100
+                assert bytes(res[1]) == b"x" * 100
+                assert captured_specs == [[(0, 205)]]
+
+                # 3. Gap exceeding adaptive max_gap (gap = 10 > 5) -> separate ranges
+                captured_specs.clear()
+                res = await fs._cat_ranges(
+                    paths, [0, 110], [100, 210], auto_max_gap=True
+                )
+                assert len(res) == 2
+                assert bytes(res[0]) == b"x" * 100
+                assert bytes(res[1]) == b"x" * 100
+                assert captured_specs == [[(0, 100), (110, 100)]]
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_per_file_adaptive():
+    fs = ExtendedGcsFileSystem(token="anon")
+    zonal_data = b"x" * 100000
+    captured_specs = []
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            captured_specs.append([(s, length) for s, length, _ in mrd_spec])
+            for s, length, buf in mrd_spec:
+                buf.write(zonal_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_mrd_instance = MockMRD()
+    mock_pool = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_size", return_value=len(zonal_data)
+        ):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=mock_mrd_instance,
+            ):
+                # Mix small slices (100B, gap 400B > 5B adaptive max_gap) and
+                # large slices (10,000B, gap 300B <= 500B adaptive max_gap)
+                paths = ["zonal-bucket/small", "zonal-bucket/small"] + [
+                    "zonal-bucket/large"
+                ] * 6
+                starts = [0, 500] + [i * 10300 for i in range(6)]
+                ends = [100, 600] + [i * 10300 + 10000 for i in range(6)]
+
+                captured_specs.clear()
+                res = await fs._cat_ranges(paths, starts, ends, max_gap="auto")
+                assert len(res) == 8
+                # small file must NOT coalesce (gap 400 > 5)
+                assert [(0, 100), (500, 100)] in captured_specs
+                # large file MUST coalesce into a single range (gap 300 <= 500)
+                assert [(0, 61500)] in captured_specs
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_pool_size_matches_batch_budget():
+    """The MRD pool must be able to serve every concurrently scheduled batch.
+
+    The outer scheduler releases up to `batch_size` batch coroutines at once
+    and each one holds an MRD for the duration of its batch, so a pool capped
+    at DEFAULT_CONCURRENCY serializes the batches behind one another.
+    """
+    fs = ExtendedGcsFileSystem(token="anon")
+    zonal_data = b"x" * 10000
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            for s, length, buf in mrd_spec:
+                buf.write(zonal_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock.AsyncMock())
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_size", return_value=len(zonal_data)
+        ):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=MockMRD(),
+            ):
+                # 200 scattered ranges at batch_size 20 -> 10 batch coroutines,
+                # all of which the outer scheduler releases at once.
+                paths = ["zonal-bucket/f"] * 200
+                starts = [i * 20 for i in range(200)]
+                ends = [s + 10 for s in starts]
+
+                await fs._cat_ranges(paths, starts, ends, batch_size=20)
+                # Previously min(10, DEFAULT_CONCURRENCY) == 4.
+                assert mock_pool_cache.get.call_args.kwargs["pool_size"] == 10
+
+                # An explicit concurrency still wins.
+                mock_pool_cache.get.reset_mock()
+                await fs._cat_ranges(paths, starts, ends, batch_size=20, concurrency=2)
+                assert mock_pool_cache.get.call_args.kwargs["pool_size"] == 2
+
+                # pool_size never exceeds the number of batches.
+                mock_pool_cache.get.reset_mock()
+                await fs._cat_ranges(paths[:20], starts[:20], ends[:20], batch_size=20)
+                assert mock_pool_cache.get.call_args.kwargs["pool_size"] == 1
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_span_cap():
+    """Zonal merged blocks are capped so batches stay parallel."""
+    fs = ExtendedGcsFileSystem(token="anon")
+    zonal_data = b"x" * 1000
+    captured_specs = []
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            captured_specs.append([(s, length) for s, length, _ in mrd_spec])
+            for s, length, buf in mrd_spec:
+                buf.write(zonal_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock.AsyncMock())
+    fs._mrd_pool_cache = mock_pool_cache
+
+    paths = ["zonal-bucket/f"] * 10
+    starts = [i * 100 for i in range(10)]
+    ends = [s + 100 for s in starts]
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_size", return_value=len(zonal_data)
+        ):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=MockMRD(),
+            ):
+                # Real floor: 1000 contiguous bytes stay a single merged read.
+                captured_specs.clear()
+                res = await fs._cat_ranges(paths, starts, ends, max_gap=0, batch_size=5)
+                assert len(res) == 10
+                assert captured_specs == [[(0, 1000)]]
+
+                # With the floor shrunk, 1000 bytes over a budget of 5 yields
+                # 200 byte blocks instead of one 1000 byte read, spread across
+                # the pool rather than packed into a single batch.
+                with mock.patch("gcsfs.core._MIN_COALESCE_SPAN", 1):
+                    captured_specs.clear()
+                    res = await fs._cat_ranges(
+                        paths, starts, ends, max_gap=0, batch_size=5
+                    )
+                    assert [bytes(r) for r in res] == [b"x" * 100] * 10
+                    flat = sorted(s for batch in captured_specs for s in batch)
+                    assert flat == [
+                        (0, 200),
+                        (200, 200),
+                        (400, 200),
+                        (600, 200),
+                        (800, 200),
+                    ]
+                    # pool_size is 2 here, so the 5 blocks span 2 batches.
+                    assert len(captured_specs) == 2
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_zonal_coalescing():
+    fs = ExtendedGcsFileSystem(token="anon")
+    zonal_data = b"0123456789abcdefghijklmnopqrstuvwxyz"
+
+    # Mock MRD client
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            # mrd_spec is a list of (start, length, BytesIO_buffer)
+            for s, length, buf in mrd_spec:
+                buf.write(zonal_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_mrd_instance = MockMRD()
+
+    # Mock pool cache get
+    mock_pool = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_size", return_value=len(zonal_data)
+        ):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=mock_mrd_instance,
+            ):
+                paths = [
+                    "zonal-bucket/test_file.bin",
+                    "zonal-bucket/test_file.bin",
+                    "zonal-bucket/test_file.bin",
+                ]
+                starts = [0, 10, 20]
+                ends = [5, 15, 25]
+
+                # max_gap=5 coalesces into a single range [0, 25)
+                res = await fs._cat_ranges(paths, starts, ends, max_gap=5)
+
+                assert len(res) == 3
+                assert bytes(res[0]) == b"01234"
+                assert bytes(res[1]) == b"abcde"
+                assert bytes(res[2]) == b"klmno"
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_zonal_error_handling():
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    class FailingMRD:
+        async def download_ranges(self, mrd_spec):
+            raise RuntimeError("Zonal MRD Connection Error")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch("gcsfs.extended_gcsfs._get_mrd_size", return_value=100):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=FailingMRD(),
+            ):
+                paths = ["zonal-bucket/f1", "zonal-bucket/f1"]
+                starts = [0, 10]
+                ends = [5, 15]
+
+                # on_error="return"
+                res = await fs._cat_ranges(
+                    paths, starts, ends, max_gap=5, on_error="return"
+                )
+                assert len(res) == 2
+                assert isinstance(res[0], RuntimeError)
+                assert isinstance(res[1], RuntimeError)
+
+                # on_error="raise"
+                with pytest.raises(RuntimeError, match="Zonal MRD Connection Error"):
+                    await fs._cat_ranges(
+                        paths, starts, ends, max_gap=5, on_error="raise"
+                    )
+
+        # Failure during pool acquisition with start=None under on_error="return"
+        mock_pool_cache.get = mock.AsyncMock(side_effect=FileNotFoundError("missing"))
+        res_missing = await fs._cat_ranges(
+            ["zonal-bucket/missing.bin"],
+            starts=[None],
+            ends=[10],
+            on_error="return",
+        )
+        assert len(res_missing) == 1
+        assert isinstance(res_missing[0], FileNotFoundError)
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_mixed_zonal_and_non_zonal():
+    fs = ExtendedGcsFileSystem(token="anon")
+    zonal_data = b"0123456789abcdefghijklmnopqrstuvwxyz"
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            for s, length, buf in mrd_spec:
+                buf.write(zonal_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock.AsyncMock())
+    fs._mrd_pool_cache = mock_pool_cache
+
+    async def mock_is_zonal(bucket):
+        return bucket == "zonal-bucket"
+
+    with mock.patch.object(fs, "_is_zonal_bucket", side_effect=mock_is_zonal):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            return_value=MockMRD(),
+        ):
+            with mock.patch(
+                "gcsfs.core.GCSFileSystem._cat_file",
+                return_value=b"STANDARD_DATA",
+            ):
+                paths = [
+                    "zonal-bucket/f1.bin",
+                    "std-bucket/f2.bin",
+                    "zonal-bucket/f1.bin",
+                ]
+                starts = [0, 0, 10]
+                ends = [5, 13, 15]
+
+                res = await fs._cat_ranges(paths, starts, ends, max_gap=5)
+                assert len(res) == 3
+                assert bytes(res[0]) == b"01234"
+                assert bytes(res[1]) == b"STANDARD_DATA"
+                assert bytes(res[2]) == b"abcde"
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_zonal_partial_batch_failure():
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    class FlakyMRD:
+        def __init__(self):
+            self.call_count = 0
+
+        async def download_ranges(self, mrd_spec):
+            self.call_count += 1
+            if self.call_count == 1:
+                # Batch 1 succeeds
+                for s, length, buf in mrd_spec:
+                    buf.write(b"BATCH1_DATA"[0:length])
+            else:
+                # Batch 2 fails
+                raise RuntimeError("Batch 2 network timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock.AsyncMock())
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            return_value=FlakyMRD(),
+        ):
+            # 2 distinct ranges separated by > max_gap, batch_size=1
+            paths = ["zonal-bucket/f.bin", "zonal-bucket/f.bin"]
+            starts = [0, 50]
+            ends = [10, 60]
+
+            res = await fs._cat_ranges(
+                paths, starts, ends, max_gap=0, batch_size=1, on_error="return"
+            )
+            assert len(res) == 2
+            assert bytes(res[0]) == b"BATCH1_DAT"
+            assert isinstance(res[1], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_zonal_lazy_info():
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            for s, length, buf in mrd_spec:
+                buf.write(b"X" * length)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock.AsyncMock())
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            return_value=MockMRD(),
+        ):
+            with mock.patch.object(fs, "_info") as mock_info:
+                # All ends are explicit (including start=None and tuple paths), so _info should NOT be called
+                paths = ("zonal-bucket/f.bin", "zonal-bucket/f.bin")
+                starts = [None, 10]
+                ends = [5, 15]
+
+                res = await fs._cat_ranges(paths, starts, ends, max_gap=5)
+                assert len(res) == 2
+                assert bytes(res[0]) == b"XXXXX"
+                assert bytes(res[1]) == b"XXXXX"
+                assert mock_info.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_zonal_pool_closed():
+    fs = ExtendedGcsFileSystem(token="anon")
+    mock_pool = mock.AsyncMock()
+    mock_pool.close = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            side_effect=RuntimeError("download failure"),
+        ):
+            paths = ["zonal-bucket/f.bin"]
+            starts = [0]
+            ends = [10]
+            with pytest.raises(RuntimeError, match="download failure"):
+                await fs._cat_ranges(paths, starts, ends, on_error="raise")
+            # Pool must be closed even when download fails
+            mock_pool.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_zonal_normalization():
+    fs = ExtendedGcsFileSystem(token="anon")
+    file_data = b"0123456789"
+
+    class MockMRD:
+        def __init__(self):
+            self.spec_called = []
+
+        async def download_ranges(self, mrd_spec):
+            self.spec_called.append(mrd_spec)
+            for s, length, buf in mrd_spec:
+                buf.write(file_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_mrd = MockMRD()
+    mock_pool = mock.AsyncMock()
+    mock_pool.close = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            return_value=mock_mrd,
+        ):
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_size", return_value=len(file_data)
+            ):
+                paths = [
+                    "zonal-bucket/f.bin",
+                    "zonal-bucket/f.bin",
+                    "zonal-bucket/f.bin",
+                    "zonal-bucket/f.bin",
+                ]
+                starts = [0, 5, -3, 2]
+                ends = [3, 5, None, 4]  # index 1 has length 0 (5 to 5)
+
+                res = await fs._cat_ranges(paths, starts, ends, batch_size=-1)
+                assert len(res) == 4
+                assert bytes(res[0]) == b"012"
+                assert bytes(res[1]) == b""  # Zero length slice returned directly
+                assert bytes(res[2]) == b"789"  # Negative start resolved to offset 7
+                assert bytes(res[3]) == b"23"
+                mock_pool.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_return_types():
+    fs = ExtendedGcsFileSystem(token="anon")
+    file_data = b"0123456789"
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            for s, length, buf in mrd_spec:
+                buf.write(file_data[s : s + length])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool = mock.AsyncMock()
+    mock_pool.close = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            return_value=MockMRD(),
+        ):
+            paths = ["zonal-bucket/f.bin", "zonal-bucket/f.bin"]
+            starts = [0, 5]
+            ends = [3, 8]
+
+            # When max_gap is None, return type should be bytes
+            res_uncoalesced = await fs._cat_ranges(paths, starts, ends, max_gap=None)
+            assert isinstance(res_uncoalesced[0], bytes)
+            assert isinstance(res_uncoalesced[1], bytes)
+            assert res_uncoalesced[0] == b"012"
+            assert res_uncoalesced[1] == b"567"
+
+            # When max_gap >= 0, return type should be memoryview
+            res_coalesced = await fs._cat_ranges(paths, starts, ends, max_gap=5)
+            assert isinstance(res_coalesced[0], memoryview)
+            assert isinstance(res_coalesced[1], memoryview)
+            assert bytes(res_coalesced[0]) == b"012"
+            assert bytes(res_coalesced[1]) == b"567"
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_batch_size_chunks():
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    class MockMRD:
+        async def download_ranges(self, mrd_spec):
+            for _, length, buf in mrd_spec:
+                buf.write(b"Z" * length)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool = mock.AsyncMock()
+    mock_pool.close = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "fsspec.asyn._run_coros_in_chunks",
+            wraps=asyn._run_coros_in_chunks,
+        ) as mock_chunks:
+            with mock.patch(
+                "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+                return_value=MockMRD(),
+            ):
+                paths = [f"zonal-bucket/f{i}.bin" for i in range(5)]
+                starts = [0] * 5
+                ends = [10] * 5
+
+                # batch_size=2 should limit file concurrency to 2
+                await fs._cat_ranges(paths, starts, ends, batch_size=2)
+                mock_chunks.assert_called()
+                assert mock_chunks.call_args.kwargs.get("batch_size") == 2
+
+
+test_extended_gcsfs_cat_ranges_batch_size_semaphore = (
+    test_extended_gcsfs_cat_ranges_batch_size_chunks
+)
+
+
+@pytest.mark.asyncio
+async def test_extended_gcsfs_cat_ranges_concurrent_batches():
+    fs = ExtendedGcsFileSystem(token="anon")
+
+    active_concurrent_calls = 0
+    max_observed_concurrency = 0
+
+    class ConcurrentMRD:
+        async def download_ranges(self, mrd_spec):
+            nonlocal active_concurrent_calls, max_observed_concurrency
+            active_concurrent_calls += 1
+            if active_concurrent_calls > max_observed_concurrency:
+                max_observed_concurrency = active_concurrent_calls
+            await asyncio.sleep(0.01)
+            for _, length, buf in mrd_spec:
+                buf.write(b"M" * length)
+            active_concurrent_calls -= 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    mock_pool = mock.AsyncMock()
+    mock_pool.close = mock.AsyncMock()
+    mock_pool_cache = mock.AsyncMock()
+    mock_pool_cache.get = mock.AsyncMock(return_value=mock_pool)
+    fs._mrd_pool_cache = mock_pool_cache
+
+    with mock.patch.object(fs, "_is_zonal_bucket", return_value=True):
+        with mock.patch(
+            "gcsfs.extended_gcsfs._get_mrd_from_pool_or_mrd",
+            return_value=ConcurrentMRD(),
+        ):
+            paths = ["zonal-bucket/f.bin"] * 6
+            starts = [i * 10 for i in range(6)]
+            ends = [s + 5 for s in starts]
+
+            # 6 ranges, batch_size=2 -> 3 batches. concurrency=3 -> 3 workers.
+            res = await fs._cat_ranges(
+                paths, starts, ends, max_gap=0, batch_size=2, concurrency=3
+            )
+            assert len(res) == 6
+            assert all(bytes(r) == b"MMMMM" for r in res)
+            assert max_observed_concurrency > 1
+            mock_pool_cache.get.assert_called_with(
+                "zonal-bucket", "f.bin", None, pool_size=3
+            )
