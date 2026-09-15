@@ -46,8 +46,11 @@ class AsyncProcessFileLock:
             )
         start_time = time.monotonic()
 
+        # 0o600: the cache directory is a single-UID trust domain (see
+        # GCSFileSystemCacheManager.__init__). A world-writable lock file would
+        # let any local user wedge single-flight election.
         self._fd = await asyncio.to_thread(
-            os.open, self.lock_path, os.O_CREAT | os.O_RDWR, 0o666
+            os.open, self.lock_path, os.O_CREAT | os.O_RDWR, 0o600
         )
         try:
             while True:
@@ -108,14 +111,37 @@ class GCSFileSystemCacheManager:
         self.cache_dir = Path(os.path.expanduser(base_dir))
         self.data_dir = self.cache_dir / "data"
         self.lock_dir = self.cache_dir / "locks"
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        # 0o700: anyone who can read this directory reads every cached object
+        # straight off disk, with no GCS credentials and no ACL check. Treat the
+        # cache as a single-UID trust domain. `mode` is masked by umask, so
+        # chmod explicitly, and repair directories left looser by an earlier
+        # version. A chmod we do not own is not ours to make -- ignore it rather
+        # than refusing to start.
+        for directory in (self.cache_dir, self.data_dir, self.lock_dir):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                directory.chmod(0o700)
+            except OSError as e:
+                logger.debug(
+                    "gcsfs cache: could not tighten permissions on %s (%s)",
+                    directory,
+                    errno.errorcode.get(e.errno, e.errno),
+                )
         self._intra_locks = weakref.WeakValueDictionary()
 
     def get_cache_key(
         self, rpath: str, generation: Optional[str] = None, size: Optional[int] = None
     ) -> str:
-        raw_identity = f"{rpath}:{generation or 'none'}:{size or 0}".encode("utf-8")
+        if not generation:
+            # Keying on a placeholder would collide every version of an object
+            # that happens to share a byte count, and the cache would then serve
+            # stale bytes with complete confidence. Callers must bypass the
+            # cache instead (see GCSFileSystem._get_file).
+            raise ValueError(
+                f"Refusing to build a cache key for {rpath!r} without an object "
+                "generation: the key would not distinguish object versions."
+            )
+        raw_identity = f"{rpath}:{generation}:{size or 0}".encode("utf-8")
         return hashlib.sha256(raw_identity).hexdigest()
 
     def get_intra_lock(self, cache_key: str) -> asyncio.Lock:
@@ -241,6 +267,90 @@ class GCSFileSystemCacheManager:
             if tmp_target.exists():
                 tmp_target.unlink(missing_ok=True)
 
+    def _entry_is_idle(self, cache_file: Path) -> bool:
+        """True when no process holds the download lock for this entry.
+
+        Probed with a non-blocking ``LOCK_EX`` that is released immediately.
+        ``flock`` is owned by the open file description, so a lock held by this
+        same process through another descriptor also registers as busy, which
+        is what we want.
+        """
+        lock_file = self.lock_dir / f"{cache_file.stem}.lock"
+        if not HAS_FCNTL or not lock_file.exists():
+            return not lock_file.exists()
+        fd = None
+        try:
+            fd = os.open(lock_file, os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        except OSError:
+            return False
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def reclaim(self, needed_bytes: int, exclude=None) -> int:
+        """Delete unreferenced cache entries, oldest first, to free space.
+
+        An entry is reclaimable when nothing points at its blocks
+        (``st_nlink == 1``, so no destination was materialized from it by
+        hardlink) and no process holds its download lock. Returns bytes freed.
+
+        Ordering is by ``st_atime``, which under the usual ``relatime`` mount
+        option is only refreshed when it predates ``st_mtime`` or is over a day
+        old -- so this approximates LRU rather than implementing it, and
+        degenerates to FIFO under ``noatime``. That is adequate here: the goal
+        is to keep the cache usable across checkpoint generations, not to
+        maximise hit rate.
+
+        Lock files are deliberately left behind. Unlinking one races a process
+        about to open it, which would leave two processes flocking different
+        inodes and break single-flight election. They are empty.
+        """
+        if needed_bytes <= 0:
+            return 0
+        exclude = exclude or set()
+
+        candidates = []
+        for entry in self.data_dir.glob("*.data"):
+            if entry.name in exclude:
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if st.st_nlink > 1:
+                # A destination still shares these blocks; removing the cache
+                # name would free nothing.
+                continue
+            candidates.append((st.st_atime, st.st_size, entry))
+        candidates.sort(key=lambda c: c[0])
+
+        freed = 0
+        for _atime, size, entry in candidates:
+            if freed >= needed_bytes:
+                break
+            if not self._entry_is_idle(entry):
+                continue
+            try:
+                entry.unlink()
+            except OSError:
+                continue
+            freed += size
+            logger.debug("gcsfs cache: reclaimed %s (%d bytes)", entry.name, size)
+
+        if freed:
+            logger.info(
+                "gcsfs cache: reclaimed %d bytes from %s to make room",
+                freed,
+                self.data_dir,
+            )
+        return freed
+
     def clear_cache(self) -> None:
         shutil.rmtree(self.data_dir, ignore_errors=True)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
