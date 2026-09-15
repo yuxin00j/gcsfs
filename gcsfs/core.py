@@ -71,9 +71,23 @@ GCS_MAX_BLOCK_SIZE = 2**28
 DEFAULT_BLOCK_SIZE = 5 * 2**20
 
 # Cross-process `get_file` cache (see GCSFileSystem._get_file).
-# Objects below this size bypass the cache: the lock, staging and materialize
-# round trip costs more than it saves, and it churns lock-file inodes.
-DEFAULT_CACHE_MIN_SIZE_BYTES = 8 * 2**20
+# Objects below this size bypass the cache.
+#
+# Measured overhead of the cache machinery itself, network stubbed out, median
+# of 200 calls: ~1.6 ms fixed on the cold path (lock file, flock, staging,
+# os.replace, hardlink) and ~0.31 ms on a warm hit, both independent of object
+# size. Against a real GCS GET, which costs at least ~20 ms of round trip, 1.6
+# ms is under 10% at every size -- so overhead alone does not justify a floor
+# of any particular height, and the earlier 8 MiB value was not derived from
+# anything.
+#
+# The floor that remains is about resource hygiene rather than speed. Every
+# distinct object cached creates a lock-file inode that is never reclaimed
+# (unlinking it would race a process about to open it) plus a cache entry that
+# is only reclaimed under space pressure. 1 MiB keeps that bounded for
+# workloads that touch thousands of small shards, while still caching anything
+# checkpoint-shaped.
+DEFAULT_CACHE_MIN_SIZE_BYTES = 1 * 2**20
 # How long a waiting process will block on the download lock before giving up
 # and falling back to its own uncached download.
 DEFAULT_CACHE_LOCK_TIMEOUT = 3600.0
