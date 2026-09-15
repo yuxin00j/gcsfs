@@ -2340,10 +2340,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if not cls._warned_no_crc32c:
                 cls._warned_no_crc32c = True
                 logger.warning(
-                    "gcsfs cache: no crc32c backend is installed, so payloads "
-                    "staged into the cache are verified by size only. Install "
-                    "one with `pip install gcsfs[crc]` (google-crc32c is much "
-                    "faster than crcmod)."
+                    "gcsfs cache: no crc32c backend is importable, so payloads "
+                    "staged into the cache are verified by size only. "
+                    "`google-crc32c` is a required transitive dependency of "
+                    "gcsfs (via google-cloud-storage), so this normally means a "
+                    "broken environment; reinstall it rather than falling back "
+                    "to `gcsfs[crc]`, whose crcmod is ~18x slower."
                 )
             return "size"
         return requested

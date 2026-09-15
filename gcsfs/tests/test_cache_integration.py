@@ -427,7 +427,8 @@ async def test_lock_timeout_degrades_to_direct_download(harness):
 
 @pytest.mark.asyncio
 async def test_clear_cache_is_exposed_on_the_filesystem(harness):
-    """Milestone 1 ships no eviction, so the public purge API is the only escape."""
+    """M1 reclaims only on demand under space pressure, so an explicit purge is
+    still the only way to drop a cache that nothing is currently competing for."""
     rpath = "my-bucket/checkpoint.ckpt"
     await harness.fs._get_file(rpath, str(harness.tmpdir / "a" / "model.ckpt"))
     assert harness.cache_file(rpath).exists()
