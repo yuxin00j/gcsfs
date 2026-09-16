@@ -118,12 +118,9 @@ class GCSFileSystemCacheManager:
         self.cache_dir = Path(os.path.expanduser(base_dir))
         self.data_dir = self.cache_dir / "data"
         self.lock_dir = self.cache_dir / "locks"
-        # 0o700: anyone who can read this directory reads every cached object
-        # straight off disk, with no GCS credentials and no ACL check. Treat the
-        # cache as a single-UID trust domain. `mode` is masked by umask, so
-        # chmod explicitly, and repair directories left looser by an earlier
-        # version. A chmod we do not own is not ours to make -- ignore it rather
-        # than refusing to start.
+        # 0o700 restricts cache access to the current UID. Explicit chmod
+        # bypasses umask and tightens pre-existing directories; ignore EPERM if
+        # we don't own a shared parent directory.
         for directory in (self.cache_dir, self.data_dir, self.lock_dir):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
@@ -140,10 +137,6 @@ class GCSFileSystemCacheManager:
         self, rpath: str, generation: Optional[str] = None, size: Optional[int] = None
     ) -> str:
         if not generation:
-            # Keying on a placeholder would collide every version of an object
-            # that happens to share a byte count, and the cache would then serve
-            # stale bytes with complete confidence. Callers must bypass the
-            # cache instead (see GCSFileSystem._get_file).
             raise ValueError(
                 f"Refusing to build a cache key for {rpath!r} without an object "
                 "generation: the key would not distinguish object versions."
