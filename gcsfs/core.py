@@ -33,12 +33,11 @@ from fsspec.utils import other_paths, setup_logging, stringify_path
 from . import __version__ as version
 from ._dircache import DirCacheUpdater
 from .cache_manager import HAS_FCNTL
-from .checkers import CHECKSUM_METADATA_FIELD, HAS_CRC32C
 from .checkers import get_consistency_checker
 from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
 from .inventory_report import InventoryReport
-from .retry import ChecksumError, errs, retry_request, validate_response
+from .retry import errs, retry_request, validate_response
 from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE, _on_loop_thread
 
 logger = logging.getLogger("gcsfs")
@@ -2319,59 +2318,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         """
         self.cache_manager.clear_cache()
 
-    # Process-wide latch so the missing-crcmod warning is emitted only once.
-    _warned_no_crc32c = False
-
-    @classmethod
-    def _cache_consistency(cls):
-        """Checksum algorithm used to verify a payload staged into the cache.
-
-        ``crc32c`` is preferred because GCS publishes a crc32c for every
-        object, composite ones included. It needs either ``google-crc32c`` or
-        ``crcmod``; without both we degrade to size-only verification.
-
-        We deliberately never fall back to md5. GCS publishes no md5 for
-        composite objects -- which is exactly what a multipart-uploaded
-        checkpoint is -- so `MD5Checker` raises on the very workload this cache
-        exists to serve. Weaker verification is better than a hard failure.
-        """
-        requested = os.environ.get("GCSFS_CACHE_CONSISTENCY", "crc32c").strip().lower()
-        if requested == "crc32c" and not HAS_CRC32C:
-            if not cls._warned_no_crc32c:
-                cls._warned_no_crc32c = True
-                logger.warning(
-                    "gcsfs cache: no crc32c backend is importable, so payloads "
-                    "staged into the cache are verified by size only. "
-                    "`google-crc32c` is a required transitive dependency of "
-                    "gcsfs (via google-cloud-storage), so this normally means a "
-                    "broken environment; reinstall it rather than falling back "
-                    "to `gcsfs[crc]`, whose crcmod is ~18x slower."
-                )
-            return "size"
-        return requested
-
-    @staticmethod
-    def _verify_staged_file(path, consistency, info, chunk_size=4 * 1024 * 1024):
-        """Checksum a fully staged file against GCS object metadata.
-
-        Blocking and CPU-bound: always call this in a worker thread.
-
-        Verification runs here, over the finished file, rather than on the
-        download stream. `_get_file_concurrent` calls `checker.update()` inline
-        on the event loop thread, so streaming verification of a multi-GiB
-        object stalls every other coroutine in the process for as long as the
-        hash takes. Hashing afterwards costs one extra sequential read of a
-        file that is still hot in page cache, and that read happens off-loop.
-        """
-        checker = get_consistency_checker(consistency)
-        with open(path, "rb") as f:
-            while True:
-                data = f.read(chunk_size)
-                if not data:
-                    break
-                checker.update(data)
-        checker.validate_json_response(info)
-
     async def _download_to_cache(
         self, rpath, cache_file, info, callback=None, **kwargs
     ):
@@ -2403,15 +2349,16 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                         )
 
             # Pin the generation so the bytes we stage are the bytes our cache
-            # key names and our checksum describes, even if the object is
-            # overwritten between the caller's _info and this download.
+            # key names, even if the object is overwritten between the caller's
+            # _info and this download.
             generation = info.get("generation")
             if generation and "generation" not in kwargs:
                 kwargs["generation"] = generation
 
             # Keep the stream itself unhashed even when the caller configured a
-            # global `consistency`: that path hashes on the event loop. We
-            # verify the finished file below instead.
+            # global `consistency`: streaming verification in `_get_file_concurrent`
+            # hashes on the event loop thread. In Milestone 1 (MVP), staging
+            # validates payload size only (`staged_size == size`).
             kwargs["consistency"] = "none"
 
             await self._get_file_direct(
@@ -2422,30 +2369,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if size and staged_size != size:
                 raise OSError(
                     f"Truncated download: expected {size} bytes, got {staged_size}"
-                )
-
-            # This payload is served to every later reader on the host, so a
-            # transient corruption would be amplified into a durable, host-wide
-            # one. Verify before publishing. "size" needs no pass of its own --
-            # the check above already enforced it, and reading the whole file
-            # back just to count bytes would be pure waste.
-            consistency = self._cache_consistency()
-            field = CHECKSUM_METADATA_FIELD.get(consistency)
-            if field and field not in info:
-                # `_info` can be served from the listing cache, and not every
-                # projection carries a checksum. Hashing anyway would only
-                # raise KeyError deep inside the checker.
-                logger.debug(
-                    "gcsfs cache: %s has no %r in its metadata; verifying %s by "
-                    "size only",
-                    rpath,
-                    field,
-                    consistency,
-                )
-                consistency = "size"
-            if consistency not in ("none", None, "size"):
-                await asyncio.to_thread(
-                    self._verify_staged_file, tmp_staging, consistency, info
                 )
 
             os.chmod(tmp_staging, 0o444)
@@ -2593,16 +2516,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 timeout,
                 lock_file,
                 rpath,
-            )
-        except (ChecksumError, KeyError, NotImplementedError) as exc:
-            # KeyError/NotImplementedError: the checker wanted a metadata field
-            # the object does not have. Unverifiable is not the same as corrupt,
-            # but either way this payload is not fit to publish host-wide.
-            logger.warning(
-                "gcsfs cache: could not verify the payload staged for %s (%r); "
-                "downloading directly instead",
-                rpath,
-                exc,
             )
         except OSError as exc:
             if exc.errno == errno.ENOSPC:

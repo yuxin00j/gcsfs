@@ -7,7 +7,6 @@ gates, and graceful degradation.
 """
 
 import asyncio
-import base64
 import io
 import os
 import tempfile
@@ -23,18 +22,6 @@ TEST_DATA = b"Simulated 45GB checkpoint payload"
 GENERATION = "1234567890"
 
 
-def _crc32c_b64(data):
-    """Base64 crc32c of `data`, or None when no backend is installed."""
-    try:
-        from gcsfs.checkers import Crc32cChecker
-
-        checker = Crc32cChecker()
-    except ImportError:
-        return None
-    checker.update(data)
-    return base64.b64encode(checker.crc32c.digest()).decode()
-
-
 class _Harness:
     """A GCSFileSystem with the network stubbed and a download counter."""
 
@@ -45,7 +32,6 @@ class _Harness:
         self.direct_kwargs = []
         self.data = TEST_DATA
         self.generation = GENERATION
-        self.publish_crc32c = True
         self.fs = GCSFileSystem(
             token="anon",
             asynchronous=True,
@@ -56,17 +42,11 @@ class _Harness:
         self.fs._get_file_direct = self._get_file_direct
 
     async def _info(self, rpath, **kwargs):
-        info = {
+        return {
             "name": rpath,
             "size": len(self.data),
             "generation": self.generation,
         }
-        # Real digest, so the verification pass is genuinely exercised rather
-        # than mocked away.
-        crc = _crc32c_b64(self.data)
-        if crc is not None and self.publish_crc32c:
-            info["crc32c"] = crc
-        return info
 
     async def _get_file_direct(self, rpath, lpath, callback=None, **kwargs):
         self.download_calls += 1
@@ -278,7 +258,7 @@ async def test_staging_stream_is_never_hashed_inline(harness):
 
     `_get_file_concurrent` calls `checker.update()` on the event loop thread,
     so hashing a multi-GiB object inline stalls every other coroutine in the
-    process. Verification happens afterwards, off-loop, instead.
+    process. In Milestone 1 (MVP), staging validates payload size only.
     """
     await harness.fs._get_file("my-bucket/checkpoint.ckpt", str(harness.tmpdir / "c"))
 
@@ -286,59 +266,35 @@ async def test_staging_stream_is_never_hashed_inline(harness):
 
 
 @pytest.mark.asyncio
-async def test_staged_payload_is_verified_before_publication(harness):
-    """A corrupt payload would be served to every later reader, so verify first."""
+async def test_truncated_download_degrades_to_direct_download(harness):
+    """A truncated stage (staged_size != expected_size) is rejected and degrades cleanly."""
     rpath = "my-bucket/checkpoint.ckpt"
-    seen = []
+    dest = harness.tmpdir / "truncated" / "model.ckpt"
 
-    def _record(path, consistency, info, **kw):
-        # Must run while still staged, under a temporary name.
-        assert Path(path).name.startswith(".")
-        seen.append((Path(path).read_bytes(), consistency, info))
+    call_count = 0
 
-    with mock.patch.object(GCSFileSystem, "_cache_consistency", return_value="crc32c"):
-        with mock.patch.object(
-            GCSFileSystem, "_verify_staged_file", staticmethod(_record)
-        ):
-            await harness.fs._get_file(rpath, str(harness.tmpdir / "v" / "model.ckpt"))
+    async def _truncate_first_then_succeed(rpath_, lpath, callback=None, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        harness.download_calls += 1
+        harness.direct_kwargs.append(kwargs)
+        Path(lpath).parent.mkdir(parents=True, exist_ok=True)
+        if call_count == 1:
+            # Truncated stage into the cache temp file
+            Path(lpath).write_bytes(TEST_DATA[:-5])
+        else:
+            # Direct fallback download succeeds
+            Path(lpath).write_bytes(TEST_DATA)
 
-    assert len(seen) == 1
-    payload, consistency, info = seen[0]
-    assert payload == TEST_DATA
-    assert consistency == "crc32c"
-    assert info["generation"] == GENERATION
+    harness.fs._get_file_direct = _truncate_first_then_succeed
 
+    await harness.fs._get_file(rpath, str(dest))
 
-@pytest.mark.asyncio
-async def test_missing_crc32c_backend_degrades_to_size_never_md5():
-    """md5 is not an acceptable fallback: GCS publishes none for composite objects.
-
-    Composite objects are exactly what a multipart-uploaded checkpoint is, so
-    falling back to md5 would fail the workload this cache exists to serve.
-    """
-    with mock.patch("gcsfs.core.HAS_CRC32C", False):
-        assert GCSFileSystem._cache_consistency() == "size"
-
-
-@pytest.mark.asyncio
-async def test_failed_verification_degrades_to_direct_download(harness):
-    """A corrupt stage must not be published, and must not fail the caller."""
-    from gcsfs.retry import ChecksumError
-
-    rpath = "my-bucket/checkpoint.ckpt"
-    dest = harness.tmpdir / "corrupt" / "model.ckpt"
-
-    def _boom(path, consistency, info, **kw):
-        raise ChecksumError("crc32c mismatch")
-
-    with mock.patch.object(GCSFileSystem, "_cache_consistency", return_value="crc32c"):
-        with mock.patch.object(
-            GCSFileSystem, "_verify_staged_file", staticmethod(_boom)
-        ):
-            await harness.fs._get_file(rpath, str(dest))
-
-    assert dest.read_bytes() == TEST_DATA
+    # Staging was rejected and unlinked; cache file was not published; caller got direct download.
     assert not harness.cache_file(rpath).exists()
+    assert not any(harness.fs.cache_manager.data_dir.iterdir())
+    assert dest.read_bytes() == TEST_DATA
+    assert harness.download_calls == 2
 
 
 @pytest.mark.asyncio
@@ -466,46 +422,3 @@ async def test_directory_destination_is_a_no_op(harness):
     await harness.fs._get_file("my-bucket/checkpoint.ckpt", str(dest))
 
     assert harness.download_calls == 0
-
-
-@pytest.mark.asyncio
-async def test_object_without_a_published_checksum_is_still_cached(harness):
-    """Unverifiable is not the same as uncacheable, and must not raise.
-
-    `_info` can be served from the listing cache, and not every projection
-    carries a crc32c. Indexing it blindly raised KeyError from inside the
-    checker, which escaped as a hard failure.
-    """
-    rpath = "my-bucket/checkpoint.ckpt"
-    dest = harness.tmpdir / "no_crc" / "model.ckpt"
-    harness.publish_crc32c = False
-
-    await harness.fs._get_file(rpath, str(dest))
-
-    assert dest.read_bytes() == TEST_DATA
-    # Size was still checked, so the payload is good enough to publish.
-    assert harness.cache_file(rpath).exists()
-    assert _same_inode(dest, harness.cache_file(rpath))
-
-
-@pytest.mark.asyncio
-async def test_real_checksum_mismatch_is_caught(harness):
-    """A payload whose bytes disagree with the published crc32c is not published."""
-    rpath = "my-bucket/checkpoint.ckpt"
-    dest = harness.tmpdir / "mismatch" / "model.ckpt"
-
-    # Serve bytes that do not match the advertised digest, keeping the length
-    # identical so only the checksum can catch it.
-    async def _corrupt(rpath_, lpath, callback=None, **kwargs):
-        harness.download_calls += 1
-        harness.direct_kwargs.append(kwargs)
-        Path(lpath).parent.mkdir(parents=True, exist_ok=True)
-        Path(lpath).write_bytes(b"\x00" * len(TEST_DATA))
-
-    harness.fs._get_file_direct = _corrupt
-
-    await harness.fs._get_file(rpath, str(dest))
-
-    # Rejected from the cache, and the caller still got its (direct) download.
-    assert not harness.cache_file(rpath).exists()
-    assert dest.exists()
