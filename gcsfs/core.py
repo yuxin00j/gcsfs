@@ -2378,8 +2378,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
             # Keep the stream itself unhashed even when the caller configured a
             # global `consistency`: streaming verification in `_get_file_concurrent`
-            # hashes on the event loop thread. In Milestone 1 (MVP), staging
-            # validates payload size only (`staged_size == size`).
+            # hashes on the event loop thread. Staging validates payload size only
+            # (`staged_size == size`).
             kwargs["consistency"] = "none"
 
             await self._get_file_direct(

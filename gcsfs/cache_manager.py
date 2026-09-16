@@ -46,9 +46,16 @@ class AsyncProcessFileLock:
             )
         start_time = time.monotonic()
 
-        # 0o600: the cache directory is a single-UID trust domain (see
-        # GCSFileSystemCacheManager.__init__). A world-writable lock file would
-        # let any local user wedge single-flight election.
+        # 0o600 for four reasons:
+        #   1. Floor for O_RDWR: both owner read and write bits are required.
+        #   2. Local DoS protection: anyone able to open the lock file can take
+        #      LOCK_EX and hold it, wedging single-flight election until
+        #      GCSFS_CACHE_LOCK_TIMEOUT_SEC expires.
+        #   3. Trust domain parity: matches the 0o700 cache directory (see
+        #      GCSFileSystemCacheManager.__init__).
+        #   4. Umask determinism: unlike 0o666 (which yields 0o644 under 0o022
+        #      vs. 0o600 under 0o077), 0o600 produces identical permissions
+        #      across ambient process umasks.
         self._fd = await asyncio.to_thread(
             os.open, self.lock_path, os.O_CREAT | os.O_RDWR, 0o600
         )
@@ -101,7 +108,7 @@ class AsyncProcessFileLock:
 
 
 class GCSFileSystemCacheManager:
-    """Manages single-flight downloads and zero-copy materialization for GCSFS (Milestone 1 MVP)."""
+    """Manages single-flight downloads and zero-copy materialization for GCSFS."""
 
     # Process-wide latch so the cross-mount warning is emitted only once.
     _warned_exdev = False
