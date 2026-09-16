@@ -167,3 +167,21 @@ def test_checker_validate_json_response(checker, data, actual_data, raises):
             checker.validate_json_response(response)
     else:
         checker.validate_json_response(response)
+
+
+def test_crc32c_backends_agree():
+    """google-crc32c and crcmod must produce identical digests for Crc32cChecker."""
+    import os
+
+    from gcsfs.checkers import crcmod, google_crc32c
+
+    if google_crc32c is None or crcmod is None:
+        pytest.skip("needs both crc32c backends installed")
+
+    for payload in (b"", b"a", os.urandom(1000), os.urandom(1024 * 1024 + 7)):
+        a = crcmod.Crc(0x11EDC6F41, initCrc=0, xorOut=0xFFFFFFFF)
+        a.update(payload)
+        b = google_crc32c.Checksum()
+        b.update(payload)
+        assert a.digest() == b.digest()
+        assert base64.b64encode(a.digest()) == base64.b64encode(b.digest())

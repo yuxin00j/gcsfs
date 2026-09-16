@@ -3,6 +3,7 @@ Google Cloud Storage pythonic interface
 """
 
 import asyncio
+import errno
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import uuid
@@ -30,6 +32,7 @@ from fsspec.utils import other_paths, setup_logging, stringify_path
 
 from . import __version__ as version
 from ._dircache import DirCacheUpdater
+from .cache_manager import HAS_FCNTL
 from .checkers import get_consistency_checker
 from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
@@ -38,6 +41,7 @@ from .retry import errs, retry_request, validate_response
 from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE, _on_loop_thread
 
 logger = logging.getLogger("gcsfs")
+cache_logger = logging.getLogger("gcsfs.cache")
 
 
 if "GCSFS_DEBUG" in os.environ:
@@ -65,6 +69,29 @@ DEFAULT_PROJECT = os.getenv("GCSFS_DEFAULT_PROJECT", "")
 GCS_MIN_BLOCK_SIZE = 2**18
 GCS_MAX_BLOCK_SIZE = 2**28
 DEFAULT_BLOCK_SIZE = 5 * 2**20
+
+# Cross-process `get_file` cache (see GCSFileSystem._get_file).
+# Objects below this size bypass the cache.
+#
+# Measured overhead of the cache machinery itself, network stubbed out, median
+# of 200 calls: ~1.6 ms fixed on the cold path (lock file, flock, staging,
+# os.replace, hardlink) and ~0.31 ms on a warm hit, both independent of object
+# size. Against a real GCS GET, which costs at least ~20 ms of round trip, 1.6
+# ms is under 10% at every size -- so overhead alone does not justify a floor
+# of any particular height, and the earlier 8 MiB value was not derived from
+# anything.
+#
+# The floor that remains is about resource hygiene rather than speed. Every
+# distinct object cached creates a lock-file inode that is never reclaimed
+# (unlinking it would race a process about to open it) plus a cache entry that
+# is only reclaimed under space pressure. 1 MiB keeps that bounded for
+# workloads that touch thousands of small shards, while still caching anything
+# checkpoint-shaped.
+DEFAULT_CACHE_MIN_SIZE_BYTES = 1 * 2**20
+# How long a waiting process will block on the download lock before giving up
+# and falling back to its own uncached download.
+DEFAULT_CACHE_LOCK_TIMEOUT = 3600.0
+
 
 SUPPORTED_FIXED_KEY_METADATA = {
     "content_encoding": "contentEncoding",
@@ -310,6 +337,26 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     version_aware: bool
         Whether to support object versioning. If enabled this will require the
         user to have the necessary permissions for dealing with versioned objects.
+    cross_process_cache: bool or None
+        Enable the host-local cross-process cache for ``get_file``. When several
+        processes on one machine download the same object, one downloads it and
+        the rest hardlink to the result. ``None`` (the default) defers to the
+        ``GCSFS_CACHE_ENABLED`` environment variable; an explicit value wins
+        outright. Requires ``fcntl``, so it is a no-op on Windows.
+    cross_process_cache_dir: str
+        Directory holding the cache. Defaults to ``GCSFS_CACHE_DIR``, or
+        ``~/.cache/gcsfs``. Created 0o700: anyone able to read it can read every
+        cached object without GCS credentials. Place it on the same filesystem
+        as your download destinations, otherwise materialization cannot
+        hardlink and every destination costs a full copy. If the directory
+        cannot be created the cache disables itself for that call and the
+        download proceeds uncached.
+    cross_process_cache_writable: bool or None
+        Materialize destinations as independent writable copies (0o644) instead
+        of read-only hardlinks (0o444). Needed only if the caller mutates
+        downloaded files in place; it forfeits the zero-copy benefit. ``None``
+        (the default) defers to the ``GCSFS_CACHE_WRITABLE`` environment
+        variable; an explicit value wins outright.
     """
 
     scopes = {"read_only", "read_write", "full_control"}
@@ -338,6 +385,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         endpoint_url=None,
         default_location=None,
         version_aware=False,
+        cross_process_cache=None,
+        cross_process_cache_dir=None,
+        cross_process_cache_writable=None,
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -374,6 +424,20 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.credentials = GoogleCredentials(
             project, access, token, on_google=self.on_google
         )
+        self.cross_process_cache = cross_process_cache
+        self.cross_process_cache_dir = cross_process_cache_dir
+        self.cross_process_cache_writable = cross_process_cache_writable
+        self._cache_manager = None
+
+    @property
+    def cache_manager(self):
+        if self._cache_manager is None:
+            from gcsfs.cache_manager import GCSFileSystemCacheManager
+
+            self._cache_manager = GCSFileSystemCacheManager(
+                cache_dir=self.cross_process_cache_dir
+            )
+        return self._cache_manager
 
     @property
     def _location(self):
@@ -2182,12 +2246,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if check_consistency:
             checker.validate_json_response(details)
 
-    async def _get_file(self, rpath, lpath, callback=None, **kwargs):
-        if os.path.isdir(lpath):
-            return
-
-        callback = callback or NoOpCallback()
-
+    async def _get_file_direct(self, rpath, lpath, callback=None, **kwargs):
         concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)
         chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
         max_prefetch_size = kwargs.pop(
@@ -2212,6 +2271,347 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if os.path.exists(lpath):
                 os.remove(lpath)
             raise
+
+    async def _stream_to_outfile(self, rpath, outfile, callback=None, **kwargs):
+        """Stream an object into an already-open binary file handle.
+
+        Used when the caller passes a file-like ``lpath``. The cross-process
+        cache is bypassed: there is no filesystem destination to hardlink to,
+        so there is nothing for a later reader to share.
+        """
+        callback = callback or NoOpCallback()
+        chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
+        # These only make sense for a seekable, pre-allocated file on disk.
+        kwargs.pop("concurrency", None)
+        kwargs.pop("max_prefetch_size", None)
+        kwargs.pop("consistency", None)
+
+        details = await self._info(rpath)
+        size = int(details.get("size") or 0)
+        callback.set_size(size)
+
+        # Pin the generation so a concurrent overwrite cannot splice two
+        # different object versions into a single stream.
+        generation = details.get("generation")
+        if generation and "generation" not in kwargs:
+            kwargs["generation"] = generation
+
+        start = 0
+        while start < size:
+            end = min(start + chunk_size, size)
+            data = await self._cat_file(
+                rpath, start=start, end=end, concurrency=1, **kwargs
+            )
+            if not data:
+                raise OSError(f"Truncated read of {rpath}: got {start} of {size} bytes")
+            outfile.write(data)
+            callback.relative_update(len(data))
+            start += len(data)
+
+    def _cache_enabled(self):
+        """Whether the cross-process ``get_file`` cache is active.
+
+        The cache depends on ``fcntl.flock`` to elect a single downloader.
+        Where ``fcntl`` is unavailable (notably Windows) there is no safe
+        fallback -- every process would elect itself and race ``os.replace``
+        onto the same master file -- so the cache disables itself
+        unconditionally and ``GCSFS_CACHE_ENABLED`` is ignored.
+        """
+        if not HAS_FCNTL:
+            return False
+        enabled = getattr(self, "cross_process_cache", None)
+        if enabled is None:
+            enabled = os.environ.get(
+                "GCSFS_CACHE_ENABLED", "false"
+            ).strip().lower() in ("true", "1", "yes", "on")
+        return bool(enabled)
+
+    def _cache_writable(self):
+        """Whether destinations are materialized as independent writable copies.
+
+        Same sentinel contract as ``_cache_enabled``: the constructor argument
+        wins outright when set, and ``GCSFS_CACHE_WRITABLE`` decides only when
+        it is left at ``None``. Resolving this with ``or`` instead would make
+        an explicit ``cross_process_cache_writable=False`` unable to override
+        an exported ``GCSFS_CACHE_WRITABLE=true``, silently costing the caller
+        the zero-copy hardlink they asked for.
+        """
+        writable = getattr(self, "cross_process_cache_writable", None)
+        if writable is None:
+            writable = os.environ.get(
+                "GCSFS_CACHE_WRITABLE", "false"
+            ).strip().lower() in ("true", "1", "yes", "on")
+        return bool(writable)
+
+    def clear_cache(self):
+        """Delete every object staged in the cross-process ``get_file`` cache.
+
+        Reclamation is otherwise automatic but demand-driven: space is only
+        freed when a download finds the cache dir too full, and only from
+        entries nothing is using. This empties it outright, including entries
+        that are still referenced. Destinations already materialized by
+        hardlink keep their data alive until they are themselves removed.
+        """
+        self.cache_manager.clear_cache()
+
+    async def _download_to_cache(
+        self, rpath, cache_file, info, callback=None, **kwargs
+    ):
+        """Download ``rpath`` into the cache. Caller must hold the download lock."""
+        cache_mgr = self.cache_manager
+        size = int(info.get("size") or 0)
+        tmp_staging = (
+            cache_mgr.data_dir
+            / f".{cache_file.stem}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        )
+        try:
+            # Fast pre-flight space check without blocking tmpfs memory allocation
+            if size > 0:
+                total, used, free = shutil.disk_usage(cache_mgr.data_dir)
+                if free < size:
+                    # Nothing evicts in the background, so without this the
+                    # cache fills once -- one entry per object generation -- and
+                    # then never serves again.
+                    freed = await asyncio.to_thread(
+                        cache_mgr.reclaim, size - free, {cache_file.name}
+                    )
+                    if freed:
+                        total, used, free = shutil.disk_usage(cache_mgr.data_dir)
+                    if free < size:
+                        raise OSError(
+                            errno.ENOSPC,
+                            f"Insufficient space in {cache_mgr.data_dir}: "
+                            f"{free} bytes free, need {size} bytes",
+                        )
+
+            # Pin the generation so the bytes we stage are the bytes our cache
+            # key names, even if the object is overwritten between the caller's
+            # _info and this download.
+            generation = info.get("generation")
+            if generation and "generation" not in kwargs:
+                kwargs["generation"] = generation
+
+            # Keep the stream itself unhashed even when the caller configured a
+            # global `consistency`: streaming verification in `_get_file_concurrent`
+            # hashes on the event loop thread. In Milestone 1 (MVP), staging
+            # validates payload size only (`staged_size == size`).
+            kwargs["consistency"] = "none"
+
+            await self._get_file_direct(
+                rpath, str(tmp_staging), callback=callback, **kwargs
+            )
+
+            staged_size = tmp_staging.stat().st_size
+            if staged_size != size:
+                raise OSError(
+                    f"Truncated download: expected {size} bytes, got {staged_size}"
+                )
+
+            os.chmod(tmp_staging, 0o444)
+            os.replace(tmp_staging, cache_file)
+        finally:
+            if tmp_staging.exists():
+                tmp_staging.unlink(missing_ok=True)
+
+    async def _get_file(self, rpath, lpath, callback=None, **kwargs):
+        callback = callback or NoOpCallback()
+
+        # A stray `writable` must still be popped before any branch can forward
+        # **kwargs to the HTTP layer, where unrecognised keywords are silently
+        # promoted into URL query parameters by `_get_params`.
+        if "writable" in kwargs:
+            kwargs.pop("writable")
+            warnings.warn(
+                "The per-call `writable=` argument to get_file() is not "
+                "supported and was ignored. Pass "
+                "`cross_process_cache_writable=True` to GCSFileSystem instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+        writable = self._cache_writable()
+
+        # A file-like destination must be detected before any os.path call:
+        # os.path.isdir() raises TypeError when handed a stream.
+        if hasattr(lpath, "write"):
+            return await self._stream_to_outfile(
+                rpath, lpath, callback=callback, **kwargs
+            )
+
+        if os.path.isdir(lpath):
+            return
+
+        if not self._cache_enabled():
+            return await self._get_file_direct(
+                rpath, lpath, callback=callback, **kwargs
+            )
+
+        info = await self._info(rpath)
+        generation = str(info.get("generation") or "")
+        size = int(info.get("size") or 0)
+
+        # Without a generation there is nothing in the key that distinguishes
+        # one version of an object from the next, so two versions of the same
+        # size would collide and we would serve stale bytes. `_info` omits it
+        # for buckets and for directory pseudo-entries synthesised from the
+        # listing cache. Fall through to an uncached download instead.
+        if not generation:
+            cache_logger.debug(
+                "gcsfs cache: bypassing %s (no object generation available)", rpath
+            )
+            return await self._get_file_direct(
+                rpath, lpath, callback=callback, **kwargs
+            )
+
+        # Everything below is best-effort. The cache is an optimisation, so no
+        # failure inside it may fail a download that would otherwise have
+        # succeeded -- each handler below falls through to a direct download.
+        #
+        # Setting the cache up is inside the guard for the same reason.
+        # Creating the cache directory can fail outright on a read-only or full
+        # filesystem -- a `readOnlyRootFilesystem` container makes the default
+        # `~/.cache/gcsfs` uncreatable -- and an operator can mistype an
+        # environment variable. Neither is a reason to fail the caller.
+        #
+        # Pre-seeded so the handlers below can reference them even when it was
+        # the setup itself that raised.
+        cache_mgr = None
+        lock_file = None
+        timeout = DEFAULT_CACHE_LOCK_TIMEOUT
+        try:
+            # Small objects are not worth the lock, staging and materialize
+            # machinery, nor the lock-file inode churn it creates in the cache
+            # dir.
+            min_size = int(
+                os.environ.get(
+                    "GCSFS_CACHE_MIN_SIZE_BYTES", DEFAULT_CACHE_MIN_SIZE_BYTES
+                )
+            )
+            if size < min_size:
+                cache_logger.debug(
+                    "gcsfs cache: bypassing %s (%d bytes < "
+                    "GCSFS_CACHE_MIN_SIZE_BYTES=%d)",
+                    rpath,
+                    size,
+                    min_size,
+                )
+                return await self._get_file_direct(
+                    rpath, lpath, callback=callback, **kwargs
+                )
+
+            cache_mgr = self.cache_manager
+            cache_key = cache_mgr.get_cache_key(rpath, generation=generation, size=size)
+            cache_file = cache_mgr.data_dir / f"{cache_key}.data"
+            lock_file = cache_mgr.lock_dir / f"{cache_key}.lock"
+
+            def _published():
+                return cache_file.exists() and (
+                    size == 0 or cache_file.stat().st_size == size
+                )
+
+            timeout = float(
+                os.environ.get(
+                    "GCSFS_CACHE_LOCK_TIMEOUT_SEC", DEFAULT_CACHE_LOCK_TIMEOUT
+                )
+            )
+
+            # Fast-Path: file already cached and published
+            if _published():
+                cache_logger.debug(
+                    "gcsfs cache: hit for %s (key=%s)", rpath, cache_key[:12]
+                )
+                callback.set_size(size)
+                callback.relative_update(size)
+                await asyncio.to_thread(
+                    cache_mgr.materialize,
+                    cache_file,
+                    lpath,
+                    rpath=rpath,
+                    writable=writable,
+                )
+                return
+
+            cache_logger.debug(
+                "gcsfs cache: miss for %s (key=%s)", rpath, cache_key[:12]
+            )
+            downloaded = False
+            # Intra-Process lock coordinates coroutines on the same event loop
+            async with cache_mgr.get_intra_lock(cache_key):
+                # Double check inside intra-lock
+                if not _published():
+                    # Cross-Process lock coordinates processes across the host
+                    from gcsfs.cache_manager import AsyncProcessFileLock
+
+                    async with AsyncProcessFileLock(lock_file, timeout=timeout):
+                        # Double check inside cross-process lock: did another
+                        # process finish downloading while we waited?
+                        if not _published():
+                            cache_logger.debug(
+                                "gcsfs cache: elected downloader for %s (key=%s)",
+                                rpath,
+                                cache_key[:12],
+                            )
+                            await self._download_to_cache(
+                                rpath, cache_file, info, callback=callback, **kwargs
+                            )
+                            downloaded = True
+
+            # Materialize to destination concurrently outside exclusive locks
+            if not downloaded:
+                callback.set_size(size)
+                callback.relative_update(size)
+            await asyncio.to_thread(
+                cache_mgr.materialize, cache_file, lpath, rpath=rpath, writable=writable
+            )
+            return
+        except TimeoutError:
+            # TimeoutError subclasses OSError, so it must be caught first.
+            cache_logger.warning(
+                "gcsfs cache: timed out after %.0fs waiting for %s; downloading "
+                "%s directly instead",
+                timeout,
+                lock_file,
+                rpath,
+            )
+        except ValueError as exc:
+            # A malformed GCSFS_CACHE_* value. Naming it matters: silently
+            # ignoring a typo would leave the cache permanently disabled with
+            # no way to tell that from a cache that is simply never hit.
+            cache_logger.warning(
+                "gcsfs cache: could not read its configuration (%s); "
+                "downloading %s directly instead. Check GCSFS_CACHE_* "
+                "environment variables.",
+                exc,
+                rpath,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                cache_logger.warning(
+                    "gcsfs cache: no room in %s for %s even after reclaiming; "
+                    "downloading directly instead. Point GCSFS_CACHE_DIR at a "
+                    "larger filesystem or call GCSFileSystem.clear_cache().",
+                    cache_mgr.data_dir if cache_mgr else "the cache directory",
+                    rpath,
+                )
+            elif cache_mgr is None:
+                # Raised before the cache was even usable, so `lpath` was never
+                # touched: an uncreatable GCSFS_CACHE_DIR (read-only or full
+                # filesystem, wrong owner) rather than a failure mid-transfer.
+                cache_logger.warning(
+                    "gcsfs cache: could not open its cache directory (%s); "
+                    "downloading %s directly instead. Point GCSFS_CACHE_DIR at "
+                    "a writable directory on node-local storage.",
+                    exc,
+                    rpath,
+                )
+            else:
+                cache_logger.warning(
+                    "gcsfs cache: unusable for %s (%s); downloading directly "
+                    "instead",
+                    rpath,
+                    exc,
+                )
+
+        return await self._get_file_direct(rpath, lpath, callback=callback, **kwargs)
 
     def _open(
         self,
