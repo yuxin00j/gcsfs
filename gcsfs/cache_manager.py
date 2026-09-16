@@ -136,6 +136,16 @@ class GCSFileSystemCacheManager:
     def get_cache_key(
         self, rpath: str, generation: Optional[str] = None, size: Optional[int] = None
     ) -> str:
+        """Derive the content-addressed key for one object version.
+
+        ``rpath`` must already be normalised by the caller (``gcsfs`` passes
+        ``GCSFileSystem._strip_protocol(rpath)``). The key is a plain hash of
+        the string it is handed, so ``gs://bucket/obj`` and ``bucket/obj``
+        would otherwise resolve to different keys, different locks and
+        different master files -- silently defeating deduplication between a
+        ``fs.get()`` bulk transfer, which strips, and a direct
+        ``fs.get_file("gs://...")``, which does not.
+        """
         if not generation:
             raise ValueError(
                 f"Refusing to build a cache key for {rpath!r} without an object "

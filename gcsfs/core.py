@@ -343,14 +343,33 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         the rest hardlink to the result. ``None`` (the default) defers to the
         ``GCSFS_CACHE_ENABLED`` environment variable; an explicit value wins
         outright. Requires ``fcntl``, so it is a no-op on Windows.
+
+        Two behaviours differ from an uncached ``get_file`` and are worth
+        knowing before enabling it:
+
+        * **Destinations are read-only and shared.** Unless
+          ``cross_process_cache_writable`` is set, each destination is a 0o444
+          hardlink sharing one inode with the cache and with every peer
+          process. Opening it for writing fails with ``EACCES``, and a caller
+          that forces the issue (``chmod u+w``, or root's ``CAP_DAC_OVERRIDE``)
+          mutates the bytes every other process is reading. Use
+          ``cross_process_cache_writable=True`` for any workflow that modifies
+          downloaded files in place.
+        * **A configured ``consistency`` disables the cache.** The cache
+          validates payload size rather than a checksum, so rather than
+          silently weakening a guarantee you asked for, a filesystem
+          constructed with ``consistency="crc32c"`` (or a per-call
+          ``consistency=``) bypasses the cache entirely and downloads directly.
     cross_process_cache_dir: str
         Directory holding the cache. Defaults to ``GCSFS_CACHE_DIR``, or
         ``~/.cache/gcsfs``. Created 0o700: anyone able to read it can read every
         cached object without GCS credentials. Place it on the same filesystem
         as your download destinations, otherwise materialization cannot
-        hardlink and every destination costs a full copy. If the directory
-        cannot be created the cache disables itself for that call and the
-        download proceeds uncached.
+        hardlink and every destination costs a full copy. It must be large
+        enough to hold the objects you download -- nothing evicts in the
+        background, and entries that peer destinations still point at cannot be
+        reclaimed -- and if it cannot be created the cache disables itself for
+        that call and the download proceeds uncached.
     cross_process_cache_writable: bool or None
         Materialize destinations as independent writable copies (0o644) instead
         of read-only hardlinks (0o444). Needed only if the caller mutates
@@ -2071,10 +2090,19 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         headers=None,
         callback=None,
         fetcher_fn=None,
+        details=None,
         **kwargs,
     ):
-        """Main orchestrator for concurrent file downloads utilizing BackgroundPrefetcher."""
-        details = await self._info(rpath, **kwargs)
+        """Main orchestrator for concurrent file downloads utilizing BackgroundPrefetcher.
+
+        ``details`` lets a caller that has already fetched the object metadata
+        hand it in rather than paying for a second ``_info`` lookup. The
+        cross-process cache in ``_get_file`` needs the size and generation up
+        front to build its key, so without this every cached (and every
+        bypassed) download would cost two metadata round trips instead of one.
+        """
+        if details is None:
+            details = await self._info(rpath, **kwargs)
         total_size = details.get("size", 0)
 
         # Concurrency typically improves performance for RAM downloads exceeding 5MB.
@@ -2231,7 +2259,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if check_consistency:
             checker.validate_json_response(details)
 
-    async def _get_file_direct(self, rpath, lpath, callback=None, **kwargs):
+    async def _get_file_direct(
+        self, rpath, lpath, callback=None, details=None, **kwargs
+    ):
         concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)
         chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
         max_prefetch_size = kwargs.pop(
@@ -2248,50 +2278,17 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     callback=callback,
                     chunk_size=chunk_size,
                     max_prefetch_size=max_prefetch_size,
+                    details=details,
                     **kwargs,
                 )
             else:
+                # `_get_file_request` reads the size off the response headers,
+                # so it has no `_info` call to save.
                 await self._get_file_request(rpath, lpath, callback=callback, **kwargs)
         except BaseException:
             if os.path.exists(lpath):
                 os.remove(lpath)
             raise
-
-    async def _stream_to_outfile(self, rpath, outfile, callback=None, **kwargs):
-        """Stream an object into an already-open binary file handle.
-
-        Used when the caller passes a file-like ``lpath``. The cross-process
-        cache is bypassed: there is no filesystem destination to hardlink to,
-        so there is nothing for a later reader to share.
-        """
-        callback = callback or NoOpCallback()
-        chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
-        # These only make sense for a seekable, pre-allocated file on disk.
-        kwargs.pop("concurrency", None)
-        kwargs.pop("max_prefetch_size", None)
-        kwargs.pop("consistency", None)
-
-        details = await self._info(rpath)
-        size = int(details.get("size") or 0)
-        callback.set_size(size)
-
-        # Pin the generation so a concurrent overwrite cannot splice two
-        # different object versions into a single stream.
-        generation = details.get("generation")
-        if generation and "generation" not in kwargs:
-            kwargs["generation"] = generation
-
-        start = 0
-        while start < size:
-            end = min(start + chunk_size, size)
-            data = await self._cat_file(
-                rpath, start=start, end=end, concurrency=1, **kwargs
-            )
-            if not data:
-                raise OSError(f"Truncated read of {rpath}: got {start} of {size} bytes")
-            outfile.write(data)
-            callback.relative_update(len(data))
-            start += len(data)
 
     def _cache_enabled(self):
         """Whether the cross-process ``get_file`` cache is active.
@@ -2328,8 +2325,14 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             ).strip().lower() in ("true", "1", "yes", "on")
         return bool(writable)
 
-    def clear_cache(self):
-        """Delete every object staged in the cross-process ``get_file`` cache.
+    def clear_cross_process_cache(self):
+        """Delete from disk every object staged in the cross-process ``get_file`` cache.
+
+        This removes **files**, not metadata. It is deliberately not named
+        ``clear_cache``: ``invalidate_cache`` drops the listings cache and
+        ``clear_instance_cache`` drops the instance registry, both of which are
+        cheap and in-memory, and a caller reaching for a similarly-named method
+        should not be able to unlink tens of gigabytes by accident.
 
         Reclamation is otherwise automatic but demand-driven: space is only
         freed when a download finds the cache dir too full, and only from
@@ -2376,14 +2379,20 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if generation and "generation" not in kwargs:
                 kwargs["generation"] = generation
 
-            # Keep the stream itself unhashed even when the caller configured a
-            # global `consistency`: streaming verification in `_get_file_concurrent`
-            # hashes on the event loop thread. Staging validates payload size only
-            # (`staged_size == size`).
-            kwargs["consistency"] = "none"
-
+            # The staging stream is deliberately unhashed: verification in
+            # `_get_file_concurrent` calls `checker.update()` on the event loop
+            # thread, which would stall every other coroutine in the process
+            # for the length of a multi-GiB hash. Staging validates payload
+            # size only (`staged_size == size`).
+            #
+            # This is safe to assume rather than enforce because `_get_file`
+            # refuses the cache outright when the caller configured a
+            # `consistency` (see the integrity gate there): a caller who asked
+            # for checksums gets an uncached, fully verified download instead
+            # of a silently weaker one. Forcing `consistency="none"` here would
+            # be that silent downgrade.
             await self._get_file_direct(
-                rpath, str(tmp_staging), callback=callback, **kwargs
+                rpath, str(tmp_staging), callback=callback, details=info, **kwargs
             )
 
             staged_size = tmp_staging.stat().st_size
@@ -2399,9 +2408,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 tmp_staging.unlink(missing_ok=True)
 
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
-        callback = callback or NoOpCallback()
-
-        # A stray `writable` must still be popped before any branch can forward
+        # A stray `writable` must be popped before any branch can forward
         # **kwargs to the HTTP layer, where unrecognised keywords are silently
         # promoted into URL query parameters by `_get_params`.
         if "writable" in kwargs:
@@ -2413,26 +2420,47 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 UserWarning,
                 stacklevel=2,
             )
-        writable = self._cache_writable()
-
-        # A file-like destination must be detected before any os.path call:
-        # os.path.isdir() raises TypeError when handed a stream.
-        if hasattr(lpath, "write"):
-            return await self._stream_to_outfile(
-                rpath, lpath, callback=callback, **kwargs
-            )
 
         if os.path.isdir(lpath):
             return
+
+        callback = callback or NoOpCallback()
 
         if not self._cache_enabled():
             return await self._get_file_direct(
                 rpath, lpath, callback=callback, **kwargs
             )
 
+        # Integrity gate. The staging download cannot verify a checksum without
+        # hashing on the event loop thread (see `_download_to_cache`), so a
+        # caller who configured `consistency` would silently be downgraded to
+        # the cache's size-only validation. Decline the cache instead: an
+        # opt-in optimisation must not quietly weaken a guarantee the caller
+        # asked for. Checksum verification moves off-loop in a later milestone,
+        # at which point this gate can be dropped.
+        consistency = kwargs.get("consistency", self.consistency)
+        if consistency not in ("none", None):
+            cache_logger.debug(
+                "gcsfs cache: bypassing %s (consistency=%r would be downgraded "
+                "to size-only)",
+                rpath,
+                consistency,
+            )
+            return await self._get_file_direct(
+                rpath, lpath, callback=callback, **kwargs
+            )
+
+        writable = self._cache_writable()
+
         info = await self._info(rpath)
         generation = str(info.get("generation") or "")
         size = int(info.get("size") or 0)
+
+        # Key on the normalised path. `fs.get()` hands `_get_file` a stripped
+        # path while a direct `fs.get_file("gs://bucket/obj")` does not, so
+        # keying on the raw string would give the same object two keys, two
+        # locks and two downloads -- with no symptom other than the wall clock.
+        cache_rpath = self._strip_protocol(rpath)
 
         # Without a generation there is nothing in the key that distinguishes
         # one version of an object from the next, so two versions of the same
@@ -2444,7 +2472,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 "gcsfs cache: bypassing %s (no object generation available)", rpath
             )
             return await self._get_file_direct(
-                rpath, lpath, callback=callback, **kwargs
+                rpath, lpath, callback=callback, details=info, **kwargs
             )
 
         # Everything below is best-effort. The cache is an optimisation, so no
@@ -2480,11 +2508,13 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     min_size,
                 )
                 return await self._get_file_direct(
-                    rpath, lpath, callback=callback, **kwargs
+                    rpath, lpath, callback=callback, details=info, **kwargs
                 )
 
             cache_mgr = self.cache_manager
-            cache_key = cache_mgr.get_cache_key(rpath, generation=generation, size=size)
+            cache_key = cache_mgr.get_cache_key(
+                cache_rpath, generation=generation, size=size
+            )
             cache_file = cache_mgr.data_dir / f"{cache_key}.data"
             lock_file = cache_mgr.lock_dir / f"{cache_key}.lock"
 
@@ -2573,7 +2603,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 cache_logger.warning(
                     "gcsfs cache: no room in %s for %s even after reclaiming; "
                     "downloading directly instead. Point GCSFS_CACHE_DIR at a "
-                    "larger filesystem or call GCSFileSystem.clear_cache().",
+                    "larger filesystem or call "
+                    "GCSFileSystem.clear_cross_process_cache().",
                     cache_mgr.data_dir if cache_mgr else "the cache directory",
                     rpath,
                 )
@@ -2596,7 +2627,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     exc,
                 )
 
-        return await self._get_file_direct(rpath, lpath, callback=callback, **kwargs)
+        return await self._get_file_direct(
+            rpath, lpath, callback=callback, details=info, **kwargs
+        )
 
     def _open(
         self,

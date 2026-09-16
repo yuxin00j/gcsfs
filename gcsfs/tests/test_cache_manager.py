@@ -1,9 +1,13 @@
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+import gcsfs
+import gcsfs.cache_manager as cache_manager
 from gcsfs.cache_manager import AsyncProcessFileLock, GCSFileSystemCacheManager
 
 
@@ -169,3 +173,94 @@ def test_reclaim_is_a_no_op_when_nothing_is_needed():
         (mgr.data_dir / "eeee.data").write_bytes(b"x" * 1024)
         assert mgr.reclaim(0) == 0
         assert (mgr.data_dir / "eeee.data").exists()
+
+
+# Run in a fresh interpreter, one per worker. Deliberately not `os.fork()` and
+# not `multiprocessing` with the default start method: forking the pytest
+# process inherits its threads and captured descriptors, and the child
+# deadlocks before it ever reaches the lock. Deliberately not `spawn` either,
+# which would require this test module to be importable by name in the child.
+_CHILD_PROGRAM = """
+import asyncio, sys
+from gcsfs.cache_manager import AsyncProcessFileLock
+
+lock_path, log_path, worker_id, hold = (
+    sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+)
+
+async def main():
+    async with AsyncProcessFileLock(lock_path, poll_interval=0.01, timeout=60):
+        with open(log_path, "a") as fh:
+            fh.write("enter:%s\\n" % worker_id)
+        await asyncio.sleep(hold)
+        with open(log_path, "a") as fh:
+            fh.write("exit:%s\\n" % worker_id)
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.skipif(not cache_manager.HAS_FCNTL, reason="requires fcntl")
+def test_lock_is_mutually_exclusive_across_real_processes():
+    """Three separate OS processes must serialise on the lock.
+
+    This is the property the whole cross-process cache rests on, and it is the
+    one thing the in-process tests cannot demonstrate: `asyncio.gather` over N
+    coroutines only exercises the intra-process `asyncio.Lock` and would pass
+    just as well if `AsyncProcessFileLock` did nothing at all. Separate
+    interpreters share no Python-level state, so the only thing that can
+    serialise them here is the kernel's `flock`.
+    """
+    workers = 3
+    hold = 0.3
+
+    repo_root = str(Path(gcsfs.__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [repo_root, env["PYTHONPATH"]] if env.get("PYTHONPATH") else [repo_root]
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lock_path = Path(tmpdir) / "contended.lock"
+        log_path = Path(tmpdir) / "order.log"
+        log_path.touch()
+
+        procs = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _CHILD_PROGRAM,
+                    str(lock_path),
+                    str(log_path),
+                    str(worker_id),
+                    str(hold),
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for worker_id in range(workers)
+        ]
+
+        for proc in procs:
+            _, stderr = proc.communicate(timeout=90)
+            assert proc.returncode == 0, stderr.decode()
+
+        events = log_path.read_text().split()
+
+        # Every process ran.
+        assert len(events) == 2 * workers, events
+
+        # And none of their critical sections overlapped: each `enter` is
+        # immediately followed by its own `exit`. Without the lock the runs
+        # interleave (enter:0, enter:1, ...) because all three sleep at once.
+        for i in range(0, len(events), 2):
+            assert events[i].startswith("enter:"), events
+            assert events[i + 1] == events[i].replace("enter:", "exit:"), events
+
+        # Each worker appears exactly once.
+        assert sorted(e.split(":")[1] for e in events if e.startswith("enter:")) == [
+            str(i) for i in range(workers)
+        ]

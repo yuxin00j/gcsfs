@@ -7,7 +7,6 @@ gates, and graceful degradation.
 """
 
 import asyncio
-import io
 import os
 import tempfile
 from pathlib import Path
@@ -33,6 +32,7 @@ class _Harness:
             fs_kwargs.pop("cross_process_cache_dir", self.tmpdir / "cache")
         )
         self.download_calls = 0
+        self.info_calls = 0
         self.direct_kwargs = []
         self.data = TEST_DATA
         self.generation = GENERATION
@@ -46,6 +46,7 @@ class _Harness:
         self.fs._get_file_direct = self._get_file_direct
 
     async def _info(self, rpath, **kwargs):
+        self.info_calls += 1
         return {
             "name": rpath,
             "size": len(self.data),
@@ -63,7 +64,9 @@ class _Harness:
 
     def cache_file(self, rpath):
         key = self.fs.cache_manager.get_cache_key(
-            rpath, generation=self.generation, size=len(self.data)
+            self.fs._strip_protocol(rpath),
+            generation=self.generation,
+            size=len(self.data),
         )
         return self.fs.cache_manager.data_dir / f"{key}.data"
 
@@ -262,11 +265,112 @@ async def test_staging_stream_is_never_hashed_inline(harness):
 
     `_get_file_concurrent` calls `checker.update()` on the event loop thread,
     so hashing a multi-GiB object inline stalls every other coroutine in the
-    process. Staging validates payload size only.
+    process. Staging validates payload size only -- which is safe precisely
+    because a caller who configured a checksum never reaches the cache (see
+    `test_configured_consistency_bypasses_the_cache`).
     """
     await harness.fs._get_file("my-bucket/checkpoint.ckpt", str(harness.tmpdir / "c"))
 
-    assert harness.direct_kwargs[-1]["consistency"] == "none"
+    # Not forced to "none" -- simply never overridden, so the filesystem's own
+    # default applies. Forcing it here is what would silently downgrade a
+    # caller who asked for crc32c.
+    assert "consistency" not in harness.direct_kwargs[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consistency", ["crc32c", "md5", "size"])
+async def test_configured_consistency_bypasses_the_cache(harness, consistency):
+    """A caller who asked for a checksum gets an uncached, verified download.
+
+    The cache validates size only, so serving this caller from it would
+    silently weaken a guarantee they explicitly configured. Declining is the
+    only honest option until verification moves off the event loop.
+    """
+    rpath = "my-bucket/checkpoint.ckpt"
+    dest = harness.tmpdir / "verified" / "model.ckpt"
+    harness.fs.consistency = consistency
+
+    await harness.fs._get_file(rpath, str(dest))
+
+    assert harness.download_calls == 1
+    assert dest.read_bytes() == TEST_DATA
+    assert not harness.cache_file(rpath).exists()
+    # The caller's choice reaches the network layer untouched.
+    assert harness.direct_kwargs[-1].get("consistency", consistency) == consistency
+
+
+@pytest.mark.asyncio
+async def test_per_call_consistency_bypasses_the_cache(harness):
+    """A per-call `consistency=` is honoured the same way as the fs-level one."""
+    rpath = "my-bucket/checkpoint.ckpt"
+    dest = harness.tmpdir / "percall" / "model.ckpt"
+
+    await harness.fs._get_file(rpath, str(dest), consistency="crc32c")
+
+    assert harness.download_calls == 1
+    assert not harness.cache_file(rpath).exists()
+    assert harness.direct_kwargs[-1]["consistency"] == "crc32c"
+
+
+@pytest.mark.asyncio
+async def test_cache_key_ignores_the_protocol_prefix(harness):
+    """`gs://bucket/obj` and `bucket/obj` must resolve to one cache entry.
+
+    `fs.get()` hands `_get_file` a stripped path while a direct
+    `fs.get_file("gs://...")` does not. Keying on the raw string would give the
+    same object two keys, two locks and two downloads, with no symptom beyond
+    the wall clock.
+    """
+    plain = "my-bucket/checkpoint.ckpt"
+    prefixed = "gs://my-bucket/checkpoint.ckpt"
+    first = harness.tmpdir / "plain" / "model.ckpt"
+    second = harness.tmpdir / "prefixed" / "model.ckpt"
+
+    await harness.fs._get_file(plain, str(first))
+    await harness.fs._get_file(prefixed, str(second))
+
+    assert harness.download_calls == 1
+    assert second.read_bytes() == TEST_DATA
+    assert _same_inode(first, second)
+    assert _same_inode(second, harness.cache_file(prefixed))
+
+
+@pytest.mark.asyncio
+async def test_bypasses_reuse_the_metadata_already_fetched(harness):
+    """A bypass must not re-fetch `_info` the cache already paid for.
+
+    The size gate needs the object metadata, so the cache fetches it before it
+    can decline. Handing that same `details` to the fallback keeps an enabled
+    cache from doubling metadata round trips on every small object.
+    """
+    rpath = "my-bucket/checkpoint.ckpt"
+    dest = harness.tmpdir / "reuse" / "model.ckpt"
+
+    with mock.patch.dict(os.environ, {"GCSFS_CACHE_MIN_SIZE_BYTES": "1048576"}):
+        await harness.fs._get_file(rpath, str(dest))
+
+    assert harness.info_calls == 1
+    assert harness.direct_kwargs[-1]["details"]["generation"] == GENERATION
+
+
+@pytest.mark.asyncio
+async def test_get_file_concurrent_uses_supplied_details(harness):
+    """`_get_file_concurrent` skips its own `_info` when handed `details`."""
+    fs = harness.fs
+    fs._get_file_request = mock.AsyncMock()
+    fs._get_threshold_for_disk_reads = mock.AsyncMock(return_value=0)
+    details = {"name": "my-bucket/o", "size": 0, "generation": GENERATION}
+
+    await fs._get_file_concurrent(
+        "my-bucket/o",
+        str(harness.tmpdir / "unused"),
+        4,
+        chunk_size=1024,
+        max_prefetch_size=1024,
+        details=details,
+    )
+
+    assert harness.info_calls == 0
 
 
 @pytest.mark.asyncio
@@ -386,35 +490,27 @@ async def test_lock_timeout_degrades_to_direct_download(harness):
 
 
 @pytest.mark.asyncio
-async def test_clear_cache_is_exposed_on_the_filesystem(harness):
+async def test_purge_is_exposed_on_the_filesystem(harness):
     """The cache reclaims only on demand under space pressure, so an explicit purge is
     still the only way to drop a cache that nothing is currently competing for."""
     rpath = "my-bucket/checkpoint.ckpt"
     await harness.fs._get_file(rpath, str(harness.tmpdir / "a" / "model.ckpt"))
     assert harness.cache_file(rpath).exists()
 
-    harness.fs.clear_cache()
+    harness.fs.clear_cross_process_cache()
 
     assert not harness.cache_file(rpath).exists()
     assert harness.fs.cache_manager.data_dir.is_dir()
 
 
-@pytest.mark.asyncio
-async def test_file_like_destination_is_streamed(harness):
-    """A file-like `lpath` is written directly and bypasses the cache.
+def test_purge_is_not_named_clear_cache():
+    """`clear_cache` would read as a sibling of `invalidate_cache`.
 
-    There is no filesystem destination to hardlink, so there is nothing for a
-    later reader to share.
+    One drops an in-memory listing, the other unlinks tens of gigabytes. The
+    names must not invite confusion between them.
     """
-    harness.fs._cat_file = mock.AsyncMock(
-        side_effect=lambda rpath, start=None, end=None, **kw: TEST_DATA[start:end]
-    )
-    buf = io.BytesIO()
-
-    await harness.fs._get_file("my-bucket/checkpoint.ckpt", buf)
-
-    assert buf.getvalue() == TEST_DATA
-    assert harness.download_calls == 0
+    assert not hasattr(GCSFileSystem, "clear_cache")
+    assert hasattr(GCSFileSystem, "clear_cross_process_cache")
 
 
 @pytest.mark.asyncio
