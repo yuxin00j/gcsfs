@@ -41,6 +41,7 @@ from .retry import errs, retry_request, validate_response
 from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE, _on_loop_thread
 
 logger = logging.getLogger("gcsfs")
+cache_logger = logging.getLogger("gcsfs.cache")
 
 
 if "GCSFS_DEBUG" in os.environ:
@@ -2366,7 +2367,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             )
 
             staged_size = tmp_staging.stat().st_size
-            if size and staged_size != size:
+            if staged_size != size:
                 raise OSError(
                     f"Truncated download: expected {size} bytes, got {staged_size}"
                 )
@@ -2422,7 +2423,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # for buckets and for directory pseudo-entries synthesised from the
         # listing cache. Fall through to an uncached download instead.
         if not generation:
-            logger.debug(
+            cache_logger.debug(
                 "gcsfs cache: bypassing %s (no object generation available)", rpath
             )
             return await self._get_file_direct(
@@ -2435,7 +2436,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             os.environ.get("GCSFS_CACHE_MIN_SIZE_BYTES", DEFAULT_CACHE_MIN_SIZE_BYTES)
         )
         if size < min_size:
-            logger.debug(
+            cache_logger.debug(
                 "gcsfs cache: bypassing %s (%d bytes < GCSFS_CACHE_MIN_SIZE_BYTES=%d)",
                 rpath,
                 size,
@@ -2465,7 +2466,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         try:
             # Fast-Path: file already cached and published
             if _published():
-                logger.debug("gcsfs cache: hit for %s (key=%s)", rpath, cache_key[:12])
+                cache_logger.debug(
+                    "gcsfs cache: hit for %s (key=%s)", rpath, cache_key[:12]
+                )
                 callback.set_size(size)
                 callback.relative_update(size)
                 await asyncio.to_thread(
@@ -2477,7 +2480,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 )
                 return
 
-            logger.debug("gcsfs cache: miss for %s (key=%s)", rpath, cache_key[:12])
+            cache_logger.debug(
+                "gcsfs cache: miss for %s (key=%s)", rpath, cache_key[:12]
+            )
             downloaded = False
             # Intra-Process lock coordinates coroutines on the same event loop
             async with cache_mgr.get_intra_lock(cache_key):
@@ -2490,7 +2495,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                         # Double check inside cross-process lock: did another
                         # process finish downloading while we waited?
                         if not _published():
-                            logger.debug(
+                            cache_logger.debug(
                                 "gcsfs cache: elected downloader for %s (key=%s)",
                                 rpath,
                                 cache_key[:12],
@@ -2510,7 +2515,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             return
         except TimeoutError:
             # TimeoutError subclasses OSError, so it must be caught first.
-            logger.warning(
+            cache_logger.warning(
                 "gcsfs cache: timed out after %.0fs waiting for %s; downloading "
                 "%s directly instead",
                 timeout,
@@ -2519,7 +2524,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             )
         except OSError as exc:
             if exc.errno == errno.ENOSPC:
-                logger.warning(
+                cache_logger.warning(
                     "gcsfs cache: no room in %s for %s even after reclaiming; "
                     "downloading directly instead. Point GCSFS_CACHE_DIR at a "
                     "larger filesystem or call GCSFileSystem.clear_cache().",
@@ -2527,7 +2532,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     rpath,
                 )
             else:
-                logger.warning(
+                cache_logger.warning(
                     "gcsfs cache: unusable for %s (%s); downloading directly "
                     "instead",
                     rpath,

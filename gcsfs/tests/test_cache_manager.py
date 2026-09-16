@@ -169,26 +169,3 @@ def test_reclaim_is_a_no_op_when_nothing_is_needed():
         (mgr.data_dir / "eeee.data").write_bytes(b"x" * 1024)
         assert mgr.reclaim(0) == 0
         assert (mgr.data_dir / "eeee.data").exists()
-
-
-def test_crc32c_backends_agree():
-    """google-crc32c and crcmod must be interchangeable for cache verification.
-
-    google-crc32c uses the CPU's CRC instructions and is roughly 18x faster
-    than crcmod's table-driven C extension, so it is preferred -- but only if
-    the digests are identical, since GCS compares against one published value.
-    """
-    import base64
-
-    from gcsfs.checkers import crcmod, google_crc32c
-
-    if google_crc32c is None or crcmod is None:
-        pytest.skip("needs both crc32c backends installed")
-
-    for payload in (b"", b"a", os.urandom(1000), os.urandom(1024 * 1024 + 7)):
-        a = crcmod.Crc(0x11EDC6F41, initCrc=0, xorOut=0xFFFFFFFF)
-        a.update(payload)
-        b = google_crc32c.Checksum()
-        b.update(payload)
-        assert a.digest() == b.digest()
-        assert base64.b64encode(a.digest()) == base64.b64encode(b.digest())

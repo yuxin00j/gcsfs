@@ -72,7 +72,7 @@ def _same_inode(a, b):
 def harness():
     """Cache-enabled filesystem with the min-size gate disabled.
 
-    The gate defaults to 8 MiB, which every payload here is far below, so it
+    The gate defaults to 1 MiB, which every payload here is far below, so it
     has to be lowered or none of these tests would touch the cache at all.
     `test_small_object_bypasses_cache` covers the gate itself.
     """
@@ -422,3 +422,22 @@ async def test_directory_destination_is_a_no_op(harness):
     await harness.fs._get_file("my-bucket/checkpoint.ckpt", str(dest))
 
     assert harness.download_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cache_logs_to_gcsfs_cache_logger(harness, caplog):
+    """Cache events log to the dedicated `gcsfs.cache` logger (Section 7.2)."""
+    import logging
+
+    rpath = "my-bucket/checkpoint.ckpt"
+    first = harness.tmpdir / "log_0" / "model.ckpt"
+    second = harness.tmpdir / "log_1" / "model.ckpt"
+
+    with caplog.at_level(logging.DEBUG, logger="gcsfs.cache"):
+        await harness.fs._get_file(rpath, str(first))
+        await harness.fs._get_file(rpath, str(second))
+
+    messages = [rec.message for rec in caplog.records if rec.name == "gcsfs.cache"]
+    assert any("miss for" in m for m in messages)
+    assert any("elected downloader for" in m for m in messages)
+    assert any("hit for" in m for m in messages)

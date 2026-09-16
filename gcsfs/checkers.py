@@ -14,9 +14,6 @@ try:
 except ImportError:
     crcmod = None
 
-# Either backend can compute crc32c; they produce identical digests.
-HAS_CRC32C = google_crc32c is not None or crcmod is not None
-
 
 class ConsistencyChecker:
     def __init__(self):
@@ -126,13 +123,6 @@ class Crc32cChecker(ConsistencyChecker):
 
     def validate_http_response(self, r):
         return self.validate_headers(r.headers)
-
-
-# The GCS object-metadata field each mode compares against. Callers can use
-# this to tell in advance whether a given `_info` dict is verifiable at all:
-# not every response carries a checksum, and GCS publishes no md5 for
-# composite objects.
-CHECKSUM_METADATA_FIELD = {"crc32c": "crc32c", "md5": "md5Hash", "size": "size"}
 
 
 def get_consistency_checker(consistency: str | None) -> ConsistencyChecker:

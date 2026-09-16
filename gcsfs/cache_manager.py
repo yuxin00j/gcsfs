@@ -189,6 +189,7 @@ class GCSFileSystemCacheManager:
                 elif (
                     dest_st.st_size == cache_st.st_size
                     and dest_st.st_mtime_ns == cache_st.st_mtime_ns
+                    and (not writable or bool(dest_st.st_mode & 0o200))
                 ):
                     return
             except OSError:
