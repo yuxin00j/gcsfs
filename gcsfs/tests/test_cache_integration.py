@@ -27,7 +27,11 @@ class _Harness:
 
     def __init__(self, tmpdir, **fs_kwargs):
         self.tmpdir = Path(tmpdir)
-        self.cache_dir = self.tmpdir / "cache"
+        # Callers can point the cache somewhere unusable to exercise the
+        # degradation paths, so this is an override rather than a fixed value.
+        self.cache_dir = Path(
+            fs_kwargs.pop("cross_process_cache_dir", self.tmpdir / "cache")
+        )
         self.download_calls = 0
         self.direct_kwargs = []
         self.data = TEST_DATA
@@ -441,3 +445,71 @@ async def test_cache_logs_to_gcsfs_cache_logger(harness, caplog):
     assert any("miss for" in m for m in messages)
     assert any("elected downloader for" in m for m in messages)
     assert any("hit for" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_uncreatable_cache_dir_degrades_to_direct_download():
+    """Setting the cache up must not fail a download that would have succeeded.
+
+    `~/.cache/gcsfs` is uncreatable under a read-only root filesystem, which is
+    routine in hardened containers. Constructing the cache manager (and so
+    creating the directory) therefore has to sit inside the same guard as every
+    other cache failure, not above it.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        readonly_parent = tmpdir / "readonly"
+        readonly_parent.mkdir()
+        os.chmod(readonly_parent, 0o500)
+        try:
+            harness = _Harness(
+                tmpdir,
+                cross_process_cache=True,
+                cross_process_cache_dir=str(readonly_parent / "cache"),
+            )
+            dest = tmpdir / "out" / "model.ckpt"
+
+            with mock.patch.dict(os.environ, {"GCSFS_CACHE_MIN_SIZE_BYTES": "0"}):
+                await harness.fs._get_file("my-bucket/checkpoint.ckpt", str(dest))
+
+            assert dest.read_bytes() == TEST_DATA
+            assert harness.download_calls == 1
+        finally:
+            # Restore write permission so the TemporaryDirectory can clean up.
+            os.chmod(readonly_parent, 0o700)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variable", ["GCSFS_CACHE_MIN_SIZE_BYTES", "GCSFS_CACHE_LOCK_TIMEOUT_SEC"]
+)
+async def test_malformed_cache_env_var_degrades_to_direct_download(harness, variable):
+    """A mistyped GCSFS_CACHE_* value must not fail the caller either."""
+    rpath = "my-bucket/checkpoint.ckpt"
+    dest = harness.tmpdir / "badenv" / "model.ckpt"
+
+    with mock.patch.dict(os.environ, {variable: "not-a-number"}):
+        await harness.fs._get_file(rpath, str(dest))
+
+    assert dest.read_bytes() == TEST_DATA
+    assert harness.download_calls == 1
+    assert not harness.cache_file(rpath).exists()
+
+
+def test_explicit_writable_false_overrides_the_environment():
+    """`cross_process_cache_writable` follows the same sentinel as the enable flag.
+
+    Resolving it with `or` made an explicit False unable to override an
+    exported GCSFS_CACHE_WRITABLE=true, silently costing the caller the
+    zero-copy hardlink they asked for.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with mock.patch.dict(os.environ, {"GCSFS_CACHE_WRITABLE": "true"}):
+            explicit = _Harness(
+                tmpdir, cross_process_cache=True, cross_process_cache_writable=False
+            )
+            assert explicit.fs._cache_writable() is False
+
+            # Left unset, the environment still decides.
+            deferred = _Harness(tmpdir, cross_process_cache=True)
+            assert deferred.fs._cache_writable() is True

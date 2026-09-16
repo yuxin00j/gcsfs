@@ -348,12 +348,15 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         ``~/.cache/gcsfs``. Created 0o700: anyone able to read it can read every
         cached object without GCS credentials. Place it on the same filesystem
         as your download destinations, otherwise materialization cannot
-        hardlink and every destination costs a full copy.
-    cross_process_cache_writable: bool
+        hardlink and every destination costs a full copy. If the directory
+        cannot be created the cache disables itself for that call and the
+        download proceeds uncached.
+    cross_process_cache_writable: bool or None
         Materialize destinations as independent writable copies (0o644) instead
         of read-only hardlinks (0o444). Needed only if the caller mutates
-        downloaded files in place; it forfeits the zero-copy benefit. Defaults
-        to ``GCSFS_CACHE_WRITABLE``.
+        downloaded files in place; it forfeits the zero-copy benefit. ``None``
+        (the default) defers to the ``GCSFS_CACHE_WRITABLE`` environment
+        variable; an explicit value wins outright.
     """
 
     scopes = {"read_only", "read_write", "full_control"}
@@ -384,7 +387,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         version_aware=False,
         cross_process_cache=None,
         cross_process_cache_dir=None,
-        cross_process_cache_writable=False,
+        cross_process_cache_writable=None,
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -2308,6 +2311,23 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             ).strip().lower() in ("true", "1", "yes", "on")
         return bool(enabled)
 
+    def _cache_writable(self):
+        """Whether destinations are materialized as independent writable copies.
+
+        Same sentinel contract as ``_cache_enabled``: the constructor argument
+        wins outright when set, and ``GCSFS_CACHE_WRITABLE`` decides only when
+        it is left at ``None``. Resolving this with ``or`` instead would make
+        an explicit ``cross_process_cache_writable=False`` unable to override
+        an exported ``GCSFS_CACHE_WRITABLE=true``, silently costing the caller
+        the zero-copy hardlink they asked for.
+        """
+        writable = getattr(self, "cross_process_cache_writable", None)
+        if writable is None:
+            writable = os.environ.get(
+                "GCSFS_CACHE_WRITABLE", "false"
+            ).strip().lower() in ("true", "1", "yes", "on")
+        return bool(writable)
+
     def clear_cache(self):
         """Delete every object staged in the cross-process ``get_file`` cache.
 
@@ -2393,10 +2413,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 UserWarning,
                 stacklevel=2,
             )
-        writable = getattr(self, "cross_process_cache_writable", False) or (
-            os.environ.get("GCSFS_CACHE_WRITABLE", "false").strip().lower()
-            in ("true", "1", "yes", "on")
-        )
+        writable = self._cache_writable()
 
         # A file-like destination must be detected before any os.path call:
         # os.path.isdir() raises TypeError when handed a stream.
@@ -2430,40 +2447,58 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 rpath, lpath, callback=callback, **kwargs
             )
 
-        # Small objects are not worth the lock, staging and materialize
-        # machinery, nor the lock-file inode churn it creates in the cache dir.
-        min_size = int(
-            os.environ.get("GCSFS_CACHE_MIN_SIZE_BYTES", DEFAULT_CACHE_MIN_SIZE_BYTES)
-        )
-        if size < min_size:
-            cache_logger.debug(
-                "gcsfs cache: bypassing %s (%d bytes < GCSFS_CACHE_MIN_SIZE_BYTES=%d)",
-                rpath,
-                size,
-                min_size,
-            )
-            return await self._get_file_direct(
-                rpath, lpath, callback=callback, **kwargs
-            )
-
-        cache_mgr = self.cache_manager
-        cache_key = cache_mgr.get_cache_key(rpath, generation=generation, size=size)
-        cache_file = cache_mgr.data_dir / f"{cache_key}.data"
-        lock_file = cache_mgr.lock_dir / f"{cache_key}.lock"
-
-        def _published():
-            return cache_file.exists() and (
-                size == 0 or cache_file.stat().st_size == size
-            )
-
-        timeout = float(
-            os.environ.get("GCSFS_CACHE_LOCK_TIMEOUT_SEC", DEFAULT_CACHE_LOCK_TIMEOUT)
-        )
-
         # Everything below is best-effort. The cache is an optimisation, so no
         # failure inside it may fail a download that would otherwise have
         # succeeded -- each handler below falls through to a direct download.
+        #
+        # Setting the cache up is inside the guard for the same reason.
+        # Creating the cache directory can fail outright on a read-only or full
+        # filesystem -- a `readOnlyRootFilesystem` container makes the default
+        # `~/.cache/gcsfs` uncreatable -- and an operator can mistype an
+        # environment variable. Neither is a reason to fail the caller.
+        #
+        # Pre-seeded so the handlers below can reference them even when it was
+        # the setup itself that raised.
+        cache_mgr = None
+        lock_file = None
+        timeout = DEFAULT_CACHE_LOCK_TIMEOUT
         try:
+            # Small objects are not worth the lock, staging and materialize
+            # machinery, nor the lock-file inode churn it creates in the cache
+            # dir.
+            min_size = int(
+                os.environ.get(
+                    "GCSFS_CACHE_MIN_SIZE_BYTES", DEFAULT_CACHE_MIN_SIZE_BYTES
+                )
+            )
+            if size < min_size:
+                cache_logger.debug(
+                    "gcsfs cache: bypassing %s (%d bytes < "
+                    "GCSFS_CACHE_MIN_SIZE_BYTES=%d)",
+                    rpath,
+                    size,
+                    min_size,
+                )
+                return await self._get_file_direct(
+                    rpath, lpath, callback=callback, **kwargs
+                )
+
+            cache_mgr = self.cache_manager
+            cache_key = cache_mgr.get_cache_key(rpath, generation=generation, size=size)
+            cache_file = cache_mgr.data_dir / f"{cache_key}.data"
+            lock_file = cache_mgr.lock_dir / f"{cache_key}.lock"
+
+            def _published():
+                return cache_file.exists() and (
+                    size == 0 or cache_file.stat().st_size == size
+                )
+
+            timeout = float(
+                os.environ.get(
+                    "GCSFS_CACHE_LOCK_TIMEOUT_SEC", DEFAULT_CACHE_LOCK_TIMEOUT
+                )
+            )
+
             # Fast-Path: file already cached and published
             if _published():
                 cache_logger.debug(
@@ -2522,13 +2557,35 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 lock_file,
                 rpath,
             )
+        except ValueError as exc:
+            # A malformed GCSFS_CACHE_* value. Naming it matters: silently
+            # ignoring a typo would leave the cache permanently disabled with
+            # no way to tell that from a cache that is simply never hit.
+            cache_logger.warning(
+                "gcsfs cache: could not read its configuration (%s); "
+                "downloading %s directly instead. Check GCSFS_CACHE_* "
+                "environment variables.",
+                exc,
+                rpath,
+            )
         except OSError as exc:
             if exc.errno == errno.ENOSPC:
                 cache_logger.warning(
                     "gcsfs cache: no room in %s for %s even after reclaiming; "
                     "downloading directly instead. Point GCSFS_CACHE_DIR at a "
                     "larger filesystem or call GCSFileSystem.clear_cache().",
-                    cache_mgr.data_dir,
+                    cache_mgr.data_dir if cache_mgr else "the cache directory",
+                    rpath,
+                )
+            elif cache_mgr is None:
+                # Raised before the cache was even usable, so `lpath` was never
+                # touched: an uncreatable GCSFS_CACHE_DIR (read-only or full
+                # filesystem, wrong owner) rather than a failure mid-transfer.
+                cache_logger.warning(
+                    "gcsfs cache: could not open its cache directory (%s); "
+                    "downloading %s directly instead. Point GCSFS_CACHE_DIR at "
+                    "a writable directory on node-local storage.",
+                    exc,
                     rpath,
                 )
             else:
