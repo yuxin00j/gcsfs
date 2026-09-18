@@ -32,7 +32,7 @@ from fsspec.utils import other_paths, setup_logging, stringify_path
 
 from . import __version__ as version
 from ._dircache import DirCacheUpdater
-from .cache_manager import HAS_FCNTL, AsyncProcessFileLock
+from .cache_manager import HAS_FCNTL, AsyncProcessFileLock, GCSFileSystemCacheManager
 from .checkers import get_consistency_checker
 from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
@@ -408,15 +408,24 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.cross_process_cache = cross_process_cache
         self.cross_process_cache_dir = cross_process_cache_dir
         self._cache_manager = None
+        self._cache_manager_lock = threading.Lock()
 
     @property
     def cache_manager(self):
-        if self._cache_manager is None:
-            from gcsfs.cache_manager import GCSFileSystemCacheManager
+        """The cross-process cache manager, built on first use.
 
-            self._cache_manager = GCSFileSystemCacheManager(
-                cache_dir=self.cross_process_cache_dir
-            )
+        Construction is deferred because it creates ``GCSFS_CACHE_DIR``, which
+        can fail on a read-only filesystem and must not break an instance whose
+        cache is switched off. It is locked because the manager owns the
+        registry of per-key intra-process locks: two of them would let two
+        callers in this process download the same object at once.
+        """
+        if self._cache_manager is None:
+            with self._cache_manager_lock:
+                if self._cache_manager is None:
+                    self._cache_manager = GCSFileSystemCacheManager(
+                        cache_dir=self.cross_process_cache_dir
+                    )
         return self._cache_manager
 
     @property

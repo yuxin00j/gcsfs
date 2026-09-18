@@ -10,12 +10,15 @@ import asyncio
 import errno
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 import gcsfs.cache_manager as cache_manager
+import gcsfs.core as core
 from gcsfs.core import GCSFileSystem
 
 TEST_DATA = b"Simulated 45GB checkpoint payload"
@@ -560,3 +563,33 @@ async def test_malformed_cache_env_var_degrades_to_direct_download(harness, vari
     assert dest.read_bytes() == TEST_DATA
     assert harness.download_calls == 1
     assert not harness.cache_file(rpath).exists()
+
+
+def test_cache_manager_is_built_once_under_thread_races(harness):
+    """Two managers would mean two registries of intra-process locks.
+
+    The registry is what makes single-flight work within a process, so the
+    lazy init has to be locked, not merely idempotent.
+    """
+    builds = []
+    real = cache_manager.GCSFileSystemCacheManager
+
+    def slow_build(*args, **kwargs):
+        builds.append(1)
+        # Widen the race window so an unguarded init reliably double-builds.
+        time.sleep(0.05)
+        return real(*args, **kwargs)
+
+    seen = []
+    with mock.patch.object(core, "GCSFileSystemCacheManager", slow_build):
+        threads = [
+            threading.Thread(target=lambda: seen.append(harness.fs.cache_manager))
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert len(builds) == 1
+    assert len({id(manager) for manager in seen}) == 1
