@@ -32,7 +32,7 @@ from fsspec.utils import other_paths, setup_logging, stringify_path
 
 from . import __version__ as version
 from ._dircache import DirCacheUpdater
-from .cache_manager import HAS_FCNTL
+from .cache_manager import HAS_FCNTL, AsyncProcessFileLock
 from .checkers import get_consistency_checker
 from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
@@ -71,26 +71,22 @@ GCS_MAX_BLOCK_SIZE = 2**28
 DEFAULT_BLOCK_SIZE = 5 * 2**20
 
 # Cross-process `get_file` cache (see GCSFileSystem._get_file).
-# Objects below this size bypass the cache.
-#
-# Measured overhead of the cache machinery itself, network stubbed out, median
-# of 200 calls: ~1.6 ms fixed on the cold path (lock file, flock, staging,
-# os.replace, hardlink) and ~0.31 ms on a warm hit, both independent of object
-# size. Against a real GCS GET, which costs at least ~20 ms of round trip, 1.6
-# ms is under 10% at every size -- so overhead alone does not justify a floor
-# of any particular height, and the earlier 8 MiB value was not derived from
-# anything.
-#
-# The floor that remains is about resource hygiene rather than speed. Every
-# distinct object cached creates a lock-file inode that is never reclaimed
-# (unlinking it would race a process about to open it) plus a cache entry that
-# is only reclaimed under space pressure. 1 MiB keeps that bounded for
-# workloads that touch thousands of small shards, while still caching anything
-# checkpoint-shaped.
+# Objects below this size bypass the cache. The floor bounds lock-file inode
+# churn rather than overhead, which is ~1.6 ms cold and ~0.31 ms warm at any
+# size. See the design doc for the measurements.
 DEFAULT_CACHE_MIN_SIZE_BYTES = 1 * 2**20
-# How long a waiting process will block on the download lock before giving up
-# and falling back to its own uncached download.
+# How long a waiting process blocks on the download lock before giving up and
+# falling back to its own uncached download.
 DEFAULT_CACHE_LOCK_TIMEOUT = 3600.0
+
+
+class _RemoteTransferError(Exception):
+    """A staged cache download failed in the transfer itself, not in the cache.
+
+    aiohttp's connection errors subclass OSError, so without this the cache's
+    fail-safe guard would mistake a dropped GCS connection for a broken cache
+    and re-download the whole object directly.
+    """
 
 
 SUPPORTED_FIXED_KEY_METADATA = {
@@ -343,9 +339,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     cross_process_cache_dir: str
         Directory for cached data and lockfiles. Defaults to ``GCSFS_CACHE_DIR``
         or ``~/.cache/gcsfs``. Should reside on the same mount as destinations.
-    cross_process_cache_writable: bool or None
-        Materialize destinations as writable copies (0o644) instead of read-only
-        hardlinks (0o444). ``None`` defers to ``GCSFS_CACHE_WRITABLE``.
     """
 
     scopes = {"read_only", "read_write", "full_control"}
@@ -376,7 +369,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         version_aware=False,
         cross_process_cache=None,
         cross_process_cache_dir=None,
-        cross_process_cache_writable=None,
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -415,7 +407,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         )
         self.cross_process_cache = cross_process_cache
         self.cross_process_cache_dir = cross_process_cache_dir
-        self.cross_process_cache_writable = cross_process_cache_writable
         self._cache_manager = None
 
     @property
@@ -2271,15 +2262,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             ).strip().lower() in ("true", "1", "yes", "on")
         return bool(enabled)
 
-    def _cache_writable(self):
-        """Whether destinations are materialized as independent writable copies."""
-        writable = getattr(self, "cross_process_cache_writable", None)
-        if writable is None:
-            writable = os.environ.get(
-                "GCSFS_CACHE_WRITABLE", "false"
-            ).strip().lower() in ("true", "1", "yes", "on")
-        return bool(writable)
-
     def clear_cross_process_cache(self):
         """Delete all cached objects from the local cross-process ``get_file`` cache."""
         self.cache_manager.clear_cache()
@@ -2305,9 +2287,14 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             if generation and "generation" not in kwargs:
                 kwargs["generation"] = generation
 
-            await self._get_file_direct(
-                rpath, str(tmp_staging), callback=callback, details=info, **kwargs
-            )
+            try:
+                await self._get_file_direct(
+                    rpath, str(tmp_staging), callback=callback, details=info, **kwargs
+                )
+            except Exception as exc:
+                # The remote read failed. Retrying it uncached would transfer
+                # the whole object a second time and still fail.
+                raise _RemoteTransferError(str(exc)) from exc
 
             staged_size = tmp_staging.stat().st_size
             if staged_size != size:
@@ -2318,20 +2305,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             os.chmod(tmp_staging, 0o444)
             os.replace(tmp_staging, cache_file)
         finally:
-            if tmp_staging.exists():
-                tmp_staging.unlink(missing_ok=True)
+            tmp_staging.unlink(missing_ok=True)
 
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
-        if "writable" in kwargs:
-            kwargs.pop("writable")
-            warnings.warn(
-                "The per-call `writable=` argument to get_file() is not "
-                "supported and was ignored. Pass "
-                "`cross_process_cache_writable=True` to GCSFileSystem instead.",
-                UserWarning,
-                stacklevel=2,
-            )
-
         if os.path.isdir(lpath):
             return
 
@@ -2353,7 +2329,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 rpath, lpath, callback=callback, **kwargs
             )
 
-        writable = self._cache_writable()
         info = await self._info(rpath)
         generation = str(info.get("generation") or "")
         size = int(info.get("size") or 0)
@@ -2409,11 +2384,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 callback.set_size(size)
                 callback.relative_update(size)
                 await asyncio.to_thread(
-                    cache_mgr.materialize,
-                    cache_file,
-                    lpath,
-                    rpath=rpath,
-                    writable=writable,
+                    cache_mgr.materialize, cache_file, lpath, rpath=rpath
                 )
                 return
 
@@ -2423,8 +2394,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             downloaded = False
             async with cache_mgr.get_intra_lock(cache_key):
                 if not _published():
-                    from gcsfs.cache_manager import AsyncProcessFileLock
-
                     async with AsyncProcessFileLock(lock_file, timeout=timeout):
                         if not _published():
                             cache_logger.debug(
@@ -2441,9 +2410,11 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 callback.set_size(size)
                 callback.relative_update(size)
             await asyncio.to_thread(
-                cache_mgr.materialize, cache_file, lpath, rpath=rpath, writable=writable
+                cache_mgr.materialize, cache_file, lpath, rpath=rpath
             )
             return
+        except _RemoteTransferError as exc:
+            raise exc.__cause__ from None
         except (OSError, ValueError) as exc:
             cache_logger.warning(
                 "gcsfs cache: bypassing cache for %s (%s); downloading directly",

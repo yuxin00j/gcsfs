@@ -134,9 +134,8 @@ class GCSFileSystemCacheManager:
         cache_file: Path,
         lpath: Union[str, Path],
         rpath: str = "",
-        writable: bool = False,
     ) -> None:
-        """Projects the master cache file to lpath via hardlink or copy fallback."""
+        """Project the cache file onto lpath via hardlink, or copy across mounts."""
         dest = Path(lpath)
         if dest.is_dir() or str(lpath).endswith(("/", "\\")):
             dest.mkdir(parents=True, exist_ok=True)
@@ -145,74 +144,47 @@ class GCSFileSystemCacheManager:
         else:
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-        # 1. Priority 1: Zero-Copy Read-Only Hardlink (os.link)
-        if not writable:
+        # 1. Zero-copy read-only hardlink: all ranks share one inode and one
+        #    page-cache copy.
+        try:
             try:
-                if dest.exists() and os.path.samefile(cache_file, dest):
+                os.link(cache_file, dest)
+                return
+            except FileExistsError:
+                if os.path.samefile(cache_file, dest):
                     return
+                tmp_target = (
+                    dest.parent
+                    / f".{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+                )
                 try:
-                    os.link(cache_file, dest)
+                    os.link(cache_file, tmp_target)
+                    os.replace(tmp_target, dest)
                     return
-                except FileExistsError:
-                    if os.path.samefile(cache_file, dest):
-                        return
-                    tmp_target = (
-                        dest.parent
-                        / f".{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-                    )
-                    try:
-                        os.link(cache_file, tmp_target)
-                        os.replace(tmp_target, dest)
-                        return
-                    finally:
-                        if tmp_target.exists():
-                            tmp_target.unlink(missing_ok=True)
-            except OSError as e:
-                if e.errno not in (
-                    errno.EXDEV,
-                    errno.EMLINK,
-                    errno.EPERM,
-                    errno.EACCES,
-                ):
-                    raise
-                if (
-                    e.errno == errno.EXDEV
-                    and not GCSFileSystemCacheManager._warned_exdev
-                ):
-                    GCSFileSystemCacheManager._warned_exdev = True
-                    logger.warning(
-                        "gcsfs cache: %s and %s are on different mounts; falling "
-                        "back to copy. Set GCSFS_CACHE_DIR on the same filesystem "
-                        "as download destinations for zero-copy hardlinks.",
-                        cache_file,
-                        dest,
-                    )
-                else:
-                    logger.debug(
-                        "gcsfs cache: hardlink %s -> %s failed (%s); falling back "
-                        "to copy",
-                        cache_file,
-                        dest,
-                        errno.errorcode.get(e.errno, e.errno),
-                    )
+                finally:
+                    tmp_target.unlink(missing_ok=True)
+        except OSError as e:
+            if e.errno not in (errno.EXDEV, errno.EMLINK, errno.EPERM, errno.EACCES):
+                raise
+            if e.errno == errno.EXDEV and not GCSFileSystemCacheManager._warned_exdev:
+                GCSFileSystemCacheManager._warned_exdev = True
+                logger.warning(
+                    "gcsfs cache: %s and %s are on different mounts; falling "
+                    "back to copy. Set GCSFS_CACHE_DIR on the same filesystem "
+                    "as download destinations for zero-copy hardlinks.",
+                    cache_file,
+                    dest,
+                )
+            else:
+                logger.debug(
+                    "gcsfs cache: hardlink %s -> %s failed (%s); falling back to copy",
+                    cache_file,
+                    dest,
+                    errno.errorcode.get(e.errno, e.errno),
+                )
 
-        # 2. Priority 2: Isolated Chunked Copy (EXDEV, EMLINK, EPERM, or writable=True)
-        if dest.exists():
-            try:
-                dest_st = dest.stat()
-                cache_st = cache_file.stat()
-                if (
-                    dest_st.st_size == cache_st.st_size
-                    and dest_st.st_mtime_ns == cache_st.st_mtime_ns
-                    and (not writable or bool(dest_st.st_mode & 0o200))
-                ):
-                    return
-            except OSError:
-                pass
-
-        logger.debug(
-            "gcsfs cache: copying %s -> %s (writable=%s)", cache_file, dest, writable
-        )
+        # 2. Chunked copy fallback (EXDEV, EMLINK, EPERM, EACCES).
+        logger.debug("gcsfs cache: copying %s -> %s", cache_file, dest)
         tmp_target = (
             dest.parent / f".{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         )
@@ -223,8 +195,7 @@ class GCSFileSystemCacheManager:
             os.chmod(tmp_target, 0o644)
             os.replace(tmp_target, dest)
         finally:
-            if tmp_target.exists():
-                tmp_target.unlink(missing_ok=True)
+            tmp_target.unlink(missing_ok=True)
 
     def clear_cache(self) -> None:
         shutil.rmtree(self.data_dir, ignore_errors=True)

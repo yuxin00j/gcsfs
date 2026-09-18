@@ -7,6 +7,7 @@ gates, and graceful degradation.
 """
 
 import asyncio
+import errno
 import os
 import tempfile
 from pathlib import Path
@@ -132,31 +133,26 @@ async def test_concurrent_ranks_single_flight(harness):
 
 
 @pytest.mark.asyncio
-async def test_writable_gets_isolated_copy(harness):
-    """The writable setting yields a private copy; mutating it cannot corrupt the cache."""
+async def test_cross_mount_falls_back_to_copy(harness):
+    """When the cache and the destination sit on different mounts, copy instead."""
     rpath = "my-bucket/checkpoint.ckpt"
-    dest = harness.tmpdir / "writable" / "model.ckpt"
-    harness.fs.cross_process_cache_writable = True
+    dest = harness.tmpdir / "other_mount" / "model.ckpt"
+    real_link = os.link
 
-    await harness.fs._get_file(rpath, str(dest))
+    def fake_link(src, dst, **kwargs):
+        if Path(dst).parent == dest.parent:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_link(src, dst, **kwargs)
+
+    with mock.patch("gcsfs.cache_manager.os.link", fake_link):
+        await harness.fs._get_file(rpath, str(dest))
 
     cache_file = harness.cache_file(rpath)
+    assert dest.read_bytes() == TEST_DATA
     assert not _same_inode(dest, cache_file)
+    # The copy is independent, so writing to it cannot corrupt the cache.
     dest.write_bytes(b"modified")
     assert cache_file.read_bytes() == TEST_DATA
-
-
-@pytest.mark.asyncio
-async def test_per_call_writable_is_rejected(harness):
-    """`writable=` is a constructor setting, so a per-call one must warn, not silently apply."""
-    rpath = "my-bucket/checkpoint.ckpt"
-    dest = harness.tmpdir / "per_call" / "model.ckpt"
-
-    with pytest.warns(UserWarning, match="cross_process_cache_writable"):
-        await harness.fs._get_file(rpath, str(dest), writable=True)
-
-    # Ignored, so the destination is still a zero-copy hardlink.
-    assert _same_inode(dest, harness.cache_file(rpath))
 
 
 @pytest.mark.asyncio
@@ -228,21 +224,25 @@ async def test_lock_refuses_to_run_unlocked_without_fcntl():
 
 
 @pytest.mark.asyncio
-async def test_cache_only_kwargs_never_reach_the_network_layer(harness):
-    """`writable` must not survive into **kwargs, where it becomes a query param.
+async def test_transfer_failure_propagates_without_a_second_download(harness):
+    """A failed GCS read must surface, not be retried uncached.
 
-    `_get_file_request` funnels unrecognised keywords through `_get_params`,
-    so a leaked kwarg silently ends up in the request URL.
+    aiohttp's connection errors subclass OSError, so the cache's fail-safe
+    guard would otherwise treat a dropped connection as a broken cache and
+    transfer the whole object a second time.
     """
-    harness.fs.cross_process_cache = False
-    dest = harness.tmpdir / "kwargs" / "model.ckpt"
+    dest = harness.tmpdir / "transfer_fail" / "model.ckpt"
 
-    with pytest.warns(UserWarning):
-        await harness.fs._get_file(
-            "my-bucket/checkpoint.ckpt", str(dest), writable=True
-        )
+    async def failing_download(rpath, lpath, callback=None, **kwargs):
+        harness.download_calls += 1
+        raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
 
-    assert "writable" not in harness.direct_kwargs[-1]
+    harness.fs._get_file_direct = failing_download
+
+    with pytest.raises(ConnectionResetError):
+        await harness.fs._get_file("my-bucket/checkpoint.ckpt", str(dest))
+
+    assert harness.download_calls == 1
 
 
 @pytest.mark.asyncio
@@ -560,22 +560,3 @@ async def test_malformed_cache_env_var_degrades_to_direct_download(harness, vari
     assert dest.read_bytes() == TEST_DATA
     assert harness.download_calls == 1
     assert not harness.cache_file(rpath).exists()
-
-
-def test_explicit_writable_false_overrides_the_environment():
-    """`cross_process_cache_writable` follows the same sentinel as the enable flag.
-
-    Resolving it with `or` made an explicit False unable to override an
-    exported GCSFS_CACHE_WRITABLE=true, silently costing the caller the
-    zero-copy hardlink they asked for.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with mock.patch.dict(os.environ, {"GCSFS_CACHE_WRITABLE": "true"}):
-            explicit = _Harness(
-                tmpdir, cross_process_cache=True, cross_process_cache_writable=False
-            )
-            assert explicit.fs._cache_writable() is False
-
-            # Left unset, the environment still decides.
-            deferred = _Harness(tmpdir, cross_process_cache=True)
-            assert deferred.fs._cache_writable() is True

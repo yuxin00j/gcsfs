@@ -1,8 +1,10 @@
+import errno
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -74,26 +76,25 @@ def test_cache_manager_materialize_hardlink():
         assert dest.exists()
 
 
-def test_cache_manager_materialize_writable_copy():
+def test_cache_manager_materialize_copy_on_exdev():
     with tempfile.TemporaryDirectory() as tmpdir:
         mgr = GCSFileSystemCacheManager(cache_dir=tmpdir)
         cache_file = mgr.data_dir / "test.data"
         cache_file.write_bytes(b"hello world")
         os.chmod(cache_file, 0o444)
 
-        dest = Path(tmpdir) / "dest" / "output_writable.bin"
-        mgr.materialize(cache_file, dest, writable=True)
+        dest = Path(tmpdir) / "dest" / "output_copy.bin"
 
-        assert dest.exists()
+        def fake_link(src, dst, **kwargs):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        with mock.patch("gcsfs.cache_manager.os.link", fake_link):
+            mgr.materialize(cache_file, dest)
+
         assert dest.read_bytes() == b"hello world"
-        dest_st = dest.stat()
-        cache_st = cache_file.stat()
-        # Should be an independent copy with different inode
-        assert dest_st.st_ino != cache_st.st_ino
-
-        # Should be writable (0o644 or similar)
+        # An independent inode, and writable, so the cache cannot be corrupted.
+        assert dest.stat().st_ino != cache_file.stat().st_ino
         dest.write_bytes(b"modified world")
-        assert dest.read_bytes() == b"modified world"
         assert cache_file.read_bytes() == b"hello world"
 
 
