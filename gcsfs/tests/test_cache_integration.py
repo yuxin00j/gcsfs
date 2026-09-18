@@ -430,44 +430,14 @@ async def test_full_cache_degrades_to_direct_download(harness):
     dest = harness.tmpdir / "enospc" / "model.ckpt"
 
     # Report the filesystem as full so the pre-flight check cannot be satisfied.
-    with mock.patch("gcsfs.core.shutil.disk_usage", return_value=(100, 100, 0)):
+    with mock.patch(
+        "gcsfs.core.shutil.disk_usage",
+        return_value=mock.Mock(total=100, used=100, free=0),
+    ):
         await harness.fs._get_file(rpath, str(dest))
 
     assert dest.read_bytes() == TEST_DATA
     assert not harness.cache_file(rpath).exists()
-
-
-@pytest.mark.asyncio
-async def test_full_cache_reclaims_before_giving_up(harness):
-    """Space is reclaimed on demand: a full cache recovers instead of degrading forever."""
-    rpath = "my-bucket/checkpoint.ckpt"
-    data_dir = harness.fs.cache_manager.data_dir
-
-    # An unreferenced entry from some earlier, now-superseded generation.
-    stale = data_dir / "00000000.data"
-    stale.write_bytes(b"x" * 4096)
-
-    free_after_reclaim = {"value": 0}
-
-    def _disk_usage(_path):
-        return (8192, 8192 - free_after_reclaim["value"], free_after_reclaim["value"])
-
-    def _reclaim(needed, exclude=None):
-        freed = stale.stat().st_size
-        stale.unlink()
-        free_after_reclaim["value"] = freed
-        return freed
-
-    with mock.patch("gcsfs.core.shutil.disk_usage", _disk_usage):
-        with mock.patch.object(
-            harness.fs.cache_manager, "reclaim", side_effect=_reclaim
-        ) as reclaim:
-            await harness.fs._get_file(rpath, str(harness.tmpdir / "r" / "model.ckpt"))
-
-    assert reclaim.called
-    assert not stale.exists()
-    # Reclaiming made room, so the download was cached rather than degraded.
-    assert harness.cache_file(rpath).exists()
 
 
 @pytest.mark.asyncio

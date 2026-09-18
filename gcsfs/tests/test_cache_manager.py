@@ -115,66 +115,6 @@ def test_cache_directories_are_private():
             assert directory.stat().st_mode & 0o777 == 0o700, directory
 
 
-def test_reclaim_evicts_oldest_unreferenced_entries_only():
-    """Reclamation frees entries nothing is using, oldest first."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = GCSFileSystemCacheManager(cache_dir=os.path.join(tmpdir, "cache"))
-        dest_dir = Path(tmpdir) / "dest"
-        dest_dir.mkdir()
-
-        old = mgr.data_dir / "aaaa.data"
-        new = mgr.data_dir / "bbbb.data"
-        linked = mgr.data_dir / "cccc.data"
-        for entry in (old, new, linked):
-            entry.write_bytes(b"x" * 1024)
-
-        # A materialized destination still shares `linked`'s blocks, so removing
-        # the cache name would free nothing.
-        os.link(linked, dest_dir / "model.ckpt")
-
-        os.utime(old, (1000, 1000))
-        os.utime(new, (2000, 2000))
-        os.utime(linked, (500, 500))
-
-        freed = mgr.reclaim(1024)
-
-        assert freed == 1024
-        assert not old.exists()
-        assert new.exists()
-        assert linked.exists()
-
-
-def test_reclaim_skips_entries_with_a_held_lock():
-    """An entry another process is downloading into must not be pulled out from under it."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = GCSFileSystemCacheManager(cache_dir=os.path.join(tmpdir, "cache"))
-        busy = mgr.data_dir / "dddd.data"
-        busy.write_bytes(b"x" * 1024)
-        lock_path = mgr.lock_dir / "dddd.lock"
-
-        import fcntl
-
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            assert mgr.reclaim(1024) == 0
-            assert busy.exists()
-        finally:
-            os.close(fd)
-
-        # Once released it becomes reclaimable.
-        assert mgr.reclaim(1024) == 1024
-        assert not busy.exists()
-
-
-def test_reclaim_is_a_no_op_when_nothing_is_needed():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = GCSFileSystemCacheManager(cache_dir=os.path.join(tmpdir, "cache"))
-        (mgr.data_dir / "eeee.data").write_bytes(b"x" * 1024)
-        assert mgr.reclaim(0) == 0
-        assert (mgr.data_dir / "eeee.data").exists()
-
-
 # Run in a fresh interpreter, one per worker. Deliberately not `os.fork()` and
 # not `multiprocessing` with the default start method: forking the pytest
 # process inherits its threads and captured descriptors, and the child
