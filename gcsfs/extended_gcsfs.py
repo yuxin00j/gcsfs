@@ -737,10 +737,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     ):
         """Fetch many ranges of a single zonal object over a shared MRD pool.
 
-        For finalized objects read without an explicit generation, the last
-        metadata seen for the object is reused so the downloads start at once.
-        A metadata lookup runs concurrently, and the result is only returned
-        if it confirms the same generation; otherwise the read is redone.
+        For objects read without an explicit generation, the last metadata
+        seen for the object is reused so the downloads start at once, on MRDs
+        already open for it. A metadata lookup runs concurrently, and the
+        result is only returned if it confirms the same generation; otherwise
+        the read is redone. Unfinalized objects only grow, so for them this
+        applies when every range ends within the last seen persisted size.
 
         Returns:
             list: One entry per input range: ``bytes`` or the exception raised
@@ -751,8 +753,16 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         hint_key = (bucket, object_name)
         spec_info = None
         validate = None
+        bounded = all(isinstance(x, int) and x >= 0 for x in (*starts, *ends))
+        max_end = max(ends, default=0) if bounded else None
         if _speculate and generation is None:
             spec_info = self._zonal_info_hints.get(hint_key)
+            if (
+                spec_info is not None
+                and spec_info.get("timeFinalized") is None
+                and (max_end is None or max_end > spec_info["size"])
+            ):
+                spec_info = None
             if spec_info is not None:
                 validate = asyncio.ensure_future(self._info(path))
         try:
@@ -764,6 +774,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 cache_type=cache_type,
                 cache_source=cache_source,
                 info=spec_info,
+                reuse_idle=spec_info is not None,
             )
         except BaseException:
             self._zonal_info_hints.pop(hint_key, None)
@@ -773,9 +784,22 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             return await self._cat_ranges_zonal_file(
                 path, starts, ends, num_streams, _speculate=False, **kwargs
             )
+        if (
+            spec_info is not None
+            and not pool.finalized
+            and (pool.persisted_size is None or max_end > pool.persisted_size)
+        ):
+            # A reused MRD may predate the size seen last time.
+            await pool.close()
+            validate.cancel()
+            return await self._cat_ranges_zonal_file(
+                path, starts, ends, num_streams, _speculate=False, **kwargs
+            )
         try:
             details = getattr(pool, "details", None)
-            if generation is None and getattr(pool, "finalized", False) and details:
+            if generation is None and details and pool.persisted_size is not None:
+                if not pool.finalized:
+                    details = dict(details, size=pool.persisted_size)
                 self._zonal_info_hints.pop(hint_key, None)
                 self._zonal_info_hints[hint_key] = details
                 if len(self._zonal_info_hints) > 1024:
@@ -822,9 +846,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             except BaseException:
                 self._zonal_info_hints.pop(hint_key, None)
                 raise
-            if fresh.get("generation") != spec_info.get(
-                "generation"
-            ) or fresh.get("size") != spec_info.get("size"):
+            if spec_info.get("timeFinalized") is None:
+                # Appends never change bytes below the old persisted size.
+                stale = fresh.get("size", 0) < max_end
+            else:
+                stale = fresh.get("size") != spec_info.get("size")
+            if stale or fresh.get("generation") != spec_info.get("generation"):
                 self._zonal_info_hints.pop(hint_key, None)
                 return await self._cat_ranges_zonal_file(
                     path, starts, ends, num_streams, _speculate=False, **kwargs

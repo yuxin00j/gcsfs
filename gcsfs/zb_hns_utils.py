@@ -620,9 +620,13 @@ class MRDPool:
         cache=None,
         cache_type=None,
         cache_source=None,
+        reuse_idle=False,
     ):
         self.gcsfs = gcsfs
         self.bucket_name = bucket_name
+        # Start from a cached MRD even for an unfinalized object, when the
+        # caller does not need its up-to-date persisted_size.
+        self.reuse_idle = reuse_idle
         self.object_name = object_name
         self.generation = generation
         self._cache = cache
@@ -700,7 +704,7 @@ class MRDPool:
                 raise RuntimeError("Cannot initialize a closed MRDPool.")
 
             if not self._initialized and self._active_count == 0:
-                if self.finalized:
+                if self.finalized or self.reuse_idle:
                     mrd = await self._get_or_create_mrd()
                 else:
                     # Always create a new MRD for unfinalized objects to get the up-to-date persisted_size
@@ -895,6 +899,7 @@ class MRDPoolCache:
         cache_type=None,
         cache_source=None,
         info=None,
+        reuse_idle=False,
     ):
         """
         Gets an MRDPool for the specified object.
@@ -908,6 +913,9 @@ class MRDPoolCache:
             cache_source (str, optional): The cache source string.
             info (dict, optional): Object metadata already known to the
                 caller. When given, the metadata lookup is skipped.
+            reuse_idle (bool, optional): Start the pool from a cached MRD even
+                if the object is unfinalized. Only safe when the caller does
+                not rely on the pool's persisted_size being current.
 
         Returns:
             MRDPool: An initialized MRDPool instance.
@@ -938,6 +946,7 @@ class MRDPoolCache:
             cache=self,
             cache_type=cache_type,
             cache_source=cache_source,
+            reuse_idle=reuse_idle,
         )
         if info is not None:
             mrd_pool.details = info
