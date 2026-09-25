@@ -92,6 +92,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     # Upper bound on concurrent MRD bidi streams per object in zonal cat_ranges.
     MAX_ZONAL_STREAMS_PER_OBJECT = 16
+    # Ranges larger than this may be cut into pieces read on separate streams.
+    MIN_ZONAL_PIECE_BYTES = 16 * 1024 * 1024
 
     def __init__(
         self,
@@ -689,48 +691,50 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             heapq.heappush(heap, (load + req[2], g))
         return [sorted(g, key=lambda r: r[1]) for g in groups if g]
 
-    async def _download_range_group(self, pool, group):
-        """Download a group of ranges on a single MRD from ``pool``.
+    @staticmethod
+    def _split_large_ranges(requests, num_streams, min_piece):
+        """Cut ranges into pieces so large ones can be spread over streams.
 
-        All ranges in the group are issued through one ``download_ranges`` call
-        (chunked at ``MRD_MAX_RANGES``), so they are multiplexed over a single
-        bidi-read stream.
+        Pieces are at most ``max(min_piece, total / num_streams)`` bytes, so a
+        single large range no longer caps a call at one stream's throughput.
+
+        Args:
+            requests (list[tuple[int, int, int]]): ``(index, offset, length)`` tuples.
+            num_streams (int): Number of streams the pieces will be spread over.
+            min_piece (int): Ranges up to this size are never cut.
 
         Returns:
-            list[bytes]: One payload per request in ``group``, in the same order.
+            list[tuple[int, int, int, int]]: ``(index, offset, length, rel)``
+            tuples, where ``rel`` is the piece's offset within its range.
         """
-        buffers = [
-            DirectMemmoveBuffer(length, self._memmove_executor)
-            for _, _, length in group
-        ]
-        views = [buf.get_view(0, length) for buf, (_, _, length) in zip(buffers, group)]
-        has_error = False
-        try:
-            async with _get_mrd_from_pool_or_mrd(pool) as mrd:
-                for i in range(0, len(group), MRD_MAX_RANGES):
-                    chunk = range(i, min(i + MRD_MAX_RANGES, len(group)))
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"mrd path: {mrd.object_name} | Requested "
-                            f"{len(chunk)} ranges: "
-                            f"{[(group[k][1], group[k][2]) for k in chunk]}"
-                        )
-                    await mrd.download_ranges(
-                        [(group[k][1], group[k][2], views[k]) for k in chunk]
+        total = sum(r[2] for r in requests)
+        cap = max(min_piece, -(-total // max(1, num_streams)))
+        pieces = []
+        for i, offset, length in requests:
+            step = -(-length // -(-length // cap))
+            for rel in range(0, length, step):
+                pieces.append((i, offset + rel, min(step, length - rel), rel))
+        return pieces
+
+    async def _download_range_group(self, pool, group):
+        """Download ``(offset, length, writer)`` requests on one MRD from ``pool``.
+
+        All requests in the group are issued through one ``download_ranges``
+        call (chunked at ``MRD_MAX_RANGES``), so they are multiplexed over a
+        single bidi-read stream. Each writer is closed afterwards, which raises
+        if it was not filled.
+        """
+        async with _get_mrd_from_pool_or_mrd(pool) as mrd:
+            for i in range(0, len(group), MRD_MAX_RANGES):
+                chunk = group[i : i + MRD_MAX_RANGES]
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"mrd path: {mrd.object_name} | Requested "
+                        f"{len(chunk)} ranges: {[(o, n) for o, n, _ in chunk]}"
                     )
-            for view in views:
-                view.close()
-        except BaseException:
-            has_error = True
-            raise
-        finally:
-            for buf in buffers:
-                try:
-                    buf.close()
-                except Exception:
-                    if not has_error:
-                        raise
-        return [buf.get_value() for buf in buffers]
+                await mrd.download_ranges(chunk)
+        for _, _, view in group:
+            view.close()
 
     async def _cat_ranges_zonal_file(
         self, path, starts, ends, num_streams, _speculate=True, **kwargs
@@ -786,7 +790,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
         if (
             spec_info is not None
-            and not pool.finalized
+            and spec_info.get("timeFinalized") is None
             and (pool.persisted_size is None or max_end > pool.persisted_size)
         ):
             # A reused MRD may predate the size seen last time.
@@ -797,8 +801,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
         try:
             details = getattr(pool, "details", None)
+            finalized = getattr(pool, "finalized", False)
             if generation is None and details and pool.persisted_size is not None:
-                if not pool.finalized:
+                if not finalized:
                     details = dict(details, size=pool.persisted_size)
                 self._zonal_info_hints.pop(hint_key, None)
                 self._zonal_info_hints[hint_key] = details
@@ -821,18 +826,38 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 if length > 0:
                     requests.append((i, offset, length))
 
-            groups = self._split_ranges_across_streams(requests, num_streams)
-            results = await asyncio.gather(
-                *(self._download_range_group(pool, g) for g in groups),
-                return_exceptions=True,
+            pieces = self._split_large_ranges(
+                requests, num_streams, self.MIN_ZONAL_PIECE_BYTES
             )
-            for group, res in zip(groups, results):
-                if isinstance(res, BaseException):
-                    for i, _, _ in group:
-                        out[i] = res
-                else:
-                    for (i, _, _), data in zip(group, res):
-                        out[i] = data
+            groups = self._split_ranges_across_streams(pieces, num_streams)
+            buffers = {
+                i: DirectMemmoveBuffer(length, self._memmove_executor)
+                for i, _, length in requests
+            }
+            errors = {}
+            try:
+                results = await asyncio.gather(
+                    *(
+                        self._download_range_group(
+                            pool,
+                            [(o, n, buffers[i].get_view(rel, n)) for i, o, n, rel in g],
+                        )
+                        for g in groups
+                    ),
+                    return_exceptions=True,
+                )
+                for group, res in zip(groups, results):
+                    if isinstance(res, BaseException):
+                        for piece in group:
+                            errors.setdefault(piece[0], res)
+            finally:
+                for i, buf in buffers.items():
+                    try:
+                        buf.close()
+                    except Exception as e:
+                        errors.setdefault(i, e)
+            for i, buf in buffers.items():
+                out[i] = errors[i] if i in errors else buf.get_value()
         except BaseException:
             if validate is not None:
                 validate.cancel()
@@ -920,7 +945,18 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
 
         batch_size = batch_size or self.batch_size or asyn._get_batch_size(True)
-        n_zonal = sum(len(idxs) for idxs in zonal.values())
+        # Streams are budgeted by pieces, so one large range can get several.
+        piece = self.MIN_ZONAL_PIECE_BYTES
+        weight = {
+            p: sum(
+                max(1, -(-(ends[i] - starts[i]) // piece))
+                if isinstance(starts[i], int) and isinstance(ends[i], int)
+                else 1
+                for i in idxs
+            )
+            for p, idxs in zonal.items()
+        }
+        n_zonal = sum(weight.values())
         total_streams = max(1, min(batch_size, n_zonal))
 
         results = [None] * len(paths)
@@ -929,9 +965,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             num_streams = max(
                 1,
                 min(
-                    len(idxs),
+                    weight[p],
                     self.MAX_ZONAL_STREAMS_PER_OBJECT,
-                    round(total_streams * len(idxs) / n_zonal),
+                    round(total_streams * weight[p] / n_zonal),
                 ),
             )
             coros.append(
