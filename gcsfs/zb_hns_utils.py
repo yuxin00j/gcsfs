@@ -729,6 +729,7 @@ class MRDPool:
             Exception: Bubbles up any exceptions encountered during MRD creation.
         """
         mrd = None
+        create_new = False
 
         async with self._lock:
             if self._closed:
@@ -736,12 +737,11 @@ class MRDPool:
 
             if self._free_mrds.empty():
                 if self._active_count < self.pool_size:
+                    # Reserve a slot now; the MRD itself is opened below,
+                    # outside the lock, so that concurrent callers can open
+                    # their bidi streams in parallel instead of serially.
                     self._active_count += 1
-                    try:
-                        mrd = await self._get_or_create_mrd()
-                    except BaseException as e:
-                        self._active_count -= 1
-                        raise e
+                    create_new = True
                 elif self._all_mrds:
                     # Pool is full and the queue is empty: share a busy MRD in
                     # round-robin fashion. The MRD now has multiple holders;
@@ -750,7 +750,7 @@ class MRDPool:
                     mrd = self._all_mrds[self._rr_index]
                     self._rr_index = (self._rr_index + 1) % len(self._all_mrds)
 
-            if mrd is None:
+            if mrd is None and not create_new:
                 # If the queue was non-empty, this gets an MRD immediately without blocking.
                 # If the queue was empty (pool is full and sharing is disabled), this blocks
                 # until a holder returns an MRD.
@@ -759,6 +759,15 @@ class MRDPool:
                 # here is still unblocked by a concurrent release (no deadlock).
                 mrd = await self._free_mrds.get()
 
+            if mrd is not None:
+                self._mark_inflight(mrd)
+
+        if create_new:
+            try:
+                mrd = await self._get_or_create_mrd()
+            except BaseException:
+                self._active_count -= 1
+                raise
             self._mark_inflight(mrd)
 
         try:
@@ -885,6 +894,7 @@ class MRDPoolCache:
         pool_size,
         cache_type=None,
         cache_source=None,
+        info=None,
     ):
         """
         Gets an MRDPool for the specified object.
@@ -896,6 +906,8 @@ class MRDPoolCache:
             pool_size (int): Requested pool size.
             cache_type (str, optional): The cache type string.
             cache_source (str, optional): The cache source string.
+            info (dict, optional): Object metadata already known to the
+                caller. When given, the metadata lookup is skipped.
 
         Returns:
             MRDPool: An initialized MRDPool instance.
@@ -906,7 +918,10 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
-        info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
+        if info is None:
+            info = await fs._info(
+                f"{bucket_name}/{object_name}", generation=generation
+            )
         if generation is None:
             generation = info.get("generation")
         key = (bucket_name, object_name, generation, cache_type)

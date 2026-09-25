@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
+import heapq
 import logging
 import os
 import uuid
 import weakref
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from glob import has_magic
@@ -31,7 +33,7 @@ from gcsfs._dircache import HnsDirCacheUpdater
 from gcsfs.concurrency import split_range
 from gcsfs.core import GCSFile, GCSFileSystem, _get_prefetcher_and_cache_config
 from gcsfs.retry import DEFAULT_RETRY_CONFIG, get_storage_control_retry_config
-from gcsfs.zb_hns_utils import DirectMemmoveBuffer, MRDPool
+from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
 from gcsfs.zonal_file import ZonalFile
 
 logger = logging.getLogger("gcsfs")
@@ -88,12 +90,15 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     to the parent class GCSFileSystem for default processing.
     """
 
+    # Upper bound on concurrent MRD bidi streams per object in zonal cat_ranges.
+    MAX_ZONAL_STREAMS_PER_OBJECT = 16
+
     def __init__(
         self,
         *args,
         finalize_on_close=False,
         mrd_pool_cache_size=16,
-        max_mrd_pool_cache_queue_size=8,
+        max_mrd_pool_cache_queue_size=16,
         **kwargs,
     ):
         """
@@ -103,7 +108,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             By default, files in zonal buckets are left unfinalized to allow appends.
         mrd_pool_cache_size : int, default 16
             Maximum number of idle pools to retain in the cache.
-        max_mrd_pool_cache_queue_size : int, default 8
+        max_mrd_pool_cache_queue_size : int, default 16
             Maximum number of idle MRDs per key in the cache.
         **kwargs : dict
             Additional arguments passed to GCSFileSystem.
@@ -124,6 +129,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         # By default, files in zonal buckets are left unfinalized to allow appends.
         self.finalize_on_close = finalize_on_close
         self._grpc_client = None
+        # (bucket, object) -> last metadata seen for a finalized zonal object.
+        self._zonal_info_hints = {}
         self._storage_control_client = None
         # Adds user-passed credentials to ExtendedGcsFileSystem to pass to gRPC/Storage Control clients.
         # We unwrap the nested credentials here because self.credentials is a GCSFS wrapper,
@@ -655,6 +662,283 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             # If we created a temporary pool specifically for this _cat_file call, clean it up
             if pool_created_here:
                 await mrd.close()
+
+    @staticmethod
+    def _split_ranges_across_streams(requests, num_streams):
+        """Partition range requests into at most ``num_streams`` byte-balanced groups.
+
+        Uses longest-processing-time-first assignment so a few large ranges do
+        not end up on the same stream. Each group is returned sorted by offset.
+
+        Args:
+            requests (list[tuple[int, int, int]]): ``(index, offset, length)`` tuples.
+            num_streams (int): Maximum number of groups to produce.
+
+        Returns:
+            list[list[tuple[int, int, int]]]: Non-empty groups of requests.
+        """
+        num_streams = max(1, min(num_streams, len(requests)))
+        if num_streams == 1:
+            return [sorted(requests, key=lambda r: r[1])] if requests else []
+
+        groups = [[] for _ in range(num_streams)]
+        heap = [(0, g) for g in range(num_streams)]
+        for req in sorted(requests, key=lambda r: r[2], reverse=True):
+            load, g = heapq.heappop(heap)
+            groups[g].append(req)
+            heapq.heappush(heap, (load + req[2], g))
+        return [sorted(g, key=lambda r: r[1]) for g in groups if g]
+
+    async def _download_range_group(self, pool, group):
+        """Download a group of ranges on a single MRD from ``pool``.
+
+        All ranges in the group are issued through one ``download_ranges`` call
+        (chunked at ``MRD_MAX_RANGES``), so they are multiplexed over a single
+        bidi-read stream.
+
+        Returns:
+            list[bytes]: One payload per request in ``group``, in the same order.
+        """
+        buffers = [
+            DirectMemmoveBuffer(length, self._memmove_executor)
+            for _, _, length in group
+        ]
+        views = [buf.get_view(0, length) for buf, (_, _, length) in zip(buffers, group)]
+        has_error = False
+        try:
+            async with _get_mrd_from_pool_or_mrd(pool) as mrd:
+                for i in range(0, len(group), MRD_MAX_RANGES):
+                    chunk = range(i, min(i + MRD_MAX_RANGES, len(group)))
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"mrd path: {mrd.object_name} | Requested "
+                            f"{len(chunk)} ranges: "
+                            f"{[(group[k][1], group[k][2]) for k in chunk]}"
+                        )
+                    await mrd.download_ranges(
+                        [(group[k][1], group[k][2], views[k]) for k in chunk]
+                    )
+            for view in views:
+                view.close()
+        except BaseException:
+            has_error = True
+            raise
+        finally:
+            for buf in buffers:
+                try:
+                    buf.close()
+                except Exception:
+                    if not has_error:
+                        raise
+        return [buf.get_value() for buf in buffers]
+
+    async def _cat_ranges_zonal_file(
+        self, path, starts, ends, num_streams, _speculate=True, **kwargs
+    ):
+        """Fetch many ranges of a single zonal object over a shared MRD pool.
+
+        For finalized objects read without an explicit generation, the last
+        metadata seen for the object is reused so the downloads start at once.
+        A metadata lookup runs concurrently, and the result is only returned
+        if it confirms the same generation; otherwise the read is redone.
+
+        Returns:
+            list: One entry per input range: ``bytes`` or the exception raised
+            while fetching it.
+        """
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+        bucket, object_name, generation = self.split_path(path)
+        hint_key = (bucket, object_name)
+        spec_info = None
+        validate = None
+        if _speculate and generation is None:
+            spec_info = self._zonal_info_hints.get(hint_key)
+            if spec_info is not None:
+                validate = asyncio.ensure_future(self._info(path))
+        try:
+            pool = await self._mrd_pool_cache.get(
+                bucket,
+                object_name,
+                generation,
+                pool_size=num_streams,
+                cache_type=cache_type,
+                cache_source=cache_source,
+                info=spec_info,
+            )
+        except BaseException:
+            self._zonal_info_hints.pop(hint_key, None)
+            if validate is None:
+                raise
+            validate.cancel()
+            return await self._cat_ranges_zonal_file(
+                path, starts, ends, num_streams, _speculate=False, **kwargs
+            )
+        try:
+            details = getattr(pool, "details", None)
+            if generation is None and getattr(pool, "finalized", False) and details:
+                self._zonal_info_hints.pop(hint_key, None)
+                self._zonal_info_hints[hint_key] = details
+                if len(self._zonal_info_hints) > 1024:
+                    self._zonal_info_hints.pop(next(iter(self._zonal_info_hints)))
+            file_size = pool.persisted_size
+            if file_size is None:
+                logger.warning(
+                    f"AsyncMultiRangeDownloader (MRD) for {path} has no "
+                    "'persisted_size'. Falling back to _info() to get the file size."
+                )
+                file_size = (await self._info(path))["size"]
+
+            out = [b""] * len(starts)
+            requests = []
+            for i, (start, end) in enumerate(zip(starts, ends)):
+                offset, length = await self._process_limits_to_offset_and_length(
+                    path, start, end, file_size
+                )
+                if length > 0:
+                    requests.append((i, offset, length))
+
+            groups = self._split_ranges_across_streams(requests, num_streams)
+            results = await asyncio.gather(
+                *(self._download_range_group(pool, g) for g in groups),
+                return_exceptions=True,
+            )
+            for group, res in zip(groups, results):
+                if isinstance(res, BaseException):
+                    for i, _, _ in group:
+                        out[i] = res
+                else:
+                    for (i, _, _), data in zip(group, res):
+                        out[i] = data
+        except BaseException:
+            if validate is not None:
+                validate.cancel()
+            raise
+        finally:
+            await pool.close()
+
+        if validate is not None:
+            try:
+                fresh = await validate
+            except BaseException:
+                self._zonal_info_hints.pop(hint_key, None)
+                raise
+            if fresh.get("generation") != spec_info.get(
+                "generation"
+            ) or fresh.get("size") != spec_info.get("size"):
+                self._zonal_info_hints.pop(hint_key, None)
+                return await self._cat_ranges_zonal_file(
+                    path, starts, ends, num_streams, _speculate=False, **kwargs
+                )
+        return out
+
+    async def _cat_ranges(
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        batch_size=None,
+        on_error="return",
+        **kwargs,
+    ):
+        """Get the contents of byte ranges from one or more files.
+
+        For Zonal buckets, ranges are grouped per object and served by a single
+        MRD pool per object. Each object's ranges are split into byte-balanced
+        groups, one per pooled MRD, and every group is sent as one multi-range
+        ``download_ranges`` call. ``batch_size`` bounds the total number of
+        concurrent MRD streams across all objects. Non-zonal paths, and any
+        call with ``max_gap`` set, use the default fsspec implementation.
+        """
+        if max_gap is not None:
+            return await super()._cat_ranges(
+                paths,
+                starts,
+                ends,
+                max_gap=max_gap,
+                batch_size=batch_size,
+                on_error=on_error,
+                **kwargs,
+            )
+        if not isinstance(paths, list):
+            raise TypeError
+        if not isinstance(starts, Iterable):
+            starts = [starts] * len(paths)
+        if not isinstance(ends, Iterable):
+            ends = [ends] * len(paths)
+        starts, ends = list(starts), list(ends)
+        if len(starts) != len(paths) or len(ends) != len(paths):
+            raise ValueError
+
+        by_path = {}
+        for i, p in enumerate(paths):
+            by_path.setdefault(p, []).append(i)
+
+        zonal, other = {}, []
+        for p, idxs in by_path.items():
+            bucket, _, _ = self.split_path(p)
+            if await self._is_zonal_bucket(bucket):
+                zonal[p] = idxs
+            else:
+                other.extend(idxs)
+
+        if not zonal:
+            return await super()._cat_ranges(
+                paths,
+                starts,
+                ends,
+                batch_size=batch_size,
+                on_error=on_error,
+                **kwargs,
+            )
+
+        batch_size = batch_size or self.batch_size or asyn._get_batch_size(True)
+        n_zonal = sum(len(idxs) for idxs in zonal.values())
+        total_streams = max(1, min(batch_size, n_zonal))
+
+        results = [None] * len(paths)
+        coros, owners = [], []
+        for p, idxs in zonal.items():
+            num_streams = max(
+                1,
+                min(
+                    len(idxs),
+                    self.MAX_ZONAL_STREAMS_PER_OBJECT,
+                    round(total_streams * len(idxs) / n_zonal),
+                ),
+            )
+            coros.append(
+                self._cat_ranges_zonal_file(
+                    p,
+                    [starts[i] for i in idxs],
+                    [ends[i] for i in idxs],
+                    num_streams,
+                    **kwargs,
+                )
+            )
+            owners.append(idxs)
+        if other:
+            coros.append(
+                super()._cat_ranges(
+                    [paths[i] for i in other],
+                    [starts[i] for i in other],
+                    [ends[i] for i in other],
+                    batch_size=batch_size,
+                    on_error=on_error,
+                    **kwargs,
+                )
+            )
+            owners.append(other)
+
+        outs = await asyncio.gather(*coros, return_exceptions=True)
+        for idxs, out in zip(owners, outs):
+            if isinstance(out, BaseException):
+                for i in idxs:
+                    results[i] = out
+            else:
+                for i, r in zip(idxs, out):
+                    results[i] = r
+        return results
 
     async def _is_bucket_hns_enabled(self, bucket):
         """Checks if a bucket has Hierarchical Namespace enabled."""
