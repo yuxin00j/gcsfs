@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import collections
 import concurrent.futures
 import contextlib
@@ -76,77 +75,6 @@ async def init_mrd(
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
-
-
-def _info_from_mrd(bucket_name, object_name, mrd):
-    """Construct a GCSFileSystem._process_object-compatible info dict from an open MRD's
-    initial BidiReadObjectResponse metadata, or return None if metadata is not present.
-    """
-    read_obj_str = getattr(mrd, "read_obj_str", None)
-    meta = getattr(read_obj_str, "object_metadata", None)
-    if meta is None or not hasattr(meta, "generation"):
-        return None
-    generation = getattr(meta, "generation", None)
-    if not isinstance(generation, int) or generation <= 0:
-        return None
-
-    key = getattr(meta, "name", None) or object_name
-    size = getattr(meta, "size", None)
-    if not isinstance(size, int):
-        persisted_size = getattr(mrd, "persisted_size", None)
-        size = persisted_size if isinstance(persisted_size, int) else 0
-
-    result = {
-        "Key": f"{bucket_name}/{key}",
-        "Size": size,
-        "name": f"{bucket_name}/{key}",
-        "size": size,
-        "type": "file",
-        "bucket": bucket_name,
-        "generation": str(generation),
-        "storageClass": getattr(meta, "storage_class", None) or "RAPID",
-    }
-    metageneration = getattr(meta, "metageneration", None)
-    if isinstance(metageneration, int) and metageneration > 0:
-        result["metageneration"] = str(metageneration)
-    etag = getattr(meta, "etag", None)
-    if isinstance(etag, str) and etag:
-        result["etag"] = etag
-    content_type = getattr(meta, "content_type", None)
-    if isinstance(content_type, str) and content_type:
-        result["contentType"] = content_type
-    create_time = getattr(meta, "create_time", None)
-    if create_time:
-        result["ctime"] = create_time
-        if hasattr(create_time, "isoformat"):
-            result["timeCreated"] = create_time.isoformat().replace("+00:00", "Z")
-    update_time = getattr(meta, "update_time", None)
-    if update_time:
-        result["mtime"] = update_time
-        if hasattr(update_time, "isoformat"):
-            result["updated"] = update_time.isoformat().replace("+00:00", "Z")
-    finalize_time = getattr(meta, "finalize_time", None)
-    if finalize_time:
-        if hasattr(finalize_time, "isoformat"):
-            result["timeFinalized"] = finalize_time.isoformat().replace("+00:00", "Z")
-        else:
-            result["timeFinalized"] = str(finalize_time)
-    checksums = getattr(meta, "checksums", None)
-    crc32c = getattr(checksums, "crc32c", None) if checksums is not None else None
-    if isinstance(crc32c, int) and crc32c > 0:
-        result["crc32c"] = base64.b64encode(crc32c.to_bytes(4, "big")).decode("ascii")
-    md5_hash = getattr(checksums, "md5_hash", None) if checksums is not None else None
-    if isinstance(md5_hash, (bytes, bytearray)) and md5_hash:
-        result["md5Hash"] = base64.b64encode(bytes(md5_hash)).decode("ascii")
-    custom_metadata = getattr(meta, "metadata", None)
-    if custom_metadata:
-        try:
-            md_dict = dict(custom_metadata)
-            if md_dict:
-                result["metadata"] = md_dict
-        except (TypeError, ValueError):
-            pass
-    return result
 
 
 async def download_range(offset, length, mrd):
@@ -907,8 +835,6 @@ class MRDPoolCache:
         self._mrd_queues = {}
         self._refcounts = {}
         self._evictable_keys = collections.OrderedDict()
-        self._pool_info = {}
-        self._latest_generation = {}
         self._closed = False
 
     def get_idle_mrd(self, key):
@@ -930,17 +856,6 @@ class MRDPoolCache:
         self._refcounts[key] = self._refcounts.get(key, 0) + 1
         self._evictable_keys.pop(key, None)
 
-    def _evict_pool_info(self, evict_key):
-        b_name, o_name, gen, _ = evict_key
-        has_other = any(
-            k[0] == b_name and k[1] == o_name and k[2] == gen
-            for k in (*self._mrd_queues.keys(), *self._refcounts.keys())
-        )
-        if not has_other:
-            self._pool_info.pop((b_name, o_name, gen), None)
-            if self._latest_generation.get((b_name, o_name)) == gen:
-                self._latest_generation.pop((b_name, o_name), None)
-
     def _decref(self, key):
         """Release one reference on `key`. When the last reference goes,
         mark the key evictable and run LRU eviction. Returns MRDs whose
@@ -960,7 +875,6 @@ class MRDPoolCache:
         while len(self._evictable_keys) > self._max_idle_pools:
             evict_key, _ = self._evictable_keys.popitem(last=False)
             mrds_to_close.extend(_drain_queue(self._mrd_queues.pop(evict_key, None)))
-            self._evict_pool_info(evict_key)
         return mrds_to_close
 
     async def get(
@@ -992,145 +906,41 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
-        resolved_gen = generation
-        if resolved_gen is None:
-            resolved_gen = self._latest_generation.get((bucket_name, object_name))
+        info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
+        if generation is None:
+            generation = info.get("generation")
+        key = (bucket_name, object_name, generation, cache_type)
+        finalized = info.get("timeFinalized") is not None
 
-        info = None
-        if resolved_gen is not None:
-            info = self._pool_info.get((bucket_name, object_name, resolved_gen))
-
-        if info is not None and info.get("timeFinalized") is not None:
-            generation = resolved_gen
-            key = (bucket_name, object_name, generation, cache_type)
-            self._incref(key)
-            mrd_pool = MRDPool(
-                fs,
-                bucket_name,
-                object_name,
-                generation,
-                True,
-                pool_size,
-                cache=self,
-                cache_type=cache_type,
-                cache_source=cache_source,
-            )
-            mrd_pool.details = info
-            try:
-                await mrd_pool.initialize()
-            except BaseException:
-                await mrd_pool.close()
-                mrds_to_close = []
-                if key not in self._refcounts:
-                    self._evictable_keys.pop(key, None)
-                    mrds_to_close = _drain_queue(self._mrd_queues.pop(key, None))
-                    self._evict_pool_info(key)
-                await _close_mrds(mrds_to_close, raise_exception=False)
-                raise
-            return mrd_pool
-
+        self._incref(key)
         mrd_pool = MRDPool(
             fs,
             bucket_name,
             object_name,
             generation,
-            False,
+            finalized,
             pool_size,
             cache=self,
             cache_type=cache_type,
             cache_source=cache_source,
         )
+        if info is not None:
+            mrd_pool.details = info
+
         try:
             await mrd_pool.initialize()
         except BaseException:
-            mrd_pool._cache = None
+            # Init failed. `mrd_pool.close()` donates any partial MRDs back
+            # via release() and drops the refcount we just took. If that was
+            # the last reference, purge the key entirely.
             await mrd_pool.close()
+            mrds_to_close = []
+            if key not in self._refcounts:
+                self._evictable_keys.pop(key, None)
+                mrds_to_close = _drain_queue(self._mrd_queues.pop(key, None))
+            await _close_mrds(mrds_to_close, raise_exception=False)
             raise
 
-        first_mrd = mrd_pool._all_mrds[0] if mrd_pool._all_mrds else None
-        mrd_info = (
-            _info_from_mrd(bucket_name, object_name, first_mrd)
-            if first_mrd is not None
-            else None
-        )
-
-        if mrd_info is not None:
-            info = mrd_info
-            if generation is None:
-                generation = info.get("generation")
-            finalized = info.get("timeFinalized") is not None
-            key = (bucket_name, object_name, generation, cache_type)
-            mrd_pool.generation = generation
-            mrd_pool.finalized = finalized
-            mrd_pool._key = key
-            mrd_pool.details = info
-            self._incref(key)
-            if finalized:
-                self._pool_info[(bucket_name, object_name, generation)] = info
-                self._latest_generation[(bucket_name, object_name)] = generation
-            else:
-                self._pool_info.pop((bucket_name, object_name, generation), None)
-                if self._latest_generation.get((bucket_name, object_name)) == generation:
-                    self._latest_generation.pop((bucket_name, object_name), None)
-            return mrd_pool
-
-        try:
-            info = await fs._info(
-                f"{bucket_name}/{object_name}", generation=generation
-            )
-        except BaseException:
-            mrd_pool._cache = None
-            await mrd_pool.close()
-            raise
-
-        if generation is None:
-            generation = info.get("generation")
-        key = (bucket_name, object_name, generation, cache_type)
-        finalized = info.get("timeFinalized") is not None
-        if finalized:
-            self._pool_info[(bucket_name, object_name, generation)] = info
-            self._latest_generation[(bucket_name, object_name)] = generation
-        else:
-            self._pool_info.pop((bucket_name, object_name, generation), None)
-            if self._latest_generation.get((bucket_name, object_name)) == generation:
-                self._latest_generation.pop((bucket_name, object_name), None)
-
-        if finalized and self._mrd_queues.get(key):
-            mrd_pool._cache = None
-            await mrd_pool.close()
-            self._incref(key)
-            mrd_pool = MRDPool(
-                fs,
-                bucket_name,
-                object_name,
-                generation,
-                finalized,
-                pool_size,
-                cache=self,
-                cache_type=cache_type,
-                cache_source=cache_source,
-            )
-            if info is not None:
-                mrd_pool.details = info
-            try:
-                await mrd_pool.initialize()
-            except BaseException:
-                await mrd_pool.close()
-                mrds_to_close = []
-                if key not in self._refcounts:
-                    self._evictable_keys.pop(key, None)
-                    mrds_to_close = _drain_queue(self._mrd_queues.pop(key, None))
-                    self._evict_pool_info(key)
-                await _close_mrds(mrds_to_close, raise_exception=False)
-                raise
-            return mrd_pool
-
-        mrd_pool.generation = generation
-        mrd_pool.finalized = finalized
-        mrd_pool._key = key
-        if info is not None:
-            mrd_pool.details = info
-        self._incref(key)
         return mrd_pool
 
     async def release(self, key, mrds):
@@ -1167,7 +977,5 @@ class MRDPoolCache:
         self._mrd_queues.clear()
         self._refcounts.clear()
         self._evictable_keys.clear()
-        self._pool_info.clear()
-        self._latest_generation.clear()
         self._closed = True
         await _close_mrds(mrds_to_close, raise_exception=True)
