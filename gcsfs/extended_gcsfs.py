@@ -70,6 +70,19 @@ def _patch_async_grpc_client_reconnect():
         client_options=None,
         attempt_direct_path=True,
     ):
+        if (
+            attempt_direct_path
+            and not getattr(client_options, "api_endpoint", None)
+            and not getattr(zb_hns_utils, "_forcing_c2p_discovery", False)
+        ):
+            eps = zb_hns_utils._read_shm_dp_endpoints(None)
+            if eps:
+                return zb_hns_utils._create_direct_alts_storage_client(
+                    credentials=credentials,
+                    client_info=client_info,
+                    client_options=client_options,
+                    endpoints=eps,
+                )
         transport_cls = storage_v2.StorageAsyncClient.get_transport_class(
             "grpc_asyncio"
         )
@@ -314,6 +327,17 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _get_grpc_client(self):
         if self._grpc_client is None:
+            if (
+                self.credential is not None
+                and self.credential.__class__.__name__ == "Credentials"
+                and "compute_engine"
+                in getattr(self.credential.__class__, "__module__", "")
+                and not getattr(self.credential, "valid", True)
+            ):
+                try:
+                    self.credentials.maybe_refresh()
+                except Exception:
+                    pass
             client_options = ClientOptions(quota_project_id=self._user_project)
             if self._location:
                 # client_options expects only the host:port, without any protocol or path components.
