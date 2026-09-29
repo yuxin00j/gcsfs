@@ -11,6 +11,7 @@ from enum import Enum
 from glob import has_magic
 
 os.environ.setdefault("GRPC_ALTS_MAX_CONCURRENT_HANDSHAKES", "1")
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
 
 try:
     import fcntl
@@ -70,19 +71,12 @@ def _patch_async_grpc_client_reconnect():
         client_options=None,
         attempt_direct_path=True,
     ):
-        if (
-            attempt_direct_path
-            and not getattr(client_options, "api_endpoint", None)
-            and not getattr(zb_hns_utils, "_forcing_c2p_discovery", False)
-        ):
-            eps = zb_hns_utils._read_shm_dp_endpoints(None)
-            if eps:
-                return zb_hns_utils._create_direct_alts_storage_client(
-                    credentials=credentials,
-                    client_info=client_info,
-                    client_options=client_options,
-                    endpoints=eps,
-                )
+        self._gcsfs_init_args = (
+            credentials,
+            client_info,
+            client_options,
+            attempt_direct_path,
+        )
         transport_cls = storage_v2.StorageAsyncClient.get_transport_class(
             "grpc_asyncio"
         )
