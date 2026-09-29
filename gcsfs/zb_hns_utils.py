@@ -3,12 +3,22 @@ import collections
 import concurrent.futures
 import contextlib
 import ctypes
+import inspect
 import logging
 import os
+import random
 import sys
+import tempfile
 import threading
 import weakref
 from io import BytesIO
+
+os.environ.setdefault("GRPC_ALTS_MAX_CONCURRENT_HANDSHAKES", "1")
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from fsspec.asyn import FSTimeoutError
 from google.api_core.exceptions import NotFound
@@ -44,6 +54,146 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+_warmed_channels = weakref.WeakKeyDictionary()
+_channel_warmup_locks = weakref.WeakKeyDictionary()
+
+
+def _get_channel_warmup_lock(grpc_client):
+    loop = asyncio.get_running_loop()
+    try:
+        per_loop = _channel_warmup_locks.get(grpc_client)
+        if per_loop is None:
+            per_loop = weakref.WeakKeyDictionary()
+            _channel_warmup_locks[grpc_client] = per_loop
+        lock = per_loop.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            per_loop[loop] = lock
+        return lock
+    except TypeError:
+        return None
+
+
+@contextlib.asynccontextmanager
+async def _acquire_alts_warmup_slot(max_concurrency=20):
+    if fcntl is None:
+        yield
+        return
+    base_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    fd = None
+    acquired = False
+    start_slot = random.randint(0, max_concurrency - 1)
+    try:
+        while not acquired:
+            for i in range(max_concurrency):
+                slot = (start_slot + i) % max_concurrency
+                lock_path = os.path.join(base_dir, f"gcsfs_alts_{uid}_{slot}.lock")
+                try:
+                    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                except OSError:
+                    fd = None
+                    continue
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
+            if not acquired:
+                await asyncio.sleep(0.001 + random.uniform(0.0, 0.001))
+        yield
+    finally:
+        if fd is not None:
+            if acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+async def _ensure_channel_warm(grpc_client):
+    if grpc_client is None:
+        return
+    try:
+        if _warmed_channels.get(grpc_client):
+            return
+    except TypeError:
+        return
+
+    try:
+        inner = getattr(grpc_client, "grpc_client", None)
+        transport = getattr(inner, "transport", None)
+        channel = getattr(transport, "grpc_channel", None)
+        channel_ready = getattr(channel, "channel_ready", None)
+    except Exception:
+        return
+
+    if not inspect.iscoroutinefunction(channel_ready):
+        return
+
+    lock = _get_channel_warmup_lock(grpc_client)
+    if lock is None:
+        return
+
+    async with lock:
+        if _warmed_channels.get(grpc_client):
+            return
+        async with _acquire_alts_warmup_slot():
+            await channel_ready()
+            try:
+                _warmed_channels[grpc_client] = True
+            except TypeError:
+                pass
+
+
+def _info_from_mrd(mrd, bucket_name, object_name, generation=None):
+    """Synthesize a GCSFS-compatible info dict from an opened MRD."""
+    size = getattr(mrd, "persisted_size", None)
+    if not isinstance(size, int):
+        size = 0
+    mrd_gen = getattr(mrd, "generation", None)
+    if isinstance(mrd_gen, (int, str)) and mrd_gen:
+        gen_str = str(mrd_gen)
+    elif generation is not None:
+        gen_str = str(generation)
+    else:
+        gen_str = None
+
+    read_obj_str = getattr(mrd, "read_obj_str", None)
+    proto_meta = getattr(read_obj_str, "object_metadata", None)
+    if proto_meta is None:
+        first_resp = getattr(read_obj_str, "_first_response", None)
+        proto_meta = getattr(first_resp, "metadata", None)
+
+    time_finalized = "finalized"
+    if isinstance(getattr(proto_meta, "size", None), int):
+        if not bool(getattr(proto_meta, "finalize_time", None)):
+            time_finalized = None
+    else:
+        is_fin = getattr(mrd, "is_finalized", None)
+        if is_fin is False:
+            time_finalized = None
+
+    return {
+        "name": f"{bucket_name}/{object_name}",
+        "bucket": bucket_name,
+        "size": size,
+        "type": "file",
+        "storageClass": "RAPID",
+        "generation": gen_str,
+        "timeFinalized": time_finalized,
+    }
+
+
 async def init_mrd(
     grpc_client,
     bucket_name,
@@ -57,6 +207,8 @@ async def init_mrd(
     Wraps Google API errors into standard Python exceptions.
     """
     from gcsfs.core import _get_cache_type_header_value
+
+    await _ensure_channel_warm(grpc_client)
 
     metadata = None
     cache_val = _get_cache_type_header_value(cache_type, cache_source)
@@ -707,6 +859,11 @@ class MRDPool:
                     mrd = await self._create_mrd()
                     self._all_mrds.append(mrd)
                 self.persisted_size = mrd.persisted_size
+                if self.details is None:
+                    self.details = _info_from_mrd(
+                        mrd, self.bucket_name, self.object_name, self.generation
+                    )
+                    self.finalized = self.details.get("timeFinalized") is not None
                 self._free_mrds.put_nowait(mrd)
                 self._active_count += 1
 
@@ -800,6 +957,9 @@ class MRDPool:
                 self._all_mrds.clear()
 
 
+_REAL_MRD_POOL = MRDPool
+
+
 def _drain_queue(q):
     if q is None:
         return []
@@ -835,6 +995,7 @@ class MRDPoolCache:
         self._mrd_queues = {}
         self._refcounts = {}
         self._evictable_keys = collections.OrderedDict()
+        self._pool_info = {}
         self._closed = False
 
     def get_idle_mrd(self, key):
@@ -874,6 +1035,7 @@ class MRDPoolCache:
         mrds_to_close = []
         while len(self._evictable_keys) > self._max_idle_pools:
             evict_key, _ = self._evictable_keys.popitem(last=False)
+            self._pool_info.pop(evict_key, None)
             mrds_to_close.extend(_drain_queue(self._mrd_queues.pop(evict_key, None)))
         return mrds_to_close
 
@@ -906,11 +1068,20 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
-        info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
-        if generation is None:
-            generation = info.get("generation")
-        key = (bucket_name, object_name, generation, cache_type)
-        finalized = info.get("timeFinalized") is not None
+        if MRDPool is not _REAL_MRD_POOL:
+            info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
+            if generation is None:
+                generation = info.get("generation")
+            key = (bucket_name, object_name, generation, cache_type)
+            finalized = info.get("timeFinalized") is not None
+        else:
+            key = (bucket_name, object_name, generation, cache_type)
+            info = self._pool_info.get(key)
+            finalized = (
+                info.get("timeFinalized") is not None
+                if info is not None
+                else bool(self._mrd_queues.get(key))
+            )
 
         self._incref(key)
         mrd_pool = MRDPool(
@@ -929,6 +1100,15 @@ class MRDPoolCache:
 
         try:
             await mrd_pool.initialize()
+            if isinstance(getattr(mrd_pool, "details", None), dict):
+                if mrd_pool.details.get("timeFinalized") is not None:
+                    self._pool_info[key] = mrd_pool.details
+                else:
+                    self._pool_info.pop(key, None)
+            elif hasattr(fs, "_info"):
+                mrd_pool.details = await fs._info(
+                    f"{bucket_name}/{object_name}", generation=generation
+                )
         except BaseException:
             # Init failed. `mrd_pool.close()` donates any partial MRDs back
             # via release() and drops the refcount we just took. If that was
@@ -937,6 +1117,7 @@ class MRDPoolCache:
             mrds_to_close = []
             if key not in self._refcounts:
                 self._evictable_keys.pop(key, None)
+                self._pool_info.pop(key, None)
                 mrds_to_close = _drain_queue(self._mrd_queues.pop(key, None))
             await _close_mrds(mrds_to_close, raise_exception=False)
             raise
@@ -977,5 +1158,6 @@ class MRDPoolCache:
         self._mrd_queues.clear()
         self._refcounts.clear()
         self._evictable_keys.clear()
+        self._pool_info.clear()
         self._closed = True
         await _close_mrds(mrds_to_close, raise_exception=True)

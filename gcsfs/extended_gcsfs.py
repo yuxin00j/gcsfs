@@ -1,12 +1,21 @@
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import tempfile
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from glob import has_magic
+
+os.environ.setdefault("GRPC_ALTS_MAX_CONCURRENT_HANDSHAKES", "1")
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 import aiohttp
 import fsspec
@@ -39,12 +48,110 @@ logger = logging.getLogger("gcsfs")
 USER_AGENT = "python-gcsfs"
 STORAGE_CONTROL_RPC_TIMEOUT = 30.0
 
+_FAST_RECONNECT_OPTIONS = (
+    ("grpc.initial_reconnect_backoff_ms", 100),
+    ("grpc.min_reconnect_backoff_ms", 100),
+    ("grpc.max_reconnect_backoff_ms", 500),
+)
+
+
+def _patch_async_grpc_client_reconnect():
+    if getattr(AsyncGrpcClient, "_gcsfs_fast_reconnect_patched", False):
+        return
+    try:
+        from google.cloud import _storage_v2 as storage_v2
+    except ImportError:
+        return
+
+    def _create_async_grpc_client(
+        self,
+        credentials=None,
+        client_info=None,
+        client_options=None,
+        attempt_direct_path=True,
+    ):
+        transport_cls = storage_v2.StorageAsyncClient.get_transport_class(
+            "grpc_asyncio"
+        )
+        primary_user_agent = client_info.to_user_agent()
+        options = (
+            ("grpc.primary_user_agent", primary_user_agent),
+            *_FAST_RECONNECT_OPTIONS,
+        )
+        channel = transport_cls.create_channel(
+            attempt_direct_path=attempt_direct_path,
+            credentials=credentials,
+            options=options,
+        )
+        transport = transport_cls(channel=channel)
+        return storage_v2.StorageAsyncClient(
+            transport=transport,
+            client_info=client_info,
+            client_options=client_options,
+        )
+
+    AsyncGrpcClient._create_async_grpc_client = _create_async_grpc_client
+    AsyncGrpcClient._gcsfs_fast_reconnect_patched = True
+
+
+_patch_async_grpc_client_reconnect()
+
 
 class BucketType(Enum):
     ZONAL_HIERARCHICAL = "ZONAL_HIERARCHICAL"
     HIERARCHICAL = "HIERARCHICAL"
     NON_HIERARCHICAL = "NON_HIERARCHICAL"
     UNKNOWN = "UNKNOWN"
+
+
+def _shm_bucket_cache_paths():
+    base_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return (
+        os.path.join(base_dir, f"gcsfs_bucket_types_{uid}.json"),
+        os.path.join(base_dir, f"gcsfs_layout_{uid}.lock"),
+    )
+
+
+def _read_shm_bucket_type(bucket):
+    cache_path, _ = _shm_bucket_cache_paths()
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        val = data.get(bucket)
+        if val and val in BucketType.__members__:
+            return BucketType[val]
+    except Exception:
+        pass
+    return None
+
+
+def _write_shm_bucket_type(bucket, bucket_type):
+    cache_path, _ = _shm_bucket_cache_paths()
+    base_dir = os.path.dirname(cache_path)
+    try:
+        data = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data[bucket] = bucket_type.name
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="gcsfs_bt_", suffix=".tmp", dir=base_dir
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 gcs_file_types = {
@@ -136,6 +243,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         if self.credentials.token == "anon":
             self.credential = AnonymousCredentials()
         self._storage_layout_cache = {}
+        self._layout_locks = weakref.WeakKeyDictionary()
         self._memmove_executor = ThreadPoolExecutor(
             max_workers=kwargs.get("memmove_max_workers", 8)
         )
@@ -230,7 +338,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
             channel_kwargs = {
                 "credentials": self.credential,
-                "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
+                "options": [
+                    ("grpc.primary_user_agent", f"{USER_AGENT}/{version}"),
+                    *_FAST_RECONNECT_OPTIONS,
+                ],
                 "quota_project_id": self._user_project,
             }
             if self._location:
@@ -272,17 +383,94 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 logger.warning(f"Failed to close grpc_client: {e}")
             self._grpc_client = None
 
+    def _get_layout_lock(self):
+        loop = asyncio.get_running_loop()
+        lock = self._layout_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._layout_locks[loop] = lock
+        return lock
+
+    def _can_use_shm_layout_cache(self):
+        if fcntl is None or isinstance(self.credential, AnonymousCredentials):
+            return False
+        if (
+            "_get_bucket_type" in self.__dict__
+            or "_get_control_plane_client" in self.__dict__
+        ):
+            return False
+        cls_fn = getattr(
+            type(self)._get_bucket_type, "__func__", type(self)._get_bucket_type
+        )
+        orig_fn = getattr(
+            ExtendedGcsFileSystem._ORIG_GET_BUCKET_TYPE,
+            "__func__",
+            ExtendedGcsFileSystem._ORIG_GET_BUCKET_TYPE,
+        )
+        return cls_fn is orig_fn
+
     async def _lookup_bucket_type(self, bucket):
         if bucket in self._storage_layout_cache:
             return self._storage_layout_cache[bucket]
-        bucket_type = await self._get_bucket_type(bucket)
-        # Don't cache UNKNOWN type.
-        # This ensures that subsequent operations will retry the lookup,
-        # allowing it to recover when the transient error resolves.
-        if bucket_type == BucketType.UNKNOWN:
-            return bucket_type
-        self._storage_layout_cache[bucket] = bucket_type
-        return self._storage_layout_cache[bucket]
+
+        async with self._get_layout_lock():
+            if bucket in self._storage_layout_cache:
+                return self._storage_layout_cache[bucket]
+
+            use_shm = self._can_use_shm_layout_cache()
+            if use_shm:
+                cached = _read_shm_bucket_type(bucket)
+                if cached is not None:
+                    self._storage_layout_cache[bucket] = cached
+                    return cached
+
+                _, lock_path = _shm_bucket_cache_paths()
+                lock_fd = None
+                acquired = False
+                try:
+                    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    while True:
+                        cached = _read_shm_bucket_type(bucket)
+                        if cached is not None:
+                            self._storage_layout_cache[bucket] = cached
+                            return cached
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            acquired = True
+                            break
+                        except (BlockingIOError, OSError):
+                            await asyncio.sleep(0.002)
+
+                    cached = _read_shm_bucket_type(bucket)
+                    if cached is not None:
+                        self._storage_layout_cache[bucket] = cached
+                        return cached
+
+                    bucket_type = await self._get_bucket_type(bucket)
+                    if bucket_type != BucketType.UNKNOWN:
+                        self._storage_layout_cache[bucket] = bucket_type
+                        _write_shm_bucket_type(bucket, bucket_type)
+                    return bucket_type
+                finally:
+                    if lock_fd is not None:
+                        if acquired:
+                            try:
+                                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                            except OSError:
+                                pass
+                        try:
+                            os.close(lock_fd)
+                        except OSError:
+                            pass
+
+            bucket_type = await self._get_bucket_type(bucket)
+            # Don't cache UNKNOWN type.
+            # This ensures that subsequent operations will retry the lookup,
+            # allowing it to recover when the transient error resolves.
+            if bucket_type == BucketType.UNKNOWN:
+                return bucket_type
+            self._storage_layout_cache[bucket] = bucket_type
+            return self._storage_layout_cache[bucket]
 
     _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
 
@@ -317,6 +505,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
             # Default to UNKNOWN in case bucket type is not obtained
             return BucketType.UNKNOWN
+
+    _ORIG_GET_BUCKET_TYPE = _get_bucket_type
 
     def _open(
         self,

@@ -1,6 +1,8 @@
 import logging
 import os
 
+os.environ.setdefault("GRPC_ALTS_MAX_CONCURRENT_HANDSHAKES", "1")
+
 try:
     from ._version import __version__  # noqa: F401
 except ImportError:
