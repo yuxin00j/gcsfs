@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -70,19 +71,6 @@ def _patch_async_grpc_client_reconnect():
         client_options=None,
         attempt_direct_path=True,
     ):
-        if (
-            attempt_direct_path
-            and not getattr(client_options, "api_endpoint", None)
-            and not getattr(zb_hns_utils, "_forcing_c2p_discovery", False)
-        ):
-            eps = zb_hns_utils._read_shm_dp_endpoints(None)
-            if eps:
-                return zb_hns_utils._create_direct_alts_storage_client(
-                    credentials=credentials,
-                    client_info=client_info,
-                    client_options=client_options,
-                    endpoints=eps,
-                )
         transport_cls = storage_v2.StorageAsyncClient.get_transport_class(
             "grpc_asyncio"
         )
@@ -132,14 +120,32 @@ def _read_shm_bucket_type(bucket):
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         val = data.get(bucket)
-        if val and val in BucketType.__members__:
+        if isinstance(val, str) and val in BucketType.__members__:
             return BucketType[val]
     except Exception:
         pass
     return None
 
 
-def _write_shm_bucket_type(bucket, bucket_type):
+def _read_shm_zonal_info():
+    cache_path, _ = _shm_bucket_cache_paths()
+    bucket_types = {}
+    zonal_samples = {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if k.startswith("_samples_"):
+                if isinstance(v, list) and v:
+                    zonal_samples[k[9:]] = v
+            elif isinstance(v, str) and v in BucketType.__members__:
+                bucket_types[k] = BucketType[v]
+    except Exception:
+        pass
+    return bucket_types, zonal_samples
+
+
+def _write_shm_bucket_type(bucket, bucket_type, sample_keys=None):
     cache_path, _ = _shm_bucket_cache_paths()
     base_dir = os.path.dirname(cache_path)
     try:
@@ -150,7 +156,10 @@ def _write_shm_bucket_type(bucket, bucket_type):
                     data = json.load(f)
             except Exception:
                 data = {}
-        data[bucket] = bucket_type.name
+        if bucket_type is not None:
+            data[bucket] = bucket_type.name
+        if sample_keys:
+            data[f"_samples_{bucket}"] = sample_keys
         fd, tmp_path = tempfile.mkstemp(
             prefix="gcsfs_bt_", suffix=".tmp", dir=base_dir
         )
@@ -272,6 +281,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self.loop,
             self._mrd_pool_cache,
         )
+        if not self.asynchronous and self._is_real_gce_env():
+            self._maybe_prewarm_zonal_grpc_sync()
 
     async def _get_threshold_for_disk_reads(self, bucket):
         if await self._is_zonal_bucket(bucket):
@@ -432,6 +443,144 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             ExtendedGcsFileSystem._ORIG_GET_BUCKET_TYPE,
         )
         return cls_fn is orig_fn
+
+    def _is_real_gce_env(self):
+        if not self._can_use_shm_layout_cache():
+            return False
+        cred = getattr(self, "credential", None)
+        if (
+            cred is None
+            or cred.__class__.__name__ != "Credentials"
+            or "compute_engine" not in getattr(cred.__class__, "__module__", "")
+        ):
+            return False
+        if (
+            hasattr(self._get_control_plane_client, "_mock_name")
+            or hasattr(self._get_grpc_client, "_mock_name")
+            or hasattr(storage_control_v2.StorageControlAsyncClient, "_mock_name")
+            or hasattr(
+                getattr(
+                    storage_control_v2.StorageControlAsyncClient,
+                    "get_transport_class",
+                    None,
+                ),
+                "_mock_name",
+            )
+            or hasattr(AsyncGrpcClient, "_mock_name")
+            or hasattr(AsyncMultiRangeDownloader.create_mrd, "_mock_name")
+            or hasattr(zb_hns_utils.init_mrd, "_mock_name")
+        ):
+            return False
+        try:
+            from gcsfs.credentials import _shm_gce_creds_paths
+
+            token_path, _ = _shm_gce_creds_paths()
+            return os.path.exists(token_path)
+        except Exception:
+            return False
+
+    def _record_shm_zonal_samples(self, bucket, items):
+        try:
+            keys = []
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") == "directory":
+                    continue
+                raw_name = item.get("name") or item.get("Key") or ""
+                if not raw_name or raw_name.endswith("/"):
+                    continue
+                _, key, _ = self.split_path(raw_name)
+                if key and not key.endswith("/"):
+                    keys.append(key)
+            if keys:
+                step = max(1, len(keys) // 32)
+                sample_keys = keys[::step][:32]
+                _write_shm_bucket_type(
+                    bucket, BucketType.ZONAL_HIERARCHICAL, sample_keys=sample_keys
+                )
+        except Exception:
+            pass
+
+    def _maybe_prewarm_zonal_grpc_sync(self):
+        try:
+            bucket_types, zonal_samples = _read_shm_zonal_info()
+            zonal_bucket = None
+            for b, btype in bucket_types.items():
+                self._storage_layout_cache[b] = btype
+                if btype == BucketType.ZONAL_HIERARCHICAL and zonal_bucket is None:
+                    zonal_bucket = b
+            if zonal_bucket is not None:
+                sample_keys = zonal_samples.get(zonal_bucket, [])
+                asyn.sync(
+                    self.loop,
+                    self._prewarm_zonal_grpc,
+                    zonal_bucket,
+                    sample_keys,
+                    timeout=20.0,
+                )
+        except Exception:
+            pass
+
+    async def _prewarm_zonal_grpc(self, zonal_bucket, sample_keys):
+        base_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        active_lock_path = os.path.join(base_dir, f"gcsfs_active_warm_{uid}.lock")
+        active_fd = None
+        holding_sh = False
+        try:
+            if fcntl is not None:
+                try:
+                    active_fd = os.open(
+                        active_lock_path, os.O_CREAT | os.O_RDWR, 0o600
+                    )
+                    fcntl.flock(active_fd, fcntl.LOCK_SH)
+                    holding_sh = True
+                except OSError:
+                    if active_fd is not None:
+                        try:
+                            os.close(active_fd)
+                        except OSError:
+                            pass
+                        active_fd = None
+
+            for attempt in range(3):
+                grpc_client = await self._get_grpc_client()
+                ok = await zb_hns_utils._prewarm_grpc_channel_and_rls(
+                    grpc_client,
+                    zonal_bucket,
+                    sample_keys,
+                    timeout_ready=0.70 if attempt == 0 else 1.50,
+                    timeout_mrd=0.85 if attempt == 0 else 1.50,
+                )
+                if ok:
+                    break
+                self._grpc_client = None
+
+            if active_fd is not None and holding_sh:
+                try:
+                    fcntl.flock(active_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                holding_sh = False
+
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        fcntl.flock(active_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(active_fd, fcntl.LOCK_UN)
+                        break
+                    except (BlockingIOError, OSError):
+                        await asyncio.sleep(0.005)
+        finally:
+            if active_fd is not None:
+                if holding_sh:
+                    try:
+                        fcntl.flock(active_fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                try:
+                    os.close(active_fd)
+                except OSError:
+                    pass
 
     async def _lookup_bucket_type(self, bucket):
         if bucket in self._storage_layout_cache:
@@ -977,7 +1126,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _list_objects(self, path, prefix="", versions=False, **kwargs):
         try:
-            return await super()._list_objects(
+            items = await super()._list_objects(
                 path, prefix=prefix, versions=versions, **kwargs
             )
         except FileNotFoundError:
@@ -989,6 +1138,16 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 except (FileNotFoundError, Exception):
                     pass
             raise
+        if items and self._is_real_gce_env():
+            try:
+                bucket, _, _ = self.split_path(path)
+                if bucket:
+                    btype = await self._lookup_bucket_type(bucket)
+                    if btype == BucketType.ZONAL_HIERARCHICAL:
+                        self._record_shm_zonal_samples(bucket, items)
+            except Exception:
+                pass
+        return items
 
     async def _mkdir(
         self,

@@ -90,157 +90,6 @@ except Exception:
 
 _warmed_channels = weakref.WeakKeyDictionary()
 _channel_warmup_locks = weakref.WeakKeyDictionary()
-_forcing_c2p_discovery = False
-
-
-def _can_discover_dp_endpoints(gcsfs):
-    if (
-        fcntl is None
-        or not os.path.isdir("/proc/self/fd")
-        or not os.path.exists("/proc/net/tcp6")
-    ):
-        return False
-    if getattr(gcsfs, "_location", None):
-        return False
-    if (
-        hasattr(getattr(gcsfs, "_get_grpc_client", None), "_mock_name")
-        or hasattr(init_mrd, "_mock_name")
-        or hasattr(AsyncMultiRangeDownloader.create_mrd, "_mock_name")
-    ):
-        return False
-    cred = getattr(gcsfs, "credential", None)
-    if (
-        cred is None
-        or cred.__class__.__name__ != "Credentials"
-        or "compute_engine" not in getattr(cred.__class__, "__module__", "")
-    ):
-        return False
-    return True
-
-
-def _shm_dp_endpoints_paths():
-    base_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    return (
-        os.path.join(base_dir, f"gcsfs_dp_endpoints_{uid}.json"),
-        os.path.join(base_dir, f"gcsfs_dp_disc_{uid}.lock"),
-    )
-
-
-def _read_shm_dp_endpoints(bucket_name=None):
-    cache_path, _ = _shm_dp_endpoints_paths()
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if bucket_name and bucket_name in data and data[bucket_name]:
-            return data[bucket_name]
-        if "*" in data and data["*"]:
-            return data["*"]
-    except Exception:
-        pass
-    return None
-
-
-def _write_shm_dp_endpoints(bucket_name, endpoints):
-    if not endpoints:
-        return
-    cache_path, _ = _shm_dp_endpoints_paths()
-    base_dir = os.path.dirname(cache_path)
-    try:
-        data = {}
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        if bucket_name:
-            data[bucket_name] = endpoints
-        data["*"] = endpoints
-        fd, tmp_path = tempfile.mkstemp(
-            prefix="gcsfs_dp_", suffix=".tmp", dir=base_dir
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, cache_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    except Exception:
-        pass
-
-
-def _get_proc_tcp6_peers():
-    peers = set()
-    try:
-        inodes = set()
-        for fd in os.listdir("/proc/self/fd"):
-            try:
-                target = os.readlink(f"/proc/self/fd/{fd}")
-                if target.startswith("socket:[") and target.endswith("]"):
-                    inodes.add(target[8:-1])
-            except OSError:
-                pass
-        if not inodes:
-            return peers
-        with open("/proc/net/tcp6", "r", encoding="utf-8") as f:
-            next(f, None)
-            for line in f:
-                parts = line.split()
-                if len(parts) < 10 or parts[3] != "01":
-                    continue
-                if parts[9] not in inodes:
-                    continue
-                rem_hex, port_hex = parts[2].split(":")
-                port = int(port_hex, 16)
-                raw = bytes.fromhex(rem_hex)
-                words = struct.unpack("<4I", raw)
-                be_bytes = struct.pack(">4I", *words)
-                ip_str = socket.inet_ntop(socket.AF_INET6, be_bytes)
-                peers.add(f"[{ip_str}]:{port}")
-    except Exception:
-        pass
-    return peers
-
-
-def _create_direct_alts_storage_client(
-    credentials, client_info, client_options, endpoints
-):
-    import google.auth.transport.grpc
-    import google.auth.transport.requests
-    import grpc
-    from google.cloud import _storage_v2 as storage_v2
-
-    transport_cls = storage_v2.StorageAsyncClient.get_transport_class("grpc_asyncio")
-    primary_user_agent = client_info.to_user_agent()
-    req = google.auth.transport.requests.Request()
-    auth_plugin = google.auth.transport.grpc.AuthMetadataPlugin(
-        credentials=credentials,
-        request=req,
-        default_host=transport_cls.DEFAULT_HOST,
-    )
-    call_creds = grpc.metadata_call_credentials(auth_plugin)
-    comp_creds = grpc.composite_channel_credentials(
-        grpc.alts_channel_credentials(), call_creds
-    )
-    chosen = random.sample(endpoints, min(8, len(endpoints)))
-    target = "ipv6:" + ",".join(chosen)
-    options = (
-        ("grpc.primary_user_agent", primary_user_agent),
-        ("grpc.default_authority", "storage.googleapis.com"),
-        ("grpc.lb_policy_name", "pick_first"),
-        *_FAST_RECONNECT_OPTIONS,
-    )
-    channel = grpc.aio.secure_channel(target, comp_creds, options=options)
-    transport = transport_cls(channel=channel)
-    return storage_v2.StorageAsyncClient(
-        transport=transport,
-        client_info=client_info,
-        client_options=client_options,
-    )
 
 
 def _get_channel_warmup_lock(grpc_client):
@@ -260,7 +109,7 @@ def _get_channel_warmup_lock(grpc_client):
 
 
 @contextlib.asynccontextmanager
-async def _acquire_alts_warmup_slot(max_concurrency=24):
+async def _acquire_alts_warmup_slot(max_concurrency=24, prefix="gcsfs_alts"):
     if fcntl is None:
         yield
         return
@@ -273,7 +122,7 @@ async def _acquire_alts_warmup_slot(max_concurrency=24):
         while not acquired:
             for i in range(max_concurrency):
                 slot = (start_slot + i) % max_concurrency
-                lock_path = os.path.join(base_dir, f"gcsfs_alts_{uid}_{slot}.lock")
+                lock_path = os.path.join(base_dir, f"{prefix}_{uid}_{slot}.lock")
                 try:
                     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
                 except OSError:
@@ -338,6 +187,78 @@ async def _ensure_channel_warm(grpc_client):
                 _warmed_channels[grpc_client] = True
             except TypeError:
                 pass
+
+
+async def _prewarm_grpc_channel_and_rls(
+    grpc_client,
+    zonal_bucket,
+    sample_keys,
+    timeout_ready=0.75,
+    timeout_mrd=0.85,
+):
+    if grpc_client is None:
+        return False
+    try:
+        inner = getattr(grpc_client, "grpc_client", None)
+        transport = getattr(inner, "transport", None)
+        channel = getattr(transport, "grpc_channel", None)
+        channel_ready = getattr(channel, "channel_ready", None)
+    except Exception:
+        return False
+
+    if not inspect.iscoroutinefunction(channel_ready):
+        return True
+
+    try:
+        async with _acquire_alts_warmup_slot(max_concurrency=24, prefix="gcsfs_alts"):
+            await asyncio.wait_for(channel_ready(), timeout=timeout_ready)
+        try:
+            _warmed_channels[grpc_client] = True
+        except TypeError:
+            pass
+    except Exception:
+        return False
+
+    if not zonal_bucket or not sample_keys:
+        return True
+
+    first_key = random.choice(sample_keys)
+    try:
+        async with _acquire_alts_warmup_slot(max_concurrency=32, prefix="gcsfs_rls"):
+            mrd0 = await asyncio.wait_for(
+                AsyncMultiRangeDownloader.create_mrd(
+                    grpc_client, zonal_bucket, first_key
+                ),
+                timeout=timeout_mrd,
+            )
+        await mrd0.close()
+    except NotFound:
+        pass
+    except asyncio.TimeoutError:
+        return False
+    except Exception:
+        pass
+
+    chosen = random.sample(sample_keys, min(10, len(sample_keys)))
+
+    async def _warm_one(key):
+        try:
+            m = await AsyncMultiRangeDownloader.create_mrd(
+                grpc_client, zonal_bucket, key
+            )
+            await m.close()
+        except Exception:
+            pass
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(_warm_one(k) for k in chosen), return_exceptions=True),
+            timeout=1.5,
+        )
+    except Exception:
+        pass
+
+    return True
 
 
 def _info_from_mrd(mrd, bucket_name, object_name, generation=None):
@@ -1008,109 +929,7 @@ class MRDPool:
         self._inflight.pop(mrd, None)
         return True
 
-    async def _init_grpc_client_with_dp_discovery(self):
-        global _forcing_c2p_discovery
-        _, lock_path = _shm_dp_endpoints_paths()
-        fd = None
-        acquired = False
-        try:
-            while True:
-                eps = _read_shm_dp_endpoints(self.bucket_name)
-                if eps:
-                    await self.gcsfs._get_grpc_client()
-                    await _ensure_channel_warm(self.gcsfs.grpc_client)
-                    return None
-                try:
-                    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except (BlockingIOError, OSError):
-                    if fd is not None:
-                        try:
-                            os.close(fd)
-                        except OSError:
-                            pass
-                        fd = None
-                    await asyncio.sleep(0.002)
-
-            eps = _read_shm_dp_endpoints(self.bucket_name)
-            if eps:
-                await self.gcsfs._get_grpc_client()
-                await _ensure_channel_warm(self.gcsfs.grpc_client)
-                return None
-
-            _forcing_c2p_discovery = True
-            try:
-                await self.gcsfs._get_grpc_client()
-                grpc_client = self.gcsfs.grpc_client
-                inner = getattr(grpc_client, "grpc_client", None)
-            finally:
-                _forcing_c2p_discovery = False
-
-            transport = getattr(inner, "transport", None)
-            channel = getattr(transport, "grpc_channel", None)
-            channel_ready = getattr(channel, "channel_ready", None)
-            if inspect.iscoroutinefunction(channel_ready):
-                await channel_ready()
-            try:
-                _warmed_channels[grpc_client] = True
-            except TypeError:
-                pass
-
-            before = _get_proc_tcp6_peers()
-            try:
-                mrd = await init_mrd(
-                    grpc_client,
-                    self.bucket_name,
-                    self.object_name,
-                    self.generation,
-                    cache_type=self.cache_type,
-                    cache_source=self.cache_source,
-                )
-                return mrd
-            finally:
-                after = _get_proc_tcp6_peers()
-                new_eps = sorted(
-                    p
-                    for p in (after - before)
-                    if p.startswith("[")
-                    and not p.endswith(":443")
-                    and not p.endswith(":80")
-                )
-                if not new_eps:
-                    new_eps = sorted(
-                        p
-                        for p in after
-                        if p.startswith("[")
-                        and not p.endswith(":443")
-                        and not p.endswith(":80")
-                    )
-                if new_eps:
-                    _write_shm_dp_endpoints(self.bucket_name, new_eps)
-        finally:
-            if fd is not None:
-                if acquired:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
     async def _create_mrd(self):
-        if getattr(self.gcsfs, "_grpc_client", None) is None and _can_discover_dp_endpoints(
-            self.gcsfs
-        ):
-            fs_lock = _get_channel_warmup_lock(self.gcsfs)
-            if fs_lock is not None:
-                async with fs_lock:
-                    if getattr(self.gcsfs, "_grpc_client", None) is None:
-                        mrd = await self._init_grpc_client_with_dp_discovery()
-                        if mrd is not None:
-                            return mrd
         await self.gcsfs._get_grpc_client()
         mrd = await init_mrd(
             self.gcsfs.grpc_client,
