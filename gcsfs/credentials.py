@@ -2,17 +2,10 @@ import json
 import logging
 import os
 import pickle
-import tempfile
 import textwrap
 import threading
-import time
 import warnings
 from datetime import datetime, timezone
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 import google.auth as gauth
 import google.auth.compute_engine
@@ -47,100 +40,6 @@ client_config = {
 
 TOKEN_INFO_TIMEOUT_SECONDS = 10
 LOCAL_REFRESH_BUFFER = 300  # Greater than google.auth._helpers.REFRESH_THRESHOLD
-
-
-def _shm_gce_creds_paths():
-    base_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    return (
-        os.path.join(base_dir, f"gcsfs_gce_creds_{uid}.json"),
-        os.path.join(base_dir, f"gcsfs_gce_creds_{uid}.lock"),
-    )
-
-
-def _can_use_shm_gce_creds():
-    if fcntl is None or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-        return False
-    if (
-        hasattr(gauth.default, "_mock_name")
-        or hasattr(requests.Session, "_mock_name")
-        or hasattr(gauth.compute_engine.Credentials, "_mock_name")
-    ):
-        return False
-    return True
-
-
-def _read_shm_gce_creds(scope):
-    cache_path, _ = _shm_gce_creds_paths()
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        entry = data.get(scope)
-        if not isinstance(entry, dict):
-            return None
-        expiry_ts = float(entry.get("expiry_ts", 0))
-        if expiry_ts - time.time() <= LOCAL_REFRESH_BUFFER + 60:
-            return None
-        token = entry.get("token")
-        project = entry.get("project")
-        if not token:
-            return None
-        creds = gauth.compute_engine.Credentials()
-        creds.token = token
-        creds.expiry = datetime.fromtimestamp(expiry_ts, tz=timezone.utc).replace(
-            tzinfo=None
-        )
-        sa_email = entry.get("service_account_email")
-        if sa_email:
-            creds._service_account_email = sa_email
-        return creds, project
-    except Exception:
-        return None
-
-
-def _write_shm_gce_creds(scope, project, creds):
-    if (
-        type(creds) is not gauth.compute_engine.Credentials
-        or not creds.token
-        or not creds.expiry
-    ):
-        return
-    cache_path, _ = _shm_gce_creds_paths()
-    base_dir = os.path.dirname(cache_path)
-    try:
-        exp = creds.expiry
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        expiry_ts = exp.timestamp()
-        data = {}
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        data[scope] = {
-            "project": project,
-            "token": creds.token,
-            "expiry_ts": expiry_ts,
-            "service_account_email": getattr(
-                creds, "_service_account_email", "default"
-            ),
-        }
-        fd, tmp_path = tempfile.mkstemp(
-            prefix="gcsfs_gc_", suffix=".tmp", dir=base_dir
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, cache_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    except Exception:
-        pass
 
 
 def _get_creds_from_raw_token(token):
@@ -221,14 +120,9 @@ class GoogleCredentials:
             warnings.warn("Saving token cache failed: " + str(e))
 
     def _connect_google_default(self):
-        use_shm = self.on_google and _can_use_shm_gce_creds()
-        cached = _read_shm_gce_creds(self.scope) if use_shm else None
-        if cached is not None:
-            credentials, project = cached
-        else:
-            with requests.Session() as session:
-                req = Request(session)
-                credentials, project = gauth.default(scopes=[self.scope], request=req)
+        with requests.Session() as session:
+            req = Request(session)
+            credentials, project = gauth.default(scopes=[self.scope], request=req)
 
         msg = textwrap.dedent(
             """\
@@ -243,8 +137,6 @@ class GoogleCredentials:
             raise ValueError(msg.format(self.project, project))
         self.project = project
         self.credentials = credentials
-        if self.credentials.valid:
-            self.credentials.apply(self.heads)
 
     def _connect_cloud(self):
         if not self.on_google:
@@ -385,10 +277,6 @@ class GoogleCredentials:
 
                 # https://github.com/fsspec/filesystem_spec/issues/565
                 self.credentials.apply(self.heads)
-                if self.on_google and _can_use_shm_gce_creds():
-                    _write_shm_gce_creds(
-                        self.scope, self.project, self.credentials
-                    )
 
     def apply(self, out):
         """Insert credential headers in-place to a dictionary"""

@@ -73,31 +73,6 @@ def _patch_async_grpc_client_reconnect():
         transport_cls = storage_v2.StorageAsyncClient.get_transport_class(
             "grpc_asyncio"
         )
-        can_direct_alts = (
-            bool(attempt_direct_path)
-            and credentials is not None
-            and not isinstance(credentials, AnonymousCredentials)
-            and not (client_options and getattr(client_options, "api_endpoint", None))
-            and not hasattr(transport_cls, "_mock_name")
-            and not hasattr(
-                getattr(transport_cls, "create_channel", None), "_mock_name"
-            )
-            and not hasattr(storage_v2.StorageAsyncClient, "_mock_name")
-        )
-        self._gcsfs_can_direct_alts = can_direct_alts
-        self._gcsfs_init_args = (credentials, client_info, client_options)
-        if can_direct_alts:
-            eps = zb_hns_utils._read_shm_dp_endpoints(None)
-            if eps:
-                try:
-                    self._gcsfs_is_direct_alts = True
-                    return zb_hns_utils._create_direct_alts_storage_client(
-                        credentials, client_info, client_options, eps
-                    )
-                except Exception:
-                    self._gcsfs_is_direct_alts = False
-
-        self._gcsfs_is_direct_alts = False
         primary_user_agent = client_info.to_user_agent()
         options = (
             ("grpc.primary_user_agent", primary_user_agent),
