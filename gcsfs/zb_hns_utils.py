@@ -4,12 +4,9 @@ import concurrent.futures
 import contextlib
 import ctypes
 import inspect
-import json
 import logging
 import os
 import random
-import socket
-import struct
 import sys
 import tempfile
 import threading
@@ -43,11 +40,29 @@ except ValueError:
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
-_FAST_RECONNECT_OPTIONS = (
-    ("grpc.initial_reconnect_backoff_ms", 100),
-    ("grpc.min_reconnect_backoff_ms", 100),
-    ("grpc.max_reconnect_backoff_ms", 500),
-)
+try:
+    _MRD_OPEN_ATTEMPT_TIMEOUT_S = float(
+        os.environ.get("GCSFS_MRD_OPEN_ATTEMPT_TIMEOUT", "60")
+    )
+except ValueError:
+    _MRD_OPEN_ATTEMPT_TIMEOUT_S = 60.0
+_MRD_OPEN_MAX_ATTEMPTS = 3
+
+
+def _replacement_grpc_client(gcsfs, slow_client):
+    """Return one shared isolated replacement channel per slow client, so that
+    concurrent timed-out MRD opens in a process do not each open a new channel."""
+    replacements = gcsfs.__dict__.setdefault(
+        "_mrd_replacement_clients", weakref.WeakKeyDictionary()
+    )
+    try:
+        client = replacements.get(slow_client)
+    except TypeError:
+        return gcsfs._create_new_grpc_client(isolated=True)
+    if client is None:
+        client = gcsfs._create_new_grpc_client(isolated=True)
+        replacements[slow_client] = client
+    return client
 
 
 def _patch_mrd_fast_open_retry():
@@ -88,17 +103,28 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+try:
+    import resource
+
+    _soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if _soft_nofile < 65536 and _hard_nofile > _soft_nofile:
+        resource.setrlimit(
+            resource.RLIMIT_NOFILE, (min(_hard_nofile, 65536), _hard_nofile)
+        )
+except Exception:
+    pass
+
 _warmed_channels = weakref.WeakKeyDictionary()
 _channel_warmup_locks = weakref.WeakKeyDictionary()
 
 
-def _get_channel_warmup_lock(grpc_client):
+def _get_channel_warmup_lock(obj):
     loop = asyncio.get_running_loop()
     try:
-        per_loop = _channel_warmup_locks.get(grpc_client)
+        per_loop = _channel_warmup_locks.get(obj)
         if per_loop is None:
             per_loop = weakref.WeakKeyDictionary()
-            _channel_warmup_locks[grpc_client] = per_loop
+            _channel_warmup_locks[obj] = per_loop
         lock = per_loop.get(loop)
         if lock is None:
             lock = asyncio.Lock()
@@ -109,7 +135,7 @@ def _get_channel_warmup_lock(grpc_client):
 
 
 @contextlib.asynccontextmanager
-async def _acquire_alts_warmup_slot(max_concurrency=24, prefix="gcsfs_alts"):
+async def _acquire_alts_warmup_slot(max_concurrency=36, prefix="gcsfs_alts"):
     if fcntl is None:
         yield
         return
@@ -154,6 +180,19 @@ async def _acquire_alts_warmup_slot(max_concurrency=24, prefix="gcsfs_alts"):
                 pass
 
 
+def _get_channel_ready_fn(grpc_client):
+    try:
+        inner = getattr(grpc_client, "grpc_client", None)
+        transport = getattr(inner, "transport", None)
+        channel = getattr(transport, "grpc_channel", None)
+        channel_ready = getattr(channel, "channel_ready", None)
+        if inspect.iscoroutinefunction(channel_ready):
+            return channel_ready
+    except Exception:
+        pass
+    return None
+
+
 async def _ensure_channel_warm(grpc_client):
     if grpc_client is None:
         return
@@ -163,15 +202,8 @@ async def _ensure_channel_warm(grpc_client):
     except TypeError:
         return
 
-    try:
-        inner = getattr(grpc_client, "grpc_client", None)
-        transport = getattr(inner, "transport", None)
-        channel = getattr(transport, "grpc_channel", None)
-        channel_ready = getattr(channel, "channel_ready", None)
-    except Exception:
-        return
-
-    if not inspect.iscoroutinefunction(channel_ready):
+    channel_ready = _get_channel_ready_fn(grpc_client)
+    if channel_ready is None:
         return
 
     lock = _get_channel_warmup_lock(grpc_client)
@@ -189,76 +221,43 @@ async def _ensure_channel_warm(grpc_client):
                 pass
 
 
-async def _prewarm_grpc_channel_and_rls(
+async def _cancel_and_close_mrd_task(task):
+    task.cancel()
+    try:
+        res = await task
+        if isinstance(res, tuple):
+            res = res[0]
+        if res is not None and hasattr(res, "close"):
+            await res.close()
+    except BaseException:
+        pass
+
+
+async def _create_mrd_raw(
     grpc_client,
-    zonal_bucket,
-    sample_keys,
-    timeout_ready=0.75,
-    timeout_mrd=0.85,
+    bucket_name,
+    object_name,
+    generation=None,
+    cache_type=None,
+    cache_source=None,
 ):
-    if grpc_client is None:
-        return False
-    try:
-        inner = getattr(grpc_client, "grpc_client", None)
-        transport = getattr(inner, "transport", None)
-        channel = getattr(transport, "grpc_channel", None)
-        channel_ready = getattr(channel, "channel_ready", None)
-    except Exception:
-        return False
+    from gcsfs.core import _get_cache_type_header_value
 
-    if not inspect.iscoroutinefunction(channel_ready):
-        return True
+    metadata = None
+    cache_val = _get_cache_type_header_value(cache_type, cache_source)
+    if cache_val:
+        metadata = [("x-goog-api-client", cache_val)]
+
+    kwargs = {}
+    if metadata:
+        kwargs["metadata"] = metadata
 
     try:
-        async with _acquire_alts_warmup_slot(max_concurrency=24, prefix="gcsfs_alts"):
-            await asyncio.wait_for(channel_ready(), timeout=timeout_ready)
-        try:
-            _warmed_channels[grpc_client] = True
-        except TypeError:
-            pass
-    except Exception:
-        return False
-
-    if not zonal_bucket or not sample_keys:
-        return True
-
-    first_key = random.choice(sample_keys)
-    try:
-        async with _acquire_alts_warmup_slot(max_concurrency=32, prefix="gcsfs_rls"):
-            mrd0 = await asyncio.wait_for(
-                AsyncMultiRangeDownloader.create_mrd(
-                    grpc_client, zonal_bucket, first_key
-                ),
-                timeout=timeout_mrd,
-            )
-        await mrd0.close()
-    except NotFound:
-        pass
-    except asyncio.TimeoutError:
-        return False
-    except Exception:
-        pass
-
-    chosen = random.sample(sample_keys, min(10, len(sample_keys)))
-
-    async def _warm_one(key):
-        try:
-            m = await AsyncMultiRangeDownloader.create_mrd(
-                grpc_client, zonal_bucket, key
-            )
-            await m.close()
-        except Exception:
-            pass
-
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*(_warm_one(k) for k in chosen), return_exceptions=True),
-            timeout=1.5,
+        return await AsyncMultiRangeDownloader.create_mrd(
+            grpc_client, bucket_name, object_name, generation, **kwargs
         )
-    except Exception:
-        pass
-
-    return True
+    except NotFound:
+        raise FileNotFoundError(f"{bucket_name}/{object_name}")
 
 
 def _info_from_mrd(mrd, bucket_name, object_name, generation=None):
@@ -312,27 +311,15 @@ async def init_mrd(
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
-    from gcsfs.core import _get_cache_type_header_value
-
     await _ensure_channel_warm(grpc_client)
-
-    metadata = None
-    cache_val = _get_cache_type_header_value(cache_type, cache_source)
-    if cache_val:
-        metadata = [("x-goog-api-client", cache_val)]
-
-    kwargs = {}
-    if metadata:
-        kwargs["metadata"] = metadata
-
-    try:
-        return await AsyncMultiRangeDownloader.create_mrd(
-            grpc_client, bucket_name, object_name, generation, **kwargs
-        )
-    except NotFound:
-        # We wrap the error here to match standard Python error handling
-        # and avoid leaking Google API exceptions to users.
-        raise FileNotFoundError(f"{bucket_name}/{object_name}")
+    return await _create_mrd_raw(
+        grpc_client,
+        bucket_name,
+        object_name,
+        generation=generation,
+        cache_type=cache_type,
+        cache_source=cache_source,
+    )
 
 
 async def download_range(offset, length, mrd):
@@ -929,17 +916,52 @@ class MRDPool:
         self._inflight.pop(mrd, None)
         return True
 
-    async def _create_mrd(self):
-        await self.gcsfs._get_grpc_client()
-        mrd = await init_mrd(
-            self.gcsfs.grpc_client,
+    async def _create_mrd_once(self, grpc_client=None):
+        return await init_mrd(
+            grpc_client or self.gcsfs.grpc_client,
             self.bucket_name,
             self.object_name,
             self.generation,
             cache_type=self.cache_type,
             cache_source=self.cache_source,
         )
-        return mrd
+
+    async def _create_mrd(self):
+        await self.gcsfs._get_grpc_client()
+        timeout = _MRD_OPEN_ATTEMPT_TIMEOUT_S
+        if (
+            not timeout
+            or timeout <= 0
+            or not hasattr(self.gcsfs, "_create_new_grpc_client")
+        ):
+            return await self._create_mrd_once()
+
+        # A BidiReadObject stream can stay stuck in call setup indefinitely
+        # (no RPC deadline), and AsyncRetry's deadline does not cancel a hung
+        # attempt. Bound each attempt; retry on a separate isolated channel.
+        grpc_client = None
+        for attempt in range(_MRD_OPEN_MAX_ATTEMPTS):
+            task = asyncio.create_task(self._create_mrd_once(grpc_client))
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if task in done:
+                return task.result()
+            asyncio.create_task(_cancel_and_close_mrd_task(task))
+            logger.warning(
+                "Opening MRD for %s/%s did not complete within %.1fs (attempt %d/%d)",
+                self.bucket_name,
+                self.object_name,
+                timeout,
+                attempt + 1,
+                _MRD_OPEN_MAX_ATTEMPTS,
+            )
+            slow_client = grpc_client or self.gcsfs.grpc_client
+            grpc_client = _replacement_grpc_client(self.gcsfs, slow_client)
+            if slow_client is self.gcsfs.grpc_client:
+                self.gcsfs._grpc_client = grpc_client
+        raise TimeoutError(
+            f"Opening {self.bucket_name}/{self.object_name} did not complete "
+            f"after {_MRD_OPEN_MAX_ATTEMPTS} attempts of {timeout}s"
+        )
 
     async def _get_or_create_mrd(self):
         """Gets an MRD from the cache or creates a new one."""
