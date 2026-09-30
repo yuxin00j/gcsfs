@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -435,6 +436,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         if bucket in self._storage_layout_cache:
             return self._storage_layout_cache[bucket]
 
+        t0 = time.perf_counter()
         async with self._get_layout_lock():
             if bucket in self._storage_layout_cache:
                 return self._storage_layout_cache[bucket]
@@ -444,6 +446,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 cached = _read_shm_bucket_type(bucket)
                 if cached is not None:
                     self._storage_layout_cache[bucket] = cached
+                    logger.debug(
+                        "Bucket type lookup for %s resolved to %s via shm_cache in %.2f ms",
+                        bucket,
+                        cached.name,
+                        (time.perf_counter() - t0) * 1000.0,
+                    )
                     return cached
 
                 _, lock_path = _shm_bucket_cache_paths()
@@ -455,6 +463,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                         cached = _read_shm_bucket_type(bucket)
                         if cached is not None:
                             self._storage_layout_cache[bucket] = cached
+                            logger.debug(
+                                "Bucket type lookup for %s resolved to %s via shm_cache (after lock wait) in %.2f ms",
+                                bucket,
+                                cached.name,
+                                (time.perf_counter() - t0) * 1000.0,
+                            )
                             return cached
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -466,12 +480,24 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                     cached = _read_shm_bucket_type(bucket)
                     if cached is not None:
                         self._storage_layout_cache[bucket] = cached
+                        logger.debug(
+                            "Bucket type lookup for %s resolved to %s via shm_cache (post-lock) in %.2f ms",
+                            bucket,
+                            cached.name,
+                            (time.perf_counter() - t0) * 1000.0,
+                        )
                         return cached
 
                     bucket_type = await self._get_bucket_type(bucket)
                     if bucket_type != BucketType.UNKNOWN:
                         self._storage_layout_cache[bucket] = bucket_type
                         _write_shm_bucket_type(bucket, bucket_type)
+                    logger.debug(
+                        "Bucket type lookup for %s resolved to %s via rpc in %.2f ms",
+                        bucket,
+                        bucket_type.name,
+                        (time.perf_counter() - t0) * 1000.0,
+                    )
                     return bucket_type
                 finally:
                     if lock_fd is not None:
@@ -492,11 +518,18 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             if bucket_type == BucketType.UNKNOWN:
                 return bucket_type
             self._storage_layout_cache[bucket] = bucket_type
+            logger.debug(
+                "Bucket type lookup for %s resolved to %s via rpc in %.2f ms",
+                bucket,
+                bucket_type.name,
+                (time.perf_counter() - t0) * 1000.0,
+            )
             return self._storage_layout_cache[bucket]
 
     _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
 
     async def _get_bucket_type(self, bucket):
+        t0 = time.perf_counter()
         try:
             client = await self._get_control_plane_client()
             bucket_name_value = f"projects/_/buckets/{bucket}/storageLayout"
@@ -508,13 +541,21 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
 
             if response.location_type == "zone":
-                return BucketType.ZONAL_HIERARCHICAL
-            if (
+                bucket_type = BucketType.ZONAL_HIERARCHICAL
+            elif (
                 response.hierarchical_namespace
                 and response.hierarchical_namespace.enabled
             ):
-                return BucketType.HIERARCHICAL
-            return BucketType.NON_HIERARCHICAL
+                bucket_type = BucketType.HIERARCHICAL
+            else:
+                bucket_type = BucketType.NON_HIERARCHICAL
+            logger.debug(
+                "get_storage_layout for %s returned %s in %.2f ms",
+                bucket,
+                bucket_type.name,
+                (time.perf_counter() - t0) * 1000.0,
+            )
+            return bucket_type
         except api_exceptions.NotFound:
             logger.warning(
                 f"Error: Bucket {bucket} not found or you lack permissions for "
@@ -547,10 +588,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         Open a file.
         """
+        t0 = time.perf_counter()
         bucket, _, _ = self.split_path(path)
         bucket_type = self._sync_lookup_bucket_type(bucket)
+        t_lookup = time.perf_counter()
 
-        return gcs_file_types[bucket_type](
+        f = gcs_file_types[bucket_type](
             self,
             path,
             mode,
@@ -565,6 +608,19 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             finalize_on_close=kwargs.pop("finalize_on_close", self.finalize_on_close),
             **kwargs,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            t_end = time.perf_counter()
+            logger.debug(
+                "Opened %s (mode=%s, bucket_type=%s) in %.2f ms "
+                "(bucket_lookup=%.2f ms, file_init=%.2f ms)",
+                path,
+                mode,
+                bucket_type.name,
+                (t_end - t0) * 1000.0,
+                (t_lookup - t0) * 1000.0,
+                (t_end - t_lookup) * 1000.0,
+            )
+        return f
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
     async def _process_limits_to_offset_and_length(

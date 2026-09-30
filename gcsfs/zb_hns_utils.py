@@ -10,6 +10,7 @@ import random
 import sys
 import tempfile
 import threading
+import time
 import weakref
 from io import BytesIO
 
@@ -210,15 +211,27 @@ async def _ensure_channel_warm(grpc_client):
     if lock is None:
         return
 
+    t0 = time.perf_counter()
     async with lock:
         if _warmed_channels.get(grpc_client):
             return
+        t_lock = time.perf_counter()
         async with _acquire_alts_warmup_slot():
+            t_slot = time.perf_counter()
             await channel_ready()
+            t_ready = time.perf_counter()
             try:
                 _warmed_channels[grpc_client] = True
             except TypeError:
                 pass
+            logger.debug(
+                "gRPC channel warmup completed in %.2f ms "
+                "(lock_wait=%.2f ms, slot_wait=%.2f ms, channel_ready=%.2f ms)",
+                (t_ready - t0) * 1000.0,
+                (t_lock - t0) * 1000.0,
+                (t_slot - t_lock) * 1000.0,
+                (t_ready - t_slot) * 1000.0,
+            )
 
 
 async def _cancel_and_close_mrd_task(task):
@@ -311,8 +324,10 @@ async def init_mrd(
     Creates the AsyncMultiRangeDownloader using an existing client.
     Wraps Google API errors into standard Python exceptions.
     """
+    t0 = time.perf_counter()
     await _ensure_channel_warm(grpc_client)
-    return await _create_mrd_raw(
+    t_warm = time.perf_counter()
+    mrd = await _create_mrd_raw(
         grpc_client,
         bucket_name,
         object_name,
@@ -320,6 +335,18 @@ async def init_mrd(
         cache_type=cache_type,
         cache_source=cache_source,
     )
+    if logger.isEnabledFor(logging.DEBUG):
+        t_end = time.perf_counter()
+        logger.debug(
+            "Initialized MRD for %s/%s in %.2f ms "
+            "(channel_warmup=%.2f ms, create_mrd=%.2f ms)",
+            bucket_name,
+            object_name,
+            (t_end - t0) * 1000.0,
+            (t_warm - t0) * 1000.0,
+            (t_end - t_warm) * 1000.0,
+        )
+    return mrd
 
 
 async def download_range(offset, length, mrd):
@@ -329,8 +356,10 @@ async def download_range(offset, length, mrd):
     # If length = 0, mrd returns till end of file, so handle that case here
     if length == 0:
         return b""
+    t0 = time.perf_counter()
     buffer = BytesIO()
     await mrd.download_ranges([(offset, length, buffer)])
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
     data = buffer.getvalue()
     bytes_downloaded = len(data)
 
@@ -342,7 +371,7 @@ async def download_range(offset, length, mrd):
 
     logger.debug(
         f"Requested {length} bytes from offset {offset}, downloaded {bytes_downloaded} "
-        f"bytes from mrd path: {mrd.bucket_name}/{mrd.object_name}"
+        f"bytes from mrd path: {mrd.bucket_name}/{mrd.object_name} in {elapsed_ms:.2f} ms"
     )
     return data
 
@@ -373,10 +402,12 @@ async def download_ranges(ranges, mrd):
     ]
 
     # Execute Download
+    t0 = time.perf_counter()
     if tasks:
         # The MRD expects list of (offset, length, buffer)
         # We extract these from our task list
         await mrd.download_ranges([(off, length, buf) for _, off, length, buf in tasks])
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     # Map results back to their original positions
     results = [b""] * len(ranges)
@@ -399,7 +430,8 @@ async def download_ranges(ranges, mrd):
             f"mrd path: {mrd.bucket_name}/{mrd.object_name} | "
             f"Requested {len(ranges)} ranges: {requested_ranges_to_log} | "
             f"total bytes requested: {total_requested} | "
-            f"total bytes downloaded: {total_downloaded}"
+            f"total bytes downloaded: {total_downloaded} | "
+            f"elapsed_ms: {elapsed_ms:.2f}"
         )
 
     return results
@@ -1196,6 +1228,7 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
+        t0 = time.perf_counter()
         if MRDPool is not _REAL_MRD_POOL:
             info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
             if generation is None:
@@ -1211,6 +1244,7 @@ class MRDPoolCache:
                 else bool(self._mrd_queues.get(key))
             )
 
+        reused_idle_mrd = bool(finalized and self._mrd_queues.get(key))
         self._incref(key)
         mrd_pool = MRDPool(
             fs,
@@ -1227,7 +1261,9 @@ class MRDPoolCache:
             mrd_pool.details = info
 
         try:
+            t_init_start = time.perf_counter()
             await mrd_pool.initialize()
+            t_init_end = time.perf_counter()
             if isinstance(getattr(mrd_pool, "details", None), dict):
                 if mrd_pool.details.get("timeFinalized") is not None:
                     self._pool_info[key] = mrd_pool.details
@@ -1236,6 +1272,18 @@ class MRDPoolCache:
             elif hasattr(fs, "_info"):
                 mrd_pool.details = await fs._info(
                     f"{bucket_name}/{object_name}", generation=generation
+                )
+            if logger.isEnabledFor(logging.DEBUG):
+                t_end = time.perf_counter()
+                logger.debug(
+                    "MRDPoolCache.get for %s/%s completed in %.2f ms "
+                    "(pool_init=%.2f ms, info=%.2f ms, reused_idle_mrd=%s)",
+                    bucket_name,
+                    object_name,
+                    (t_end - t0) * 1000.0,
+                    (t_init_end - t_init_start) * 1000.0,
+                    (t_end - t_init_end) * 1000.0,
+                    reused_idle_mrd,
                 )
         except BaseException:
             # Init failed. `mrd_pool.close()` donates any partial MRDs back
