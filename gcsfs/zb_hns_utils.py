@@ -35,9 +35,9 @@ from google.cloud.storage.asyncio.async_multi_range_downloader import (
 
 MRD_MAX_RANGES = 1000  # MRD supports up to 1000 ranges per request
 try:
-    DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "4"))
+    DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_GCSFS_CONCURRENCY", "1"))
 except ValueError:
-    DEFAULT_CONCURRENCY = 4
+    DEFAULT_CONCURRENCY = 1
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
 logger = logging.getLogger("gcsfs")
 
@@ -75,9 +75,9 @@ def _patch_mrd_fast_open_retry():
         if retry_policy is None and not hasattr(AsyncRetry, "_mock_name"):
             retry_policy = AsyncRetry(
                 predicate=_is_read_retryable,
-                initial=0.05,
-                maximum=0.25,
-                multiplier=1.5,
+                initial=0.1,
+                maximum=30.0,
+                multiplier=2.0,
                 deadline=120.0,
             )
         return await orig_open(self, retry_policy=retry_policy, metadata=metadata)
