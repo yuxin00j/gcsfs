@@ -42,6 +42,11 @@ logger = logging.getLogger("gcsfs")
 
 if "GCSFS_DEBUG" in os.environ:
     setup_logging(logger=logger, level=os.getenv("GCSFS_DEBUG"))
+elif "GCSFS_LOG_LEVEL" in os.environ:
+    _gcsfs_log_level = os.getenv("GCSFS_LOG_LEVEL", "INFO").upper()
+    if _gcsfs_log_level == "TRACE":
+        _gcsfs_log_level = "DEBUG"
+    setup_logging(logger=logger, level=_gcsfs_log_level)
 
 
 # client created 2018-01-16
