@@ -37,6 +37,28 @@ try:
     PyBytes_AsString = ctypes.pythonapi.PyBytes_AsString
     PyBytes_AsString.argtypes = (ctypes.py_object,)
     PyBytes_AsString.restype = ctypes.c_void_p
+
+    class _PyBuffer(ctypes.Structure):
+        _fields_ = [
+            ("buf", ctypes.c_void_p),
+            ("obj", ctypes.c_void_p),
+            ("len", ctypes.c_ssize_t),
+            ("itemsize", ctypes.c_ssize_t),
+            ("readonly", ctypes.c_int),
+            ("ndim", ctypes.c_int),
+            ("format", ctypes.c_char_p),
+            ("shape", ctypes.c_void_p),
+            ("strides", ctypes.c_void_p),
+            ("suboffsets", ctypes.c_void_p),
+            ("internal", ctypes.c_void_p),
+        ]
+
+    PyObject_GetBuffer = ctypes.pythonapi.PyObject_GetBuffer
+    PyObject_GetBuffer.argtypes = (ctypes.py_object, ctypes.POINTER(_PyBuffer), ctypes.c_int)
+    PyObject_GetBuffer.restype = ctypes.c_int
+    PyBuffer_Release = ctypes.pythonapi.PyBuffer_Release
+    PyBuffer_Release.argtypes = (ctypes.POINTER(_PyBuffer),)
+    PyBuffer_Release.restype = None
     HAS_CPYTHON_API = True
 except Exception:
     PyBytes_FromStringAndSize = None
@@ -77,7 +99,7 @@ async def init_mrd(
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
 
 
-async def download_range(offset, length, mrd):
+async def download_range(offset, length, mrd, enable_checksum=True):
     """
     Downloads a byte range from the file asynchronously.
     """
@@ -85,7 +107,9 @@ async def download_range(offset, length, mrd):
     if length == 0:
         return b""
     buffer = BytesIO()
-    await mrd.download_ranges([(offset, length, buffer)])
+    await mrd.download_ranges(
+        [(offset, length, buffer)], enable_checksum=enable_checksum
+    )
     data = buffer.getvalue()
     bytes_downloaded = len(data)
 
@@ -102,7 +126,7 @@ async def download_range(offset, length, mrd):
     return data
 
 
-async def download_ranges(ranges, mrd):
+async def download_ranges(ranges, mrd, enable_checksum=True):
     """
     Downloads multiple byte ranges from the file asynchronously in a single batch.
 
@@ -131,7 +155,10 @@ async def download_ranges(ranges, mrd):
     if tasks:
         # The MRD expects list of (offset, length, buffer)
         # We extract these from our task list
-        await mrd.download_ranges([(off, length, buf) for _, off, length, buf in tasks])
+        await mrd.download_ranges(
+            [(off, length, buf) for _, off, length, buf in tasks],
+            enable_checksum=enable_checksum,
+        )
 
     # Map results back to their original positions
     results = [b""] * len(ranges)
@@ -325,8 +352,8 @@ class PartialView:
         """
         Schedules a write operation to memory mapping.
         """
-        if not isinstance(data, bytes):
-            raise ValueError(f"Expected bytes, but got {type(data)}")
+        if not isinstance(data, (bytes, memoryview)):
+            raise ValueError(f"Expected bytes or memoryview, but got {type(data)}")
 
         size = len(data)
         with self._view_lock:
@@ -466,7 +493,11 @@ class DirectMemmoveBuffer:
                     raise self._error
 
                 if self._result_bytes is None:
-                    if dest_offset == 0 and size == self.expected_size:
+                    if (
+                        dest_offset == 0
+                        and size == self.expected_size
+                        and isinstance(data_bytes, bytes)
+                    ):
                         # fastpath: return buffer directly
                         self._result_bytes = data_bytes
                         self.semaphore.release()  # Release because we skip the executor
@@ -536,7 +567,18 @@ class DirectMemmoveBuffer:
             # PyPy uses memory-safe native slice assignment.
             if HAS_CPYTHON_API:
                 dest = self._start_address + dest_offset
-                ctypes.memmove(dest, data_bytes, size)
+                if isinstance(data_bytes, bytes):
+                    ctypes.memmove(dest, data_bytes, size)
+                else:
+                    # ctypes.memmove only accepts bytes; borrow the raw
+                    # pointer of any other buffer via the buffer protocol.
+                    view = _PyBuffer()
+                    if PyObject_GetBuffer(data_bytes, ctypes.byref(view), 0) != 0:
+                        raise BufferError("source does not support the buffer protocol")
+                    try:
+                        ctypes.memmove(dest, view.buf, size)
+                    finally:
+                        PyBuffer_Release(ctypes.byref(view))
             else:
                 memoryview(self._result_bytes)[
                     dest_offset : dest_offset + size

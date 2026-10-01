@@ -59,7 +59,7 @@ async def test_download_range():
     expected_data = b"test data from download"
 
     # Simulate the download_ranges method writing data to the buffer
-    async def mock_download_ranges(ranges):
+    async def mock_download_ranges(ranges, enable_checksum=True):
         _offset, _length, buffer = ranges[0]
         buffer.write(expected_data)
 
@@ -67,7 +67,7 @@ async def test_download_range():
 
     result = await zb_hns_utils.download_range(offset, length, mock_mrd)
 
-    mock_mrd.download_ranges.assert_called_once_with([(offset, length, mock.ANY)])
+    mock_mrd.download_ranges.assert_called_once_with([(offset, length, mock.ANY)], enable_checksum=True)
     assert result == expected_data
 
 
@@ -264,7 +264,7 @@ async def test_download_ranges_unified(ranges, expected_call_count):
     mock_mrd = mock.AsyncMock()
 
     # Writes distinct data like b"0-5" to verify mapping
-    async def side_effect(req_ranges):
+    async def side_effect(req_ranges, enable_checksum=True):
         for offset, length, buf in req_ranges:
             buf.write(f"{offset}-{length}".encode())
 
