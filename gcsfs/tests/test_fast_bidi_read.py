@@ -182,9 +182,10 @@ def test_install_leaves_unknown_clients_alone():
 async def test_get_grpc_client_installs_fast_parser_only_when_supported(supported):
     fs = ExtendedGcsFileSystem(project="p", token="anon", skip_instance_cache=True)
     grpc_client = mock.Mock(grpc_client=_anonymous_storage_client())
-    with mock.patch(
-        "gcsfs.extended_gcsfs.AsyncGrpcClient", return_value=grpc_client
-    ), mock.patch.object(_fast_bidi_read, "is_supported", return_value=supported):
+    with (
+        mock.patch("gcsfs.extended_gcsfs.AsyncGrpcClient", return_value=grpc_client),
+        mock.patch.object(_fast_bidi_read, "is_supported", return_value=supported),
+    ):
         await fs._get_grpc_client()
 
     transport = grpc_client.grpc_client._client._transport

@@ -1,7 +1,9 @@
 import asyncio
 import collections
 import concurrent.futures
+import importlib
 import logging
+import sys
 from unittest import mock
 
 import pytest
@@ -624,6 +626,34 @@ def test_direct_memmove_buffer_copies_whole_buffer_memoryview():
     assert isinstance(result, bytes)
     source[:] = b"\x00" * len(source)
     assert result == data
+    executor.shutdown()
+
+
+def test_direct_memmove_buffer_memoryview_after_module_reexecution():
+    # gcsfs/tests/test_init.py drops every gcsfs module from sys.modules and
+    # imports the package again, then restores the originals. The module body
+    # runs twice in one process; ctypes.pythonapi function objects are shared
+    # process-wide, so the second run must not break the first module's calls.
+    import gcsfs
+
+    saved_module = sys.modules.pop("gcsfs.zb_hns_utils")
+    saved_attr = gcsfs.zb_hns_utils
+    try:
+        importlib.import_module("gcsfs.zb_hns_utils")
+    finally:
+        sys.modules["gcsfs.zb_hns_utils"] = saved_module
+        gcsfs.zb_hns_utils = saved_attr
+
+    data = bytes(range(256)) * 4
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(len(data), executor, max_pending=2)
+    view = buf.get_view(0, len(data))
+
+    view.write(memoryview(data)).result()
+
+    view.close()
+    buf.close()
+    assert buf.get_value() == data
     executor.shutdown()
 
 

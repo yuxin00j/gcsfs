@@ -53,15 +53,16 @@ try:
             ("internal", ctypes.c_void_p),
         ]
 
+    # ctypes.pythonapi hands out one function object per symbol for the whole
+    # process, so argtypes may only use built-in ctypes types: a pointer to the
+    # _PyBuffer class above would be invalidated if this module body ran again
+    # (importlib.reload, or tests that purge sys.modules). The struct's address
+    # is passed as a plain void pointer instead.
     PyObject_GetBuffer = ctypes.pythonapi.PyObject_GetBuffer
-    PyObject_GetBuffer.argtypes = (
-        ctypes.py_object,
-        ctypes.POINTER(_PyBuffer),
-        ctypes.c_int,
-    )
+    PyObject_GetBuffer.argtypes = (ctypes.py_object, ctypes.c_void_p, ctypes.c_int)
     PyObject_GetBuffer.restype = ctypes.c_int
     PyBuffer_Release = ctypes.pythonapi.PyBuffer_Release
-    PyBuffer_Release.argtypes = (ctypes.POINTER(_PyBuffer),)
+    PyBuffer_Release.argtypes = (ctypes.c_void_p,)
     PyBuffer_Release.restype = None
     HAS_CPYTHON_API = True
 except Exception:
@@ -572,12 +573,13 @@ class DirectMemmoveBuffer:
                     # ctypes.memmove only accepts bytes; borrow the raw
                     # pointer of any other buffer via the buffer protocol.
                     view = _PyBuffer()
-                    if PyObject_GetBuffer(data_bytes, ctypes.byref(view), 0) != 0:
+                    view_ptr = ctypes.addressof(view)
+                    if PyObject_GetBuffer(data_bytes, view_ptr, 0) != 0:
                         raise BufferError("source does not support the buffer protocol")
                     try:
                         ctypes.memmove(dest, view.buf, size)
                     finally:
-                        PyBuffer_Release(ctypes.byref(view))
+                        PyBuffer_Release(view_ptr)
             else:
                 memoryview(self._result_bytes)[
                     dest_offset : dest_offset + size
