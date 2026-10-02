@@ -129,10 +129,6 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         # By default, files in zonal buckets are left unfinalized to allow appends.
         self.finalize_on_close = finalize_on_close
         self._grpc_client = None
-        # Client-side crc32c on zonal reads is opt-in; without it the
-        # BidiReadObject stub can hand chunks out zero-copy (see
-        # _fast_bidi_read), which the checksum path cannot consume.
-        self._zonal_checksum = self.consistency == "crc32c"
         self._storage_control_client = None
         # Adds user-passed credentials to ExtendedGcsFileSystem to pass to gRPC/Storage Control clients.
         # We unwrap the nested credentials here because self.credentials is a GCSFS wrapper,
@@ -231,7 +227,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
                 client_options=client_options,
             )
-            if not self._zonal_checksum:
+            if _fast_bidi_read.is_supported():
                 _fast_bidi_read.install(self._grpc_client.grpc_client)
         return self._grpc_client
 
@@ -550,9 +546,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                         f"mrd path: {m_client.object_name} | "
                         f"Requested range: [({o}, {s})]"
                     )
-                await m_client.download_ranges(
-                    [(o, s, view)], enable_checksum=self._zonal_checksum
-                )
+                await m_client.download_ranges([(o, s, view)])
 
         for relative_offset, actual_size in ranges:
             part_offset = offset + relative_offset
@@ -1774,10 +1768,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                             break
 
                         data = await zb_hns_utils.download_range(
-                            offset=offset,
-                            length=chunksize,
-                            mrd=mrd,
-                            enable_checksum=self._zonal_checksum,
+                            offset=offset, length=chunksize, mrd=mrd
                         )
                         if not data:
                             break

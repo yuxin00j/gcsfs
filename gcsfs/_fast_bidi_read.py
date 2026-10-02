@@ -9,6 +9,9 @@ Responses carrying object metadata (the first message of a stream opened without
 a read handle) or anything unexpected fall back to the generated parser.
 """
 
+import os
+
+import google_crc32c
 from google.cloud import _storage_v2 as storage_v2
 
 _WT_VARINT, _WT_I64, _WT_LEN, _WT_I32 = 0, 1, 2, 5
@@ -53,13 +56,6 @@ class _ObjectRangeData:
         raise ValueError(name)
 
 
-class _ReadHandle:
-    __slots__ = ("handle",)
-
-    def __init__(self, handle):
-        self.handle = handle
-
-
 class FastBidiReadObjectResponse:
     """Duck-typed stand-in for ``BidiReadObjectResponse`` without metadata."""
 
@@ -82,6 +78,10 @@ class FastBidiReadObjectResponse:
         raise ValueError(name)
 
 
+class _Malformed(ValueError):
+    """Raised when the wire bytes do not look like a well-formed message."""
+
+
 def _varint(buf, i):
     shift = 0
     result = 0
@@ -92,19 +92,33 @@ def _varint(buf, i):
         if b < 0x80:
             return result, i
         shift += 7
+        if shift > 63:
+            raise _Malformed("varint longer than 10 bytes")
 
 
-def _skip(buf, i, wt):
+def _length_prefixed(buf, i, end):
+    """Return ``(start, stop)`` of a length-delimited field body at ``i``."""
+    n, i = _varint(buf, i)
+    stop = i + n
+    if stop > end:
+        raise _Malformed("field runs past its enclosing message")
+    return i, stop
+
+
+def _skip(buf, i, wt, end):
     if wt == _WT_VARINT:
-        return _varint(buf, i)[1]
-    if wt == _WT_LEN:
-        n, i = _varint(buf, i)
-        return i + n
-    if wt == _WT_I64:
-        return i + 8
-    if wt == _WT_I32:
-        return i + 4
-    raise ValueError(f"unsupported wire type {wt}")
+        i = _varint(buf, i)[1]
+    elif wt == _WT_LEN:
+        i = _length_prefixed(buf, i, end)[1]
+    elif wt == _WT_I64:
+        i += 8
+    elif wt == _WT_I32:
+        i += 4
+    else:
+        raise _Malformed(f"unsupported wire type {wt}")
+    if i > end:
+        raise _Malformed("field runs past its enclosing message")
+    return i
 
 
 def _parse_read_range(buf, i, end):
@@ -121,7 +135,9 @@ def _parse_read_range(buf, i, end):
             elif f == 3:
                 rr.read_id = v
         else:
-            i = _skip(buf, i, wt)
+            i = _skip(buf, i, wt, end)
+    if i != end:
+        raise _Malformed("read_range overruns its length")
     return rr
 
 
@@ -131,15 +147,18 @@ def _parse_checksummed(buf, mv, i, end):
         tag, i = _varint(buf, i)
         f, wt = tag >> 3, tag & 7
         if f == 1 and wt == _WT_LEN:
-            n, i = _varint(buf, i)
-            cd.content = mv[i : i + n]
-            i += n
+            start, i = _length_prefixed(buf, i, end)
+            cd.content = mv[start:i]
         elif f == 2 and wt == _WT_I32:
+            if i + 4 > end:
+                raise _Malformed("crc32c runs past its enclosing message")
             cd.crc32c = int.from_bytes(buf[i : i + 4], "little")
             cd._has_crc32c = True
             i += 4
         else:
-            i = _skip(buf, i, wt)
+            i = _skip(buf, i, wt, end)
+    if i != end:
+        raise _Malformed("checksummed_data overruns its length")
     return cd
 
 
@@ -149,17 +168,18 @@ def _parse_range_data(buf, mv, i, end):
         tag, i = _varint(buf, i)
         f, wt = tag >> 3, tag & 7
         if wt == _WT_LEN:
-            n, i = _varint(buf, i)
+            start, i = _length_prefixed(buf, i, end)
             if f == 1:
-                rd.checksummed_data = _parse_checksummed(buf, mv, i, i + n)
+                rd.checksummed_data = _parse_checksummed(buf, mv, start, i)
             elif f == 2:
-                rd.read_range = _parse_read_range(buf, i, i + n)
-            i += n
+                rd.read_range = _parse_read_range(buf, start, i)
         elif f == 3 and wt == _WT_VARINT:
             v, i = _varint(buf, i)
             rd.range_end = bool(v)
         else:
-            i = _skip(buf, i, wt)
+            i = _skip(buf, i, wt, end)
+    if i != end:
+        raise _Malformed("object_data_ranges overruns its length")
     return rd
 
 
@@ -169,19 +189,27 @@ def _parse_handle(buf, i, end):
         tag, i = _varint(buf, i)
         f, wt = tag >> 3, tag & 7
         if f == 1 and wt == _WT_LEN:
-            n, i = _varint(buf, i)
-            handle = bytes(buf[i : i + n])
-            i += n
+            start, i = _length_prefixed(buf, i, end)
+            handle = bytes(buf[start:i])
         else:
-            i = _skip(buf, i, wt)
-    return _ReadHandle(handle)
+            i = _skip(buf, i, wt, end)
+    if i != end:
+        raise _Malformed("read_handle overruns its length")
+    # A real message: the SDK stores the handle and passes it back in the
+    # BidiReadObjectSpec of the next open, which only accepts the proto type.
+    return storage_v2.BidiReadHandle(handle=handle)
 
 
 _slow_deserialize = storage_v2.BidiReadObjectResponse.deserialize
 
 
 def deserialize(buf):
-    """Parse a serialized ``BidiReadObjectResponse``; chunk payloads alias ``buf``."""
+    """Parse a serialized ``BidiReadObjectResponse``; chunk payloads alias ``buf``.
+
+    Anything that is not a plain data response (object metadata present, or
+    bytes that do not parse cleanly) is handed to the generated parser, which
+    either produces the real message or raises its usual ``DecodeError``.
+    """
     try:
         mv = memoryview(buf)
         n = len(buf)
@@ -192,22 +220,42 @@ def deserialize(buf):
             tag, i = _varint(buf, i)
             f, wt = tag >> 3, tag & 7
             if wt == _WT_LEN:
-                ln, i = _varint(buf, i)
-                end = i + ln
+                start, end = _length_prefixed(buf, i, n)
                 if f == 6:
-                    ranges.append(_parse_range_data(buf, mv, i, end))
+                    ranges.append(_parse_range_data(buf, mv, start, end))
                 elif f == 7:
-                    handle = _parse_handle(buf, i, end)
+                    handle = _parse_handle(buf, start, end)
                 elif f == 4:
                     return _slow_deserialize(buf)
                 i = end
             else:
-                i = _skip(buf, i, wt)
+                i = _skip(buf, i, wt, n)
         if i != n:
             return _slow_deserialize(buf)
         return FastBidiReadObjectResponse(ranges, handle)
     except Exception:
         return _slow_deserialize(buf)
+
+
+_DISABLED_VALUES = ("0", "false", "no", "off")
+
+
+def is_supported():
+    """Whether the zero-copy parser may be installed in this process.
+
+    The parser hands chunk payloads to the SDK as ``memoryview`` objects and the
+    SDK's checksum verification feeds them to ``google_crc32c``; releases of
+    google-crc32c that only accept ``bytes`` there would make every verified
+    read fail, so the generated parser is kept in that case. Setting
+    ``GCSFS_ZONAL_FAST_READ=0`` forces the generated parser as well.
+    """
+    if os.environ.get("GCSFS_ZONAL_FAST_READ", "").strip().lower() in _DISABLED_VALUES:
+        return False
+    try:
+        google_crc32c.value(memoryview(b"\0"))
+    except Exception:
+        return False
+    return True
 
 
 def install(grpc_client):

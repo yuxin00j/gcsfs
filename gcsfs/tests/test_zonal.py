@@ -78,9 +78,7 @@ def gcs_bucket_mocks():
         )
         patch_target_gcsfs_cat_file = "gcsfs.core.GCSFileSystem._cat_file"
 
-        async def download_side_effect(
-            read_requests, metadata=None, enable_checksum=True
-        ):
+        async def download_side_effect(read_requests, metadata=None):
             for param_offset, param_length, buffer_arg in read_requests:
                 if hasattr(buffer_arg, "write"):
                     buffer_arg.write(
@@ -542,9 +540,7 @@ def test_multithreaded_read_one_fails_others_survive_zb(
         call_counter = 0
         counter_lock = threading.Lock()
 
-        async def failing_download_ranges_side_effect(
-            read_requests, metadata=None, enable_checksum=True
-        ):
+        async def failing_download_ranges_side_effect(read_requests, metadata=None):
             nonlocal call_counter
             with counter_lock:
                 current_call_idx = call_counter
@@ -964,7 +960,7 @@ async def create_mrd_side_effect(
     """Side effect function to create a mocked AsyncMultiRangeDownloader."""
     file_data = files[object_name]
 
-    async def download_side_effect(read_requests, metadata=None, enable_checksum=True):
+    async def download_side_effect(read_requests, metadata=None):
         for param_offset, param_length, buffer_arg in read_requests:
             if hasattr(buffer_arg, "write"):
                 buffer_arg.write(file_data[param_offset : param_offset + param_length])
@@ -1203,7 +1199,7 @@ def _mrd_pool_with_downloads():
     mock_mrd.object_name = "test_object"
     mock_pool.get_mrd.return_value.__aenter__.return_value = mock_mrd
 
-    async def fake_download(ranges, metadata=None, enable_checksum=True):
+    async def fake_download(ranges, metadata=None):
         for offset, length, buf in ranges:
             buf.write(b"A" * length)
 
@@ -1256,7 +1252,7 @@ async def test_concurrent_mrd_fetch_exception_masking(extended_gcsfs, monkeypatc
 
     call_count = 0
 
-    async def failing_download(ranges, metadata=None, enable_checksum=True):
+    async def failing_download(ranges, metadata=None):
         nonlocal call_count
         call_count += 1
         if call_count == 2:
@@ -1546,7 +1542,7 @@ async def test_concurrent_mrd_fetch_buffer_error_surfaced(extended_gcsfs):
     mock_mrd.object_name = "test_object"
     mock_pool.get_mrd.return_value.__aenter__.return_value = mock_mrd
 
-    async def underfilling_download(ranges, metadata=None, enable_checksum=True):
+    async def underfilling_download(ranges, metadata=None):
         for offset, length, buf in ranges:
             # We intentionally write 1 byte LESS than requested.
             # This causes no exception during the gather block (has_error = False),

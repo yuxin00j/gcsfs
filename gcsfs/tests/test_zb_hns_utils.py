@@ -59,7 +59,7 @@ async def test_download_range():
     expected_data = b"test data from download"
 
     # Simulate the download_ranges method writing data to the buffer
-    async def mock_download_ranges(ranges, enable_checksum=True):
+    async def mock_download_ranges(ranges):
         _offset, _length, buffer = ranges[0]
         buffer.write(expected_data)
 
@@ -67,9 +67,7 @@ async def test_download_range():
 
     result = await zb_hns_utils.download_range(offset, length, mock_mrd)
 
-    mock_mrd.download_ranges.assert_called_once_with(
-        [(offset, length, mock.ANY)], enable_checksum=True
-    )
+    mock_mrd.download_ranges.assert_called_once_with([(offset, length, mock.ANY)])
     assert result == expected_data
 
 
@@ -266,7 +264,7 @@ async def test_download_ranges_unified(ranges, expected_call_count):
     mock_mrd = mock.AsyncMock()
 
     # Writes distinct data like b"0-5" to verify mapping
-    async def side_effect(req_ranges, enable_checksum=True):
+    async def side_effect(req_ranges):
         for offset, length, buf in req_ranges:
             buf.write(f"{offset}-{length}".encode())
 
@@ -589,6 +587,43 @@ def test_direct_memmove_buffer():
     result_bytes = buf.get_value()
     assert result_bytes == b"helloworld"
 
+    executor.shutdown()
+
+
+def test_direct_memmove_buffer_accepts_memoryview_slices():
+    data = bytes(range(256)) * 4
+    size = len(data)
+    half = size // 2
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(size, executor, max_pending=2)
+    view = buf.get_view(0, size)
+
+    view.write(memoryview(data)[:half]).result()
+    view.write(memoryview(data)[half:]).result()
+
+    view.close()
+    buf.close()
+    assert buf.get_value() == data
+    executor.shutdown()
+
+
+def test_direct_memmove_buffer_copies_whole_buffer_memoryview():
+    # A bytes payload covering the whole buffer is kept by reference; a
+    # memoryview must be copied so the result cannot alias the caller's memory.
+    data = bytes(range(256)) * 4
+    source = bytearray(data)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(len(data), executor, max_pending=2)
+    view = buf.get_view(0, len(data))
+
+    view.write(memoryview(source)).result()
+
+    view.close()
+    buf.close()
+    result = buf.get_value()
+    assert isinstance(result, bytes)
+    source[:] = b"\x00" * len(source)
+    assert result == data
     executor.shutdown()
 
 

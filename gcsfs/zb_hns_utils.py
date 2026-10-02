@@ -103,7 +103,7 @@ async def init_mrd(
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
 
 
-async def download_range(offset, length, mrd, enable_checksum=True):
+async def download_range(offset, length, mrd):
     """
     Downloads a byte range from the file asynchronously.
     """
@@ -111,9 +111,7 @@ async def download_range(offset, length, mrd, enable_checksum=True):
     if length == 0:
         return b""
     buffer = BytesIO()
-    await mrd.download_ranges(
-        [(offset, length, buffer)], enable_checksum=enable_checksum
-    )
+    await mrd.download_ranges([(offset, length, buffer)])
     data = buffer.getvalue()
     bytes_downloaded = len(data)
 
@@ -130,7 +128,7 @@ async def download_range(offset, length, mrd, enable_checksum=True):
     return data
 
 
-async def download_ranges(ranges, mrd, enable_checksum=True):
+async def download_ranges(ranges, mrd):
     """
     Downloads multiple byte ranges from the file asynchronously in a single batch.
 
@@ -159,10 +157,7 @@ async def download_ranges(ranges, mrd, enable_checksum=True):
     if tasks:
         # The MRD expects list of (offset, length, buffer)
         # We extract these from our task list
-        await mrd.download_ranges(
-            [(off, length, buf) for _, off, length, buf in tasks],
-            enable_checksum=enable_checksum,
-        )
+        await mrd.download_ranges([(off, length, buf) for _, off, length, buf in tasks])
 
     # Map results back to their original positions
     results = [b""] * len(ranges)
