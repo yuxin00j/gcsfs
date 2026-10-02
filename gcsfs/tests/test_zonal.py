@@ -78,7 +78,9 @@ def gcs_bucket_mocks():
         )
         patch_target_gcsfs_cat_file = "gcsfs.core.GCSFileSystem._cat_file"
 
-        async def download_side_effect(read_requests, metadata=None, enable_checksum=True):
+        async def download_side_effect(
+            read_requests, metadata=None, enable_checksum=True
+        ):
             for param_offset, param_length, buffer_arg in read_requests:
                 if hasattr(buffer_arg, "write"):
                     buffer_arg.write(
@@ -540,7 +542,9 @@ def test_multithreaded_read_one_fails_others_survive_zb(
         call_counter = 0
         counter_lock = threading.Lock()
 
-        async def failing_download_ranges_side_effect(read_requests, metadata=None, enable_checksum=True):
+        async def failing_download_ranges_side_effect(
+            read_requests, metadata=None, enable_checksum=True
+        ):
             nonlocal call_counter
             with counter_lock:
                 current_call_idx = call_counter

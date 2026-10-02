@@ -54,7 +54,11 @@ try:
         ]
 
     PyObject_GetBuffer = ctypes.pythonapi.PyObject_GetBuffer
-    PyObject_GetBuffer.argtypes = (ctypes.py_object, ctypes.POINTER(_PyBuffer), ctypes.c_int)
+    PyObject_GetBuffer.argtypes = (
+        ctypes.py_object,
+        ctypes.POINTER(_PyBuffer),
+        ctypes.c_int,
+    )
     PyObject_GetBuffer.restype = ctypes.c_int
     PyBuffer_Release = ctypes.pythonapi.PyBuffer_Release
     PyBuffer_Release.argtypes = (ctypes.POINTER(_PyBuffer),)
