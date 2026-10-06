@@ -4,7 +4,7 @@ common:
   batch_size: 8
   baseline:
     fmt: "text_parquet"
-    file_count: 64
+    file_count: 256
     rows_per_file: 10920
     # Keeps uncompressed pretokenized Parquet row groups below about 30 MB.
     row_group_size: 1800
