@@ -37,6 +37,33 @@ try:
     PyBytes_AsString = ctypes.pythonapi.PyBytes_AsString
     PyBytes_AsString.argtypes = (ctypes.py_object,)
     PyBytes_AsString.restype = ctypes.c_void_p
+
+    class _PyBuffer(ctypes.Structure):
+        _fields_ = [
+            ("buf", ctypes.c_void_p),
+            ("obj", ctypes.c_void_p),
+            ("len", ctypes.c_ssize_t),
+            ("itemsize", ctypes.c_ssize_t),
+            ("readonly", ctypes.c_int),
+            ("ndim", ctypes.c_int),
+            ("format", ctypes.c_char_p),
+            ("shape", ctypes.c_void_p),
+            ("strides", ctypes.c_void_p),
+            ("suboffsets", ctypes.c_void_p),
+            ("internal", ctypes.c_void_p),
+        ]
+
+    # ctypes.pythonapi hands out one function object per symbol for the whole
+    # process, so argtypes may only use built-in ctypes types: a pointer to the
+    # _PyBuffer class above would be invalidated if this module body ran again
+    # (importlib.reload, or tests that purge sys.modules). The struct's address
+    # is passed as a plain void pointer instead.
+    PyObject_GetBuffer = ctypes.pythonapi.PyObject_GetBuffer
+    PyObject_GetBuffer.argtypes = (ctypes.py_object, ctypes.c_void_p, ctypes.c_int)
+    PyObject_GetBuffer.restype = ctypes.c_int
+    PyBuffer_Release = ctypes.pythonapi.PyBuffer_Release
+    PyBuffer_Release.argtypes = (ctypes.c_void_p,)
+    PyBuffer_Release.restype = None
     HAS_CPYTHON_API = True
 except Exception:
     PyBytes_FromStringAndSize = None
@@ -325,8 +352,8 @@ class PartialView:
         """
         Schedules a write operation to memory mapping.
         """
-        if not isinstance(data, bytes):
-            raise ValueError(f"Expected bytes, but got {type(data)}")
+        if not isinstance(data, (bytes, memoryview)):
+            raise ValueError(f"Expected bytes or memoryview, but got {type(data)}")
 
         size = len(data)
         with self._view_lock:
@@ -466,7 +493,11 @@ class DirectMemmoveBuffer:
                     raise self._error
 
                 if self._result_bytes is None:
-                    if dest_offset == 0 and size == self.expected_size:
+                    if (
+                        dest_offset == 0
+                        and size == self.expected_size
+                        and isinstance(data_bytes, bytes)
+                    ):
                         # fastpath: return buffer directly
                         self._result_bytes = data_bytes
                         self.semaphore.release()  # Release because we skip the executor
@@ -536,7 +567,19 @@ class DirectMemmoveBuffer:
             # PyPy uses memory-safe native slice assignment.
             if HAS_CPYTHON_API:
                 dest = self._start_address + dest_offset
-                ctypes.memmove(dest, data_bytes, size)
+                if isinstance(data_bytes, bytes):
+                    ctypes.memmove(dest, data_bytes, size)
+                else:
+                    # ctypes.memmove only accepts bytes; borrow the raw
+                    # pointer of any other buffer via the buffer protocol.
+                    view = _PyBuffer()
+                    view_ptr = ctypes.addressof(view)
+                    if PyObject_GetBuffer(data_bytes, view_ptr, 0) != 0:
+                        raise BufferError("source does not support the buffer protocol")
+                    try:
+                        ctypes.memmove(dest, view.buf, size)
+                    finally:
+                        PyBuffer_Release(view_ptr)
             else:
                 memoryview(self._result_bytes)[
                     dest_offset : dest_offset + size

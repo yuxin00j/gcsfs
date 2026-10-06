@@ -1,7 +1,9 @@
 import asyncio
 import collections
 import concurrent.futures
+import importlib
 import logging
+import sys
 from unittest import mock
 
 import pytest
@@ -753,6 +755,86 @@ def test_direct_memmove_buffer():
 
     result_bytes = buf.get_value()
     assert result_bytes == b"helloworld"
+
+    executor.shutdown()
+
+
+def test_direct_memmove_buffer_accepts_memoryview_slices():
+    # The storage SDK's zero-copy read path hands chunks over as memoryview
+    # slices of the gRPC message; halves above THRESHOLD_BYTES_FOR_SCHEDULING
+    # go through the executor, so this covers the scheduled memmove path.
+    data = bytes(range(256)) * 2048
+    size = len(data)
+    half = size // 2
+    assert half > DirectMemmoveBuffer.THRESHOLD_BYTES_FOR_SCHEDULING
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(size, executor, max_pending=2)
+    view = buf.get_view(0, size)
+
+    view.write(memoryview(data)[:half]).result()
+    view.write(memoryview(data)[half:]).result()
+
+    view.close()
+    buf.close()
+    assert buf.get_value() == data
+    executor.shutdown()
+
+
+def test_direct_memmove_buffer_copies_whole_buffer_memoryview():
+    # A bytes payload covering the whole buffer is kept by reference; a
+    # memoryview must be copied so the result cannot alias the caller's memory.
+    data = bytes(range(256)) * 4
+    source = bytearray(data)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(len(data), executor, max_pending=2)
+    view = buf.get_view(0, len(data))
+
+    view.write(memoryview(source)).result()
+
+    view.close()
+    buf.close()
+    result = buf.get_value()
+    assert isinstance(result, bytes)
+    source[:] = b"\x00" * len(source)
+    assert result == data
+    executor.shutdown()
+
+
+def test_direct_memmove_buffer_memoryview_after_module_reexecution():
+    # gcsfs/tests/test_init.py drops every gcsfs module from sys.modules and
+    # imports the package again, then restores the originals. The module body
+    # runs twice in one process; ctypes.pythonapi function objects are shared
+    # process-wide, so the second run must not break the first module's calls.
+    import gcsfs
+
+    saved_module = sys.modules.pop("gcsfs.zb_hns_utils")
+    saved_attr = gcsfs.zb_hns_utils
+    try:
+        importlib.import_module("gcsfs.zb_hns_utils")
+    finally:
+        sys.modules["gcsfs.zb_hns_utils"] = saved_module
+        gcsfs.zb_hns_utils = saved_attr
+
+    data = bytes(range(256)) * 4
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(len(data), executor, max_pending=2)
+    view = buf.get_view(0, len(data))
+
+    view.write(memoryview(data)).result()
+
+    view.close()
+    buf.close()
+    assert buf.get_value() == data
+    executor.shutdown()
+
+
+def test_partial_view_write_rejects_non_bytes_like():
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(4, executor, max_pending=2)
+    view = buf.get_view(0, 4)
+
+    with pytest.raises(ValueError, match="Expected bytes or memoryview"):
+        view.write("text")
 
     executor.shutdown()
 
