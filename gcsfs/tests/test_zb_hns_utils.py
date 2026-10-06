@@ -3,6 +3,7 @@ import collections
 import concurrent.futures
 import importlib
 import logging
+import os
 import sys
 from unittest import mock
 
@@ -837,6 +838,28 @@ def test_partial_view_write_rejects_non_bytes_like():
         view.write("text")
 
     executor.shutdown()
+
+
+@pytest.mark.parametrize("existing, expected", [(None, "1"), ("0", "0")])
+def test_zb_hns_utils_enables_zero_copy_bidi_read_by_default(
+    monkeypatch, existing, expected
+):
+    import gcsfs
+
+    if existing is None:
+        monkeypatch.delenv("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ", raising=False)
+    else:
+        monkeypatch.setenv("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ", existing)
+
+    saved_module = sys.modules.pop("gcsfs.zb_hns_utils")
+    saved_attr = gcsfs.zb_hns_utils
+    try:
+        importlib.import_module("gcsfs.zb_hns_utils")
+    finally:
+        sys.modules["gcsfs.zb_hns_utils"] = saved_module
+        gcsfs.zb_hns_utils = saved_attr
+
+    assert os.environ.get("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ") == expected
 
 
 def test_direct_memmove_buffer_overflow():

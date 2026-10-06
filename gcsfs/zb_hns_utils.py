@@ -26,6 +26,10 @@ try:
 except ValueError:
     DEFAULT_CONCURRENCY = 4
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
+# Opt in to the google-cloud-storage zero-copy BidiReadObjectResponse parser
+# when the installed SDK and google-crc32c support it; PartialView and
+# DirectMemmoveBuffer accept the resulting memoryview chunks.
+os.environ.setdefault("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ", "1")
 logger = logging.getLogger("gcsfs")
 
 
