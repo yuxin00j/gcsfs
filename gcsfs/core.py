@@ -2605,6 +2605,28 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             else:
                 kwargs.pop("max_prefetch_size", None)
 
+        fs_loop = getattr(gcsfs, "loop", None)
+        has_usable_fs_loop = (
+            isinstance(fs_loop, asyncio.AbstractEventLoop)
+            and fs_loop.is_running()
+            and not fs_loop.is_closed()
+        )
+        if (
+            self.cache_type == "adaptive"
+            and "r" in mode
+            and has_usable_fs_loop
+            and asyn.loop[0] is None
+        ):
+            # If fsspec.asyn.reset_lock() cleared fsspec's global loop slot
+            # (e.g. Hugging Face datasets IterableDataset._iter_pytorch) while
+            # a cached GCSFileSystem/ExtendedGcsFileSystem instance is still
+            # bound to fs_loop, restore asyn.loop[0] before AbstractBufferedFile
+            # initializes AdaptiveReadaheadCache so fsspec.asyn.get_loop() does
+            # not spawn a second event loop thread that conflicts with gcsfs.loop.
+            with asyn.get_lock():
+                if asyn.loop[0] is None:
+                    asyn.loop[0] = fs_loop
+
         super().__init__(
             gcsfs,
             path,
@@ -2631,7 +2653,26 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             # TODO: Remove this direct override once fsspec natively supports passing an async_fetcher.
             # Only producer uses the fetcher and producer will always be there for a prefetcher hence
             # fetcher attributes check is not required.
-            prefetcher.producer.fetcher = self._async_fetch_range
+            if has_usable_fs_loop and prefetcher.loop is not fs_loop:
+                # AdaptiveReadaheadCache initializes BackgroundPrefetcher with
+                # fsspec.asyn.get_loop(). If that loop differs from gcsfs.loop
+                # (for instance, when gcsfs was given an explicit loop or a new
+                # global loop was created after fsspec.asyn.reset_lock()),
+                # recreate the prefetcher bound to gcsfs.loop so _async_fetch_range
+                # runs on the same event loop as the filesystem's gRPC/HTTP clients.
+                prefetcher.close()
+                from fsspec.prefetcher import BackgroundPrefetcher
+
+                prefetcher = BackgroundPrefetcher(
+                    fetcher=self._async_fetch_range,
+                    size=self.size,
+                    concurrency=cache_options.get("concurrency", self.concurrency),
+                    max_prefetch_size=cache_options.get("max_prefetch_size"),
+                    loop=fs_loop,
+                )
+                cache._prefetcher = prefetcher
+            else:
+                prefetcher.producer.fetcher = self._async_fetch_range
 
             if hasattr(cache, "close"):
                 # TODO: Remove this disarm once fsspec adds native support for deferred or

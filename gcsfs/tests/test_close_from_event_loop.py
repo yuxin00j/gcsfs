@@ -264,3 +264,37 @@ def test_gcsfile_cache_del_does_not_block_gc(fake_fs):
 
     f.close()
     assert getattr(cache, "_prefetcher", None) is None
+
+
+def test_gcsfile_adaptive_cache_binds_to_fs_loop_after_reset_lock(fake_fs, io_loop):
+    payload = b"regional-adaptive-payload-" * 64
+    fake_fs.info.return_value = {
+        "size": len(payload),
+        "generation": "1",
+        "name": "test-key",
+    }
+
+    async def fake_cat_file_concurrent(
+        path, start=None, end=None, concurrency=1, **kwargs
+    ):
+        fut = io_loop.create_future()
+        io_loop.call_soon(fut.set_result, payload[start:end])
+        return await fut
+
+    fake_fs._cat_file_concurrent = fake_cat_file_concurrent
+    orig_iothread = fsspec.asyn.iothread[0]
+
+    try:
+        fsspec.asyn.reset_lock()
+        assert fsspec.asyn.loop[0] is None
+
+        f = core.GCSFile(fake_fs, "gs://b/test-key", mode="rb", cache_type="adaptive")
+        try:
+            assert fsspec.asyn.loop[0] is io_loop
+            assert f.cache._prefetcher.loop is io_loop
+            assert f.read(128) == payload[:128]
+        finally:
+            f.close()
+    finally:
+        fsspec.asyn.loop[0] = io_loop
+        fsspec.asyn.iothread[0] = orig_iothread
