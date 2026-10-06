@@ -49,8 +49,8 @@ read -r -a REQUIREMENT_SPECS <<< "$REQUIREMENTS_OVERRIDE"
 if ((${#REQUIREMENT_SPECS[@]})); then
   # Resolve any dependencies needed by the override, then reinstall only the
   # requested packages in case an existing installation has the same version.
-  pip install -- "${REQUIREMENT_SPECS[@]}"
-  pip install --no-deps --force-reinstall -- "${REQUIREMENT_SPECS[@]}"
+  pip install "${REQUIREMENT_SPECS[@]}"
+  pip install --no-deps --force-reinstall "${REQUIREMENT_SPECS[@]}"
 fi
 REQUIREMENTS_OVERRIDE="${REQUIREMENT_SPECS[*]}"
 REQUIREMENTS_RESOLVED=$(pip list --format=json)
