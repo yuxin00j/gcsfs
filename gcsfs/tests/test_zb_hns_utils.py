@@ -840,16 +840,33 @@ def test_partial_view_write_rejects_non_bytes_like():
     executor.shutdown()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("existing, expected", [(None, "1"), ("0", "0")])
-def test_zb_hns_utils_enables_zero_copy_bidi_read_by_default(
-    monkeypatch, existing, expected
-):
+async def test_init_mrd_enables_zero_copy_bidi_read(monkeypatch, existing, expected):
+    # The opt-in happens when a zonal read stream is created, and an explicit
+    # setting in the environment wins.
+    name = zb_hns_utils.ZERO_COPY_BIDI_READ_ENV_VAR
+    if existing is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, existing)
+
+    with mock.patch(
+        "gcsfs.zb_hns_utils.AsyncMultiRangeDownloader.create_mrd",
+        new_callable=mock.AsyncMock,
+    ):
+        await zb_hns_utils.init_mrd(mock_grpc_client, bucket_name, object_name)
+
+    assert os.environ.get(name) == expected
+
+
+def test_import_does_not_enable_zero_copy_bidi_read(monkeypatch):
+    # Importing gcsfs must not change the SDK's behaviour for processes that
+    # never read from a zonal bucket.
     import gcsfs
 
-    if existing is None:
-        monkeypatch.delenv("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ", raising=False)
-    else:
-        monkeypatch.setenv("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ", existing)
+    name = zb_hns_utils.ZERO_COPY_BIDI_READ_ENV_VAR
+    monkeypatch.delenv(name, raising=False)
 
     saved_module = sys.modules.pop("gcsfs.zb_hns_utils")
     saved_attr = gcsfs.zb_hns_utils
@@ -859,7 +876,42 @@ def test_zb_hns_utils_enables_zero_copy_bidi_read_by_default(
         sys.modules["gcsfs.zb_hns_utils"] = saved_module
         gcsfs.zb_hns_utils = saved_attr
 
-    assert os.environ.get("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ") == expected
+    assert name not in os.environ
+
+
+@pytest.mark.parametrize(
+    "make_view",
+    [
+        lambda data: memoryview(data).cast("I"),
+        lambda data: memoryview(data).cast("B", [4, len(data) // 4]),
+    ],
+    ids=["cast_uint32", "two_dimensional"],
+)
+def test_partial_view_write_sizes_memoryview_in_bytes(make_view):
+    # len() of these views is a fraction of their byte size; the whole payload
+    # must still be copied and accounted for.
+    data = bytes(range(256)) * 4
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(len(data), executor, max_pending=2)
+    view = buf.get_view(0, len(data))
+
+    view.write(make_view(data)).result()
+
+    view.close()
+    buf.close()
+    assert buf.get_value() == data
+    executor.shutdown()
+
+
+def test_partial_view_write_rejects_non_contiguous_memoryview():
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    buf = DirectMemmoveBuffer(3, executor, max_pending=2)
+    view = buf.get_view(0, 3)
+
+    with pytest.raises(TypeError, match="C-contiguous"):
+        view.write(memoryview(b"abcdef")[::2])
+
+    executor.shutdown()
 
 
 def test_direct_memmove_buffer_overflow():

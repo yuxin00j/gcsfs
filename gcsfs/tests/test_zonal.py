@@ -1193,7 +1193,7 @@ def test_mrd_stream_cleanup(extended_gcsfs, gcs_bucket_mocks):
             mocks["downloader"].close.assert_awaited()
 
 
-def _mrd_pool_with_downloads():
+def _mrd_pool_with_downloads(chunk_type=bytes):
     mock_pool = mock.AsyncMock(spec=MRDPool)
     mock_mrd = mock.AsyncMock(spec=AsyncMultiRangeDownloader)
     mock_mrd.object_name = "test_object"
@@ -1201,17 +1201,21 @@ def _mrd_pool_with_downloads():
 
     async def fake_download(ranges, metadata=None):
         for offset, length, buf in ranges:
-            buf.write(b"A" * length)
+            buf.write(chunk_type(b"A" * length))
 
     mock_mrd.download_ranges.side_effect = fake_download
     return mock_pool, mock_mrd
 
 
 @pytest.mark.asyncio
-async def test_concurrent_mrd_fetch_success(extended_gcsfs, monkeypatch):
-    """Tests that _concurrent_mrd_fetch successfully downloads and stitches chunks."""
+@pytest.mark.parametrize("chunk_type", [bytes, memoryview], ids=["bytes", "memoryview"])
+async def test_concurrent_mrd_fetch_success(extended_gcsfs, monkeypatch, chunk_type):
+    """Tests that _concurrent_mrd_fetch successfully downloads and stitches chunks.
+
+    The SDK's zero-copy read path hands chunks over as memoryview objects.
+    """
     monkeypatch.setattr(extended_gcsfs, "MIN_CHUNK_SIZE_FOR_CONCURRENCY", 1)
-    mock_pool, mock_mrd = _mrd_pool_with_downloads()
+    mock_pool, mock_mrd = _mrd_pool_with_downloads(chunk_type)
 
     result = await extended_gcsfs._concurrent_mrd_fetch(
         offset=0, length=4, concurrency=4, mrd_or_pool=mock_pool

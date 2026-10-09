@@ -26,10 +26,7 @@ try:
 except ValueError:
     DEFAULT_CONCURRENCY = 4
 MAX_PREFETCH_SIZE = 256 * 1024 * 1024
-# Opt in to the google-cloud-storage zero-copy BidiReadObjectResponse parser
-# when the installed SDK and google-crc32c support it; PartialView and
-# DirectMemmoveBuffer accept the resulting memoryview chunks.
-os.environ.setdefault("GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ", "1")
+ZERO_COPY_BIDI_READ_ENV_VAR = "GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ"
 logger = logging.getLogger("gcsfs")
 
 
@@ -75,6 +72,18 @@ except Exception:
     HAS_CPYTHON_API = False
 
 
+def _enable_zero_copy_bidi_read():
+    """Opts the process into google-cloud-storage's zero-copy BidiReadObject parser.
+
+    Called when a zonal read stream is created rather than at import, so a
+    process that never reads from a zonal bucket keeps the SDK's default. An
+    explicit value in the environment wins. PartialView and DirectMemmoveBuffer
+    accept the memoryview chunks the parser hands over; SDKs without the parser
+    ignore the variable.
+    """
+    os.environ.setdefault(ZERO_COPY_BIDI_READ_ENV_VAR, "1")
+
+
 async def init_mrd(
     grpc_client,
     bucket_name,
@@ -88,6 +97,8 @@ async def init_mrd(
     Wraps Google API errors into standard Python exceptions.
     """
     from gcsfs.core import _get_cache_type_header_value
+
+    _enable_zero_copy_bidi_read()
 
     metadata = None
     cache_val = _get_cache_type_header_value(cache_type, cache_source)
@@ -356,7 +367,12 @@ class PartialView:
         """
         Schedules a write operation to memory mapping.
         """
-        if not isinstance(data, (bytes, memoryview)):
+        if isinstance(data, memoryview):
+            # len() counts items; a byte view makes it the byte count that the
+            # memmove and the accounting below rely on. Non-contiguous views
+            # cannot be cast and raise TypeError.
+            data = data.cast("B")
+        elif not isinstance(data, bytes):
             raise ValueError(f"Expected bytes or memoryview, but got {type(data)}")
 
         size = len(data)
