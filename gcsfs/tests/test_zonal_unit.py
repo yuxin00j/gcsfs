@@ -1688,3 +1688,284 @@ async def test_close_resources_with_exceptions(caplog):
 
     assert fs._grpc_client is None
     assert fs._storage_control_client is None
+
+
+# --- Rapid Cache Ultra (RCU) & Orthogonal BucketLayout Unit Tests ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location_type, hns_enabled, cache_type, expected_sc, expected_ct, expected_nl",
+    [
+        ("zone", True, "", "RAPID", "NONE", "HIERARCHICAL"),
+        (
+            "region",
+            True,
+            "rapid-cache-ultra",
+            "STANDARD",
+            "RAPID_CACHE_ULTRA",
+            "HIERARCHICAL",
+        ),
+        (
+            "region",
+            False,
+            "rapid-cache-ultra",
+            "STANDARD",
+            "RAPID_CACHE_ULTRA",
+            "NON_HIERARCHICAL",
+        ),
+        ("region", False, "rapid-cache", "STANDARD", "RAPID_CACHE", "NON_HIERARCHICAL"),
+        ("region", True, "", "STANDARD", "NONE", "HIERARCHICAL"),
+        ("region", False, "", "STANDARD", "NONE", "NON_HIERARCHICAL"),
+    ],
+)
+async def test_get_bucket_layout_orthogonal_enums(
+    extended_gcsfs,
+    location_type,
+    hns_enabled,
+    cache_type,
+    expected_sc,
+    expected_ct,
+    expected_nl,
+):
+    from google.cloud import storage_control_v2
+
+    from gcsfs.extended_gcsfs import (
+        _ORIG_GET_BUCKET_TYPE,
+        BucketLayout,
+        CachingTier,
+        NamespaceLayout,
+        StorageClass,
+    )
+
+    layout_proto = storage_control_v2.StorageLayout(
+        location_type=location_type,
+        hierarchical_namespace=storage_control_v2.StorageLayout.HierarchicalNamespace(
+            enabled=hns_enabled
+        ),
+        rapid_cache_info=storage_control_v2.StorageLayout.RapidCacheInfo(
+            cache_type=cache_type
+        ),
+    )
+    mock_control = mock.AsyncMock()
+    mock_control.get_storage_layout.return_value = layout_proto
+
+    with (
+        mock.patch.object(extended_gcsfs, "_storage_control_client", mock_control),
+        mock.patch(
+            "gcsfs.extended_gcsfs.ExtendedGcsFileSystem._get_bucket_type",
+            new=_ORIG_GET_BUCKET_TYPE,
+        ),
+    ):
+        bucket_name = f"bucket-{location_type}-{hns_enabled}-{cache_type}"
+        layout = await extended_gcsfs._lookup_bucket_layout(bucket_name)
+
+        assert layout == BucketLayout(
+            storage_class=StorageClass[expected_sc],
+            caching_tier=CachingTier[expected_ct],
+            namespace_layout=NamespaceLayout[expected_nl],
+        )
+        assert extended_gcsfs._storage_layout_cache[bucket_name] == layout
+
+
+@pytest.mark.asyncio
+async def test_rcu_capability_predicates_and_cp_merge(extended_gcsfs):
+    from gcsfs.extended_gcsfs import (
+        BucketLayout,
+        CachingTier,
+        NamespaceLayout,
+        StorageClass,
+    )
+
+    rcu_hns = BucketLayout(
+        StorageClass.STANDARD,
+        CachingTier.RAPID_CACHE_ULTRA,
+        NamespaceLayout.HIERARCHICAL,
+    )
+    rcu_flat = BucketLayout(
+        StorageClass.STANDARD,
+        CachingTier.RAPID_CACHE_ULTRA,
+        NamespaceLayout.NON_HIERARCHICAL,
+    )
+    zonal = BucketLayout(
+        StorageClass.RAPID,
+        CachingTier.NONE,
+        NamespaceLayout.HIERARCHICAL,
+    )
+    extended_gcsfs._storage_layout_cache["rcu-hns"] = rcu_hns
+    extended_gcsfs._storage_layout_cache["rcu-flat"] = rcu_flat
+    extended_gcsfs._storage_layout_cache["zonal-bkt"] = zonal
+
+    assert await extended_gcsfs._is_zonal_bucket("zonal-bkt") is True
+    assert await extended_gcsfs._is_zonal_bucket("rcu-hns") is False
+    assert await extended_gcsfs._is_zonal_bucket("rcu-flat") is False
+
+    assert await extended_gcsfs._is_rcu_bucket("rcu-hns") is True
+    assert await extended_gcsfs._is_rcu_bucket("rcu-flat") is True
+    assert await extended_gcsfs._is_rcu_bucket("zonal-bkt") is False
+
+    assert await extended_gcsfs._uses_grpc_data_path("zonal-bkt") is True
+    assert await extended_gcsfs._uses_grpc_data_path("rcu-hns") is True
+    assert await extended_gcsfs._uses_grpc_data_path("rcu-flat") is True
+
+    assert await extended_gcsfs._is_bucket_hns_enabled("rcu-hns") is True
+    assert await extended_gcsfs._is_bucket_hns_enabled("rcu-flat") is False
+
+    assert (
+        await extended_gcsfs._get_threshold_for_disk_reads("rcu-flat")
+        == 5 * 1024 * 1024
+    )
+
+    # RCU buckets are regional STANDARD buckets so server-side copy/compose (_cp_file / _merge) are allowed
+    with (
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._cp_file", new_callable=mock.AsyncMock
+        ) as mock_super_cp,
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._merge", new_callable=mock.AsyncMock
+        ) as mock_super_merge,
+    ):
+        await extended_gcsfs._cp_file("rcu-flat/src", "rcu-hns/dst")
+        mock_super_cp.assert_awaited_once()
+
+        await extended_gcsfs._merge("rcu-flat/merged", ["rcu-flat/p1", "rcu-flat/p2"])
+        mock_super_merge.assert_awaited_once()
+
+
+def test_rcu_open_and_write_passes_rapid_storage_class(
+    extended_gcsfs, gcs_bucket_mocks
+):
+    from gcsfs.extended_gcsfs import (
+        BucketLayout,
+        CachingTier,
+        NamespaceLayout,
+        StorageClass,
+    )
+    from gcsfs.zonal_file import ZonalFile
+
+    rcu_flat = BucketLayout(
+        StorageClass.STANDARD,
+        CachingTier.RAPID_CACHE_ULTRA,
+        NamespaceLayout.NON_HIERARCHICAL,
+    )
+    rcu_path = f"{TEST_ZONAL_BUCKET}/rcu_write_test.bin"
+
+    mock_aaow = mock.AsyncMock()
+    mock_aaow._is_stream_open = True
+
+    with (
+        gcs_bucket_mocks(json_data, bucket_type_val=rcu_flat),
+        mock.patch.object(extended_gcsfs, "_grpc_client", mock.Mock()),
+        mock.patch(
+            "gcsfs.zb_hns_utils.init_aaow",
+            new_callable=mock.AsyncMock,
+            return_value=mock_aaow,
+        ) as mock_init_aaow,
+        mock.patch(
+            "gcsfs.zb_hns_utils.close_aaow", new_callable=mock.AsyncMock
+        ) as mock_close_aaow,
+    ):
+        with extended_gcsfs.open(rcu_path, "wb") as f:
+            assert isinstance(f, ZonalFile)
+            assert f.finalize_on_close is False
+            f.write(b"hello rcu")
+
+        mock_init_aaow.assert_awaited_once()
+        assert mock_init_aaow.call_args.kwargs.get("storage_class") == "RAPID"
+        mock_close_aaow.assert_awaited_once_with(mock_aaow, finalize_on_close=False)
+
+
+@pytest.mark.asyncio
+async def test_rcu_put_pipe_initiate_and_simple_upload_pass_rapid_storage_class(
+    extended_gcsfs, tmp_path
+):
+    from gcsfs.extended_gcsfs import (
+        BucketLayout,
+        CachingTier,
+        NamespaceLayout,
+        StorageClass,
+        initiate_upload,
+        simple_upload,
+    )
+
+    rcu_hns = BucketLayout(
+        StorageClass.STANDARD,
+        CachingTier.RAPID_CACHE_ULTRA,
+        NamespaceLayout.HIERARCHICAL,
+    )
+    extended_gcsfs._storage_layout_cache["rcu-bkt"] = rcu_hns
+
+    local_file = tmp_path / "payload.bin"
+    local_file.write_bytes(b"rcu-payload")
+
+    mock_aaow = mock.AsyncMock()
+    mock_aaow._is_stream_open = True
+
+    with (
+        mock.patch.object(extended_gcsfs, "_grpc_client", mock.Mock()),
+        mock.patch(
+            "gcsfs.zb_hns_utils.init_aaow",
+            new_callable=mock.AsyncMock,
+            return_value=mock_aaow,
+        ) as mock_init_aaow,
+        mock.patch("gcsfs.zb_hns_utils.close_aaow", new_callable=mock.AsyncMock),
+        mock.patch.object(
+            extended_gcsfs, "_write_file_cache_update", new_callable=mock.AsyncMock
+        ),
+    ):
+        await extended_gcsfs._put_file(str(local_file), "rcu-bkt/put.bin")
+        assert mock_init_aaow.call_args.kwargs.get("storage_class") == "RAPID"
+
+        await extended_gcsfs._pipe_file("rcu-bkt/pipe.bin", b"rcu-bytes")
+        assert mock_init_aaow.call_args.kwargs.get("storage_class") == "RAPID"
+
+        await initiate_upload(extended_gcsfs, "rcu-bkt", "init.bin")
+        assert mock_init_aaow.call_args.kwargs.get("storage_class") == "RAPID"
+
+        await simple_upload(extended_gcsfs, "rcu-bkt", "simple.bin", b"simple")
+        assert mock_init_aaow.call_args.kwargs.get("storage_class") == "RAPID"
+
+        assert mock_init_aaow.await_count == 4
+
+
+def test_rcu_cat_file_and_cat_ranges_use_mrd(extended_gcsfs, gcs_bucket_mocks):
+    from gcsfs.extended_gcsfs import (
+        BucketLayout,
+        CachingTier,
+        NamespaceLayout,
+        StorageClass,
+    )
+
+    rcu_flat = BucketLayout(
+        StorageClass.STANDARD,
+        CachingTier.RAPID_CACHE_ULTRA,
+        NamespaceLayout.NON_HIERARCHICAL,
+    )
+    with gcs_bucket_mocks(json_data, bucket_type_val=rcu_flat) as mocks:
+        data = extended_gcsfs.cat_file(file_path, start=0, end=10)
+        assert data == json_data[:10]
+        mocks["pool_cache_get"].assert_called()
+
+        ranges = extended_gcsfs.cat_ranges([file_path, file_path], [0, 10], [5, 20])
+        assert ranges == [json_data[0:5], json_data[10:20]]
+
+
+@pytest.mark.asyncio
+async def test_init_aaow_passes_storage_class_to_sdk():
+    from gcsfs import zb_hns_utils
+
+    mock_client = mock.Mock()
+    mock_writer = mock.MagicMock()
+    mock_writer.open = mock.AsyncMock()
+
+    with mock.patch(
+        "gcsfs.zb_hns_utils.AsyncAppendableObjectWriter", return_value=mock_writer
+    ) as mock_aaow_cls:
+        await zb_hns_utils.init_aaow(
+            mock_client,
+            "rcu-bucket",
+            "obj.bin",
+            storage_class="RAPID",
+        )
+        _, kwargs = mock_aaow_cls.call_args
+        assert kwargs["storage_class"] == "RAPID"

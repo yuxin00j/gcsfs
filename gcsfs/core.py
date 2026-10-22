@@ -3123,7 +3123,7 @@ async def initiate_upload(
 
     # Explicit type checking is used to ensure only the ExtendedGcsFileSystem
     # enters this path, ruling out false positives from mocks or coincidentally matching attributes.
-    if isinstance(fs, ExtendedGcsFileSystem) and await fs._is_zonal_bucket(bucket):
+    if isinstance(fs, ExtendedGcsFileSystem) and await fs._uses_grpc_data_path(bucket):
 
         return await ext_initiate_upload(
             fs,
@@ -3183,7 +3183,7 @@ async def simple_upload(
 
     # Explicit type checking is used to ensure only the ExtendedGcsFileSystem
     # enters this path, ruling out false positives from mocks or coincidentally matching attributes.
-    if isinstance(fs, ExtendedGcsFileSystem) and await fs._is_zonal_bucket(bucket):
+    if isinstance(fs, ExtendedGcsFileSystem) and await fs._uses_grpc_data_path(bucket):
 
         return await ext_simple_upload(
             fs,

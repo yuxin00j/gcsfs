@@ -162,6 +162,11 @@ class ZonalFile(GCSFile):
                 # if file doesn't exist, we don't need generation
                 pass
         await self.gcsfs._get_grpc_client()
+        is_rcu = (
+            await self.gcsfs._is_rcu_bucket(bucket_name)
+            if hasattr(self.gcsfs, "_is_rcu_bucket")
+            else False
+        )
         return await zb_hns_utils.init_aaow(
             self.gcsfs.grpc_client,
             bucket_name,
@@ -169,6 +174,7 @@ class ZonalFile(GCSFile):
             generation,
             flush_interval_bytes,
             if_generation_match=self.if_generation_match,
+            storage_class="RAPID" if is_rcu else None,
         )
 
     def _ensure_aaow(self):

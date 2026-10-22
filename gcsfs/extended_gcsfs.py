@@ -7,6 +7,7 @@ import uuid
 import weakref
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from enum import Enum
 from glob import has_magic
 
@@ -48,11 +49,75 @@ USER_AGENT = "python-gcsfs"
 STORAGE_CONTROL_RPC_TIMEOUT = 30.0
 
 
+class StorageClass(Enum):
+    RAPID = "RAPID"
+    STANDARD = "STANDARD"
+    UNKNOWN = "UNKNOWN"
+
+
+class CachingTier(Enum):
+    RAPID_CACHE = "RAPID_CACHE"
+    RAPID_CACHE_ULTRA = "RAPID_CACHE_ULTRA"
+    NONE = "NONE"
+
+
+class NamespaceLayout(Enum):
+    HIERARCHICAL = "HIERARCHICAL"
+    NON_HIERARCHICAL = "NON_HIERARCHICAL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class BucketLayout:
+    storage_class: StorageClass = StorageClass.UNKNOWN
+    caching_tier: CachingTier = CachingTier.NONE
+    namespace_layout: NamespaceLayout = NamespaceLayout.UNKNOWN
+
+
+UNKNOWN_BUCKET_LAYOUT = BucketLayout(
+    storage_class=StorageClass.UNKNOWN,
+    caching_tier=CachingTier.NONE,
+    namespace_layout=NamespaceLayout.UNKNOWN,
+)
+
+
 class BucketType(Enum):
+    """Deprecated compatibility enum; prefer BucketLayout with StorageClass, CachingTier, and NamespaceLayout."""
+
     ZONAL_HIERARCHICAL = "ZONAL_HIERARCHICAL"
     HIERARCHICAL = "HIERARCHICAL"
     NON_HIERARCHICAL = "NON_HIERARCHICAL"
     UNKNOWN = "UNKNOWN"
+
+
+def _coerce_to_bucket_layout(val: BucketLayout | BucketType) -> BucketLayout:
+    if isinstance(val, BucketLayout):
+        return val
+    if val == BucketType.ZONAL_HIERARCHICAL:
+        return BucketLayout(
+            StorageClass.RAPID, CachingTier.NONE, NamespaceLayout.HIERARCHICAL
+        )
+    if val == BucketType.HIERARCHICAL:
+        return BucketLayout(
+            StorageClass.STANDARD, CachingTier.NONE, NamespaceLayout.HIERARCHICAL
+        )
+    if val == BucketType.NON_HIERARCHICAL:
+        return BucketLayout(
+            StorageClass.STANDARD, CachingTier.NONE, NamespaceLayout.NON_HIERARCHICAL
+        )
+    return UNKNOWN_BUCKET_LAYOUT
+
+
+def _to_bucket_type(val: BucketLayout | BucketType) -> BucketType:
+    if isinstance(val, BucketType):
+        return val
+    if val.storage_class == StorageClass.RAPID:
+        return BucketType.ZONAL_HIERARCHICAL
+    if val.namespace_layout == NamespaceLayout.HIERARCHICAL:
+        return BucketType.HIERARCHICAL
+    if val.namespace_layout == NamespaceLayout.NON_HIERARCHICAL:
+        return BucketType.NON_HIERARCHICAL
+    return BucketType.UNKNOWN
 
 
 gcs_file_types = {
@@ -182,7 +247,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         )
 
     async def _get_threshold_for_disk_reads(self, bucket):
-        if await self._is_zonal_bucket(bucket):
+        if await self._uses_grpc_data_path(bucket):
             return (
                 5 * 1024 * 1024
             )  # Thanks to our in house, zero copy DirectMemmoveBuffer
@@ -268,16 +333,18 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
                 "quota_project_id": self._user_project,
             }
+            client_options = None
             if self._grpc_location:
                 # Extract host:port safely (strips protocol and trailing URL paths if any).
                 endpoint = self._grpc_location.split("://")[-1].split("/")[0]
                 channel_kwargs["host"] = endpoint
+                client_options = ClientOptions(api_endpoint=endpoint)
 
             channel = transport_cls.create_channel(**channel_kwargs)
 
             transport = transport_cls(channel=channel)
             self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
-                transport=transport
+                transport=transport, client_options=client_options
             )
         return self._storage_control_client
 
@@ -307,21 +374,42 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 logger.warning(f"Failed to close grpc_client: {e}")
             self._grpc_client = None
 
-    async def _lookup_bucket_type(self, bucket):
+    async def _lookup_bucket_layout(self, bucket) -> BucketLayout:
+        if (
+            getattr(self._lookup_bucket_type, "__func__", self._lookup_bucket_type)
+            is not _ORIG_LOOKUP_BUCKET_TYPE
+        ):
+            return _coerce_to_bucket_layout(await self._lookup_bucket_type(bucket))
         if bucket in self._storage_layout_cache:
-            return self._storage_layout_cache[bucket]
-        bucket_type = await self._get_bucket_type(bucket)
-        # Don't cache UNKNOWN type.
+            return _coerce_to_bucket_layout(self._storage_layout_cache[bucket])
+        if (
+            getattr(self._get_bucket_type, "__func__", self._get_bucket_type)
+            is not _ORIG_GET_BUCKET_TYPE
+        ):
+            layout = _coerce_to_bucket_layout(await self._get_bucket_type(bucket))
+        else:
+            layout = await self._get_bucket_layout(bucket)
+        # Don't cache UNKNOWN layout.
         # This ensures that subsequent operations will retry the lookup,
         # allowing it to recover when the transient error resolves.
-        if bucket_type == BucketType.UNKNOWN:
-            return bucket_type
-        self._storage_layout_cache[bucket] = bucket_type
-        return self._storage_layout_cache[bucket]
+        if layout.storage_class == StorageClass.UNKNOWN:
+            return layout
+        self._storage_layout_cache[bucket] = layout
+        return layout
 
-    _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
+    def _sync_lookup_bucket_layout(self, bucket) -> BucketLayout:
+        if (
+            getattr(
+                self._sync_lookup_bucket_type,
+                "__func__",
+                self._sync_lookup_bucket_type,
+            )
+            is not _ORIG_SYNC_LOOKUP_BUCKET_TYPE
+        ):
+            return _coerce_to_bucket_layout(self._sync_lookup_bucket_type(bucket))
+        return asyn.sync(self.loop, self._lookup_bucket_layout, bucket)
 
-    async def _get_bucket_type(self, bucket):
+    async def _get_bucket_layout(self, bucket) -> BucketLayout:
         try:
             client = await self._get_control_plane_client()
             bucket_name_value = f"projects/_/buckets/{bucket}/storageLayout"
@@ -332,26 +420,67 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 timeout=STORAGE_CONTROL_RPC_TIMEOUT,
             )
 
-            if response.location_type == "zone":
-                return BucketType.ZONAL_HIERARCHICAL
-            if (
+            is_zonal = response.location_type == "zone"
+            storage_class = StorageClass.RAPID if is_zonal else StorageClass.STANDARD
+
+            is_hns = is_zonal or bool(
                 response.hierarchical_namespace
                 and response.hierarchical_namespace.enabled
-            ):
-                return BucketType.HIERARCHICAL
-            return BucketType.NON_HIERARCHICAL
+            )
+            namespace_layout = (
+                NamespaceLayout.HIERARCHICAL
+                if is_hns
+                else NamespaceLayout.NON_HIERARCHICAL
+            )
+
+            cache_type = getattr(
+                getattr(response, "rapid_cache_info", None), "cache_type", ""
+            )
+            if cache_type == "rapid-cache-ultra":
+                caching_tier = CachingTier.RAPID_CACHE_ULTRA
+            elif cache_type == "rapid-cache":
+                caching_tier = CachingTier.RAPID_CACHE
+            else:
+                caching_tier = CachingTier.NONE
+
+            return BucketLayout(
+                storage_class=storage_class,
+                caching_tier=caching_tier,
+                namespace_layout=namespace_layout,
+            )
         except api_exceptions.NotFound:
             logger.warning(
                 f"Error: Bucket {bucket} not found or you lack permissions for "
                 f"storage layout api used to detect bucket type. Falling back to GCSFileSystem."
             )
-            return BucketType.UNKNOWN
+            return UNKNOWN_BUCKET_LAYOUT
         except Exception as e:
             logger.warning(
                 f"Could not determine bucket type for bucket name {bucket}: {e}, falling back to GCSFileSystem"
             )
-            # Default to UNKNOWN in case bucket type is not obtained
-            return BucketType.UNKNOWN
+            return UNKNOWN_BUCKET_LAYOUT
+
+    async def _lookup_bucket_type(self, bucket):
+        """Deprecated compatibility wrapper; prefer _lookup_bucket_layout."""
+        if bucket in self._storage_layout_cache:
+            return _to_bucket_type(self._storage_layout_cache[bucket])
+        if (
+            getattr(self._get_bucket_type, "__func__", self._get_bucket_type)
+            is not _ORIG_GET_BUCKET_TYPE
+        ):
+            bucket_type = await self._get_bucket_type(bucket)
+            if bucket_type == BucketType.UNKNOWN:
+                return bucket_type
+            self._storage_layout_cache[bucket] = bucket_type
+            return _to_bucket_type(bucket_type)
+        layout = await self._lookup_bucket_layout(bucket)
+        return _to_bucket_type(layout)
+
+    _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
+
+    async def _get_bucket_type(self, bucket):
+        """Deprecated compatibility wrapper; prefer _get_bucket_layout."""
+        return _to_bucket_type(await self._get_bucket_layout(bucket))
 
     def _open(
         self,
@@ -371,9 +500,9 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         Open a file.
         """
         bucket, _, _ = self.split_path(path)
-        bucket_type = self._sync_lookup_bucket_type(bucket)
+        file_cls = ZonalFile if self._sync_uses_grpc_data_path(bucket) else GCSFile
 
-        return gcs_file_types[bucket_type](
+        return file_cls(
             self,
             path,
             mode,
@@ -443,8 +572,26 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     )
 
     async def _is_zonal_bucket(self, bucket):
-        bucket_type = await self._lookup_bucket_type(bucket)
-        return bucket_type == BucketType.ZONAL_HIERARCHICAL
+        layout = await self._lookup_bucket_layout(bucket)
+        return layout.storage_class == StorageClass.RAPID
+
+    def _sync_is_zonal_bucket(self, bucket):
+        layout = self._sync_lookup_bucket_layout(bucket)
+        return layout.storage_class == StorageClass.RAPID
+
+    async def _is_rcu_bucket(self, bucket):
+        layout = await self._lookup_bucket_layout(bucket)
+        return layout.caching_tier == CachingTier.RAPID_CACHE_ULTRA
+
+    def _sync_is_rcu_bucket(self, bucket):
+        layout = self._sync_lookup_bucket_layout(bucket)
+        return layout.caching_tier == CachingTier.RAPID_CACHE_ULTRA
+
+    async def _uses_grpc_data_path(self, bucket):
+        return await self._is_zonal_bucket(bucket) or await self._is_rcu_bucket(bucket)
+
+    def _sync_uses_grpc_data_path(self, bucket):
+        return self._sync_is_zonal_bucket(bucket) or self._sync_is_rcu_bucket(bucket)
 
     @staticmethod
     def _resolve_cache_config(kwargs):
@@ -643,8 +790,8 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         if mrd is None:
             bucket, object_name, generation = self.split_path(path)
-            if not await self._is_zonal_bucket(bucket):
-                # Fall back to default implementation if not a zonal bucket
+            if not await self._uses_grpc_data_path(bucket):
+                # Fall back to default implementation if not a zonal/RCU bucket
                 return await super()._cat_file(
                     path, start=start, end=end, concurrency=concurrency, **kwargs
                 )
@@ -957,7 +1104,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         zonal, other = {}, []
         for p, idxs in by_path.items():
             bucket, _, _ = self.split_path(p)
-            if await self._is_zonal_bucket(bucket):
+            if await self._uses_grpc_data_path(bucket):
                 zonal[p] = idxs
             else:
                 other.extend(idxs)
@@ -1061,7 +1208,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     async def _is_bucket_hns_enabled(self, bucket):
         """Checks if a bucket has Hierarchical Namespace enabled."""
         try:
-            bucket_type = await self._lookup_bucket_type(bucket)
+            layout = await self._lookup_bucket_layout(bucket)
         except Exception as e:
             logger.warning(
                 f"Could not determine if bucket '{bucket}' is HNS-enabled, falling back to default non-HNS: {e}",
@@ -1069,7 +1216,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             )
             return False
 
-        return bucket_type in [BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL]
+        return layout.namespace_layout == NamespaceLayout.HIERARCHICAL
 
     async def _mv(self, path1, path2, **kwargs):
         """
@@ -1975,7 +2122,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             Only write if the object's current generation matches this value.
         """
         bucket, key, generation = self.split_path(rpath)
-        if not await self._is_zonal_bucket(bucket):
+        if not await self._uses_grpc_data_path(bucket):
             return await super()._put_file(
                 lpath,
                 rpath,
@@ -2008,11 +2155,13 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 "These parameters will be ignored."
             )
         await self._get_grpc_client()
+        is_rcu = await self._is_rcu_bucket(bucket)
         writer = await zb_hns_utils.init_aaow(
             self.grpc_client,
             bucket,
             key,
             if_generation_match=_resolve_generation_match(mode, if_generation_match),
+            storage_class="RAPID" if is_rcu else None,
         )
 
         try:
@@ -2066,7 +2215,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             Only write if the object's current generation matches this value.
         """
         bucket, key, generation = self.split_path(path)
-        if not await self._is_zonal_bucket(bucket):
+        if not await self._uses_grpc_data_path(bucket):
             return await super()._pipe_file(
                 path,
                 data,
@@ -2089,11 +2238,13 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
                 "fixed_key_metadata during upload. These parameters will be ignored."
             )
         await self._get_grpc_client()
+        is_rcu = await self._is_rcu_bucket(bucket)
         writer = await zb_hns_utils.init_aaow(
             self.grpc_client,
             bucket,
             key,
             if_generation_match=_resolve_generation_match(mode, if_generation_match),
+            storage_class="RAPID" if is_rcu else None,
         )
         try:
             with memoryview(data) as data_view:
@@ -2128,7 +2279,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         bucket, key, path_generation = self.split_path(rpath)
 
-        if not await self._is_zonal_bucket(bucket):
+        if not await self._uses_grpc_data_path(bucket):
             return await super()._get_file_request(
                 rpath, lpath, *args, headers=headers, callback=callback, **kwargs
             )
@@ -2211,7 +2362,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         bucket, key, path_generation = self.split_path(rpath)
 
         # Delegate standard buckets to the original implementation
-        if not await self._is_zonal_bucket(bucket):
+        if not await self._uses_grpc_data_path(bucket):
             return await super()._get_file_concurrent(
                 rpath,
                 lpath,
@@ -2346,6 +2497,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
     merge = asyn.sync_wrapper(_merge)
 
 
+_ORIG_GET_BUCKET_TYPE = ExtendedGcsFileSystem._get_bucket_type
+_ORIG_LOOKUP_BUCKET_TYPE = ExtendedGcsFileSystem._lookup_bucket_type
+_ORIG_SYNC_LOOKUP_BUCKET_TYPE = ExtendedGcsFileSystem._sync_lookup_bucket_type
+
+
 async def upload_chunk(fs, location, data, offset, size, content_type):
     """
     Uploads a chunk of data using AsyncAppendableObjectWriter for zonal buckets.
@@ -2423,7 +2579,7 @@ async def initiate_upload(
     if_generation_match: int, optional
         Only write if the object's current generation matches this value.
     """
-    if not await fs._is_zonal_bucket(bucket):
+    if not await fs._uses_grpc_data_path(bucket):
         from gcsfs.core import initiate_upload as core_initiate_upload
 
         return await core_initiate_upload(
@@ -2450,11 +2606,13 @@ async def initiate_upload(
         )
 
     await fs._get_grpc_client()
+    is_rcu = await fs._is_rcu_bucket(bucket) if hasattr(fs, "_is_rcu_bucket") else False
     return await zb_hns_utils.init_aaow(
         fs.grpc_client,
         bucket,
         key,
         if_generation_match=_resolve_generation_match(mode, if_generation_match),
+        storage_class="RAPID" if is_rcu else None,
     )
 
 
@@ -2503,7 +2661,7 @@ async def simple_upload(
     if_generation_match: int, optional
         Only write if the object's current generation matches this value.
     """
-    if not await fs._is_zonal_bucket(bucket):
+    if not await fs._uses_grpc_data_path(bucket):
         from gcsfs.core import simple_upload as core_simple_upload
 
         return await core_simple_upload(
@@ -2532,11 +2690,13 @@ async def simple_upload(
             "consistency or kms_key_name during upload. These parameters will be ignored."
         )
     await fs._get_grpc_client()
+    is_rcu = await fs._is_rcu_bucket(bucket) if hasattr(fs, "_is_rcu_bucket") else False
     writer = await zb_hns_utils.init_aaow(
         fs.grpc_client,
         bucket,
         key,
         if_generation_match=_resolve_generation_match(mode, if_generation_match),
+        storage_class="RAPID" if is_rcu else None,
     )
     try:
         await writer.append(datain)

@@ -169,6 +169,7 @@ async def init_aaow(
     generation=None,
     flush_interval_bytes=None,
     if_generation_match=None,
+    storage_class=None,
 ):
     """
     Creates and opens the AsyncAppendableObjectWriter.
@@ -197,6 +198,8 @@ async def init_aaow(
         generation = 0
     elif if_generation_match is not None:
         kwargs["if_generation_match"] = if_generation_match
+    if storage_class is not None:
+        kwargs["storage_class"] = storage_class
     try:
         writer = AsyncAppendableObjectWriter(
             client=grpc_client,
@@ -207,6 +210,11 @@ async def init_aaow(
             **kwargs,
         )
     except TypeError as e:
+        if "storage_class" in str(e):
+            raise NotImplementedError(
+                "Writing to RCU buckets with storage_class requires "
+                "google-cloud-storage>=3.15.0"
+            ) from e
         if "if_generation_match" not in str(e):
             raise
         raise NotImplementedError(
