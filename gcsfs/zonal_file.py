@@ -190,14 +190,22 @@ class ZonalFile(GCSFile):
 
     def _ensure_aaow(self):
         if self.aaow is None:
-            self.aaow = asyn.sync(
-                self.gcsfs.loop,
-                self._init_aaow,
-                self.bucket,
-                self.key,
-                self.generation,
-                self.flush_interval_bytes,
-            )
+            from gcsfs.extended_gcsfs import RapidCacheUltraDisabledError
+
+            try:
+                self.aaow = asyn.sync(
+                    self.gcsfs.loop,
+                    self._init_aaow,
+                    self.bucket,
+                    self.key,
+                    self.generation,
+                    self.flush_interval_bytes,
+                )
+            except RapidCacheUltraDisabledError:
+                # The writer cannot open on this handle any more. Mark the file
+                # force-flushed so that close() does not try to open it again.
+                self.forced = True
+                raise
 
     def _fetch_range(
         self,
