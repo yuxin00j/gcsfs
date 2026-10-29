@@ -3502,9 +3502,7 @@ class TestExtendedGcsFileSystemBucketLayout:
             new_callable=mock.AsyncMock,
             side_effect=[BucketLayout.STANDARD_RCU, BucketLayout.STANDARD],
         ) as mock_get_layout:
-            assert (
-                await fs._lookup_bucket_layout("bucket") == BucketLayout.STANDARD_RCU
-            )
+            assert await fs._lookup_bucket_layout("bucket") == BucketLayout.STANDARD_RCU
 
             fs.invalidate_storage_layout_cache("bucket")
 
@@ -3534,3 +3532,25 @@ class TestExtendedGcsFileSystemBucketLayout:
         assert BucketLayout.UNKNOWN == BucketLayout(
             StorageClass.UNKNOWN, CachingTier.NONE, NamespaceLayout.UNKNOWN
         )
+
+    @pytest.mark.parametrize(
+        "bucket_layout, expected",
+        [
+            (BucketLayout.ZONAL_HIERARCHICAL, True),
+            (BucketLayout.STANDARD_RCU, True),
+            (BucketLayout.HIERARCHICAL_RCU, True),
+            (BucketLayout.STANDARD_HIERARCHICAL, False),
+            (BucketLayout.STANDARD, False),
+            (BucketLayout.UNKNOWN, False),
+            (
+                BucketLayout(
+                    StorageClass.STANDARD,
+                    CachingTier.RAPID_CACHE,
+                    NamespaceLayout.NON_HIERARCHICAL,
+                ),
+                False,
+            ),
+        ],
+    )
+    def test_bucket_layout_uses_grpc_data_path(self, bucket_layout, expected):
+        assert bucket_layout.uses_grpc_data_path is expected
