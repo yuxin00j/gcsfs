@@ -58,8 +58,17 @@ from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE, _on_loop_threa
 logger = logging.getLogger("gcsfs")
 
 
-if "GCSFS_DEBUG" in os.environ:
-    setup_logging(logger=logger, level=os.getenv("GCSFS_DEBUG"))
+def _configure_logger_from_env(target_logger=logger):
+    if "GCSFS_DEBUG" in os.environ:
+        setup_logging(logger=target_logger, level=os.getenv("GCSFS_DEBUG"))
+    elif "GCSFS_LOG_LEVEL" in os.environ:
+        level = os.getenv("GCSFS_LOG_LEVEL", "INFO").upper()
+        if level == "TRACE":
+            level = "DEBUG"
+        setup_logging(logger=target_logger, level=level)
+
+
+_configure_logger_from_env()
 
 
 # client created 2018-01-16

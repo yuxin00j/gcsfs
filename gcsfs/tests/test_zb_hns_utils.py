@@ -1913,3 +1913,45 @@ async def test_mrd_methods_raise_unrelated_type_error():
             await zb_hns_utils.init_mrd(
                 mock_grpc_client, "b", "o", cache_type="readahead"
             )
+
+
+@pytest.mark.asyncio
+async def test_init_mrd_logs_latency(caplog):
+    fake_mrd = mock.AsyncMock()
+    with (
+        mock.patch(
+            "gcsfs.zb_hns_utils.AsyncMultiRangeDownloader.create_mrd",
+            new_callable=mock.AsyncMock,
+            return_value=fake_mrd,
+        ),
+        caplog.at_level(logging.INFO, logger="gcsfs"),
+    ):
+        result = await zb_hns_utils.init_mrd(
+            mock_grpc_client, "test-bucket", "test-obj"
+        )
+
+    assert result is fake_mrd
+    init_logs = [r.getMessage() for r in caplog.records if "init_mrd" in r.getMessage()]
+    assert len(init_logs) == 1
+    assert "test-bucket/test-obj" in init_logs[0]
+    assert "ms" in init_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_init_mrd_logs_latency_on_failure(caplog):
+    with (
+        mock.patch(
+            "gcsfs.zb_hns_utils.AsyncMultiRangeDownloader.create_mrd",
+            new_callable=mock.AsyncMock,
+            side_effect=NotFound("missing"),
+        ),
+        caplog.at_level(logging.INFO, logger="gcsfs"),
+    ):
+        with pytest.raises(FileNotFoundError, match="test-bucket/missing-obj"):
+            await zb_hns_utils.init_mrd(mock_grpc_client, "test-bucket", "missing-obj")
+
+    init_logs = [r.getMessage() for r in caplog.records if "init_mrd" in r.getMessage()]
+    assert len(init_logs) == 1
+    assert "failed" in init_logs[0]
+    assert "test-bucket/missing-obj" in init_logs[0]
+    assert "ms" in init_logs[0]

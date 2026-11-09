@@ -3,6 +3,7 @@ import contextlib
 import heapq
 import logging
 import os
+import time
 import uuid
 import weakref
 from collections.abc import Iterable
@@ -48,7 +49,7 @@ from gcsfs.telemetry.wrapper import (
     with_telemetry_context,
 )
 from gcsfs.zb_hns_utils import MRD_MAX_RANGES, DirectMemmoveBuffer, MRDPool
-from gcsfs.zonal_file import ZonalFile
+from gcsfs.zonal_file import ZonalFile, _zonal_open_timing_context
 
 logger = logging.getLogger("gcsfs")
 
@@ -498,29 +499,37 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         Open a file.
         """
+        t0 = time.perf_counter()
         bucket, _, _ = self.split_path(path)
         bucket_layout = self._sync_lookup_bucket_layout(bucket)
+        t_lookup = time.perf_counter()
         use_zonal_file = "+" not in mode and bucket_layout.uses_grpc_data_path
         file_cls = ZonalFile if use_zonal_file else GCSFile
         finalize_on_close = self._resolve_finalize_on_close(
             bucket_layout, kwargs.pop("finalize_on_close", None)
         )
 
-        return file_cls(
-            self,
-            path,
-            mode,
-            block_size=block_size or self.default_block_size,
-            cache_options=cache_options,
-            consistency=consistency or self.consistency,
-            metadata=metadata,
-            acl=acl,
-            autocommit=autocommit,
-            fixed_key_metadata=fixed_key_metadata,
-            generation=generation,
-            finalize_on_close=finalize_on_close,
-            **kwargs,
+        open_ctx = (
+            _zonal_open_timing_context(t0, (t_lookup - t0) * 1000.0)
+            if use_zonal_file
+            else contextlib.nullcontext()
         )
+        with open_ctx:
+            return file_cls(
+                self,
+                path,
+                mode,
+                block_size=block_size or self.default_block_size,
+                cache_options=cache_options,
+                consistency=consistency or self.consistency,
+                metadata=metadata,
+                acl=acl,
+                autocommit=autocommit,
+                fixed_key_metadata=fixed_key_metadata,
+                generation=generation,
+                finalize_on_close=finalize_on_close,
+                **kwargs,
+            )
 
     # Replacement method for _process_limits to support new params (offset and length) for MRD.
     async def _process_limits_to_offset_and_length(

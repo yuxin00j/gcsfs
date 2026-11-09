@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import weakref
 from io import BytesIO
 
@@ -76,14 +77,39 @@ async def init_mrd(
     if metadata:
         kwargs["metadata"] = metadata
 
+    t0 = time.perf_counter()
     try:
-        return await AsyncMultiRangeDownloader.create_mrd(
+        mrd = await AsyncMultiRangeDownloader.create_mrd(
             grpc_client, bucket_name, object_name, generation, **kwargs
         )
-    except NotFound:
+    except NotFound as exc:
+        logger.info(
+            "init_mrd for %s/%s failed (%s) in %.2f ms",
+            bucket_name,
+            object_name,
+            type(exc).__name__,
+            (time.perf_counter() - t0) * 1000.0,
+        )
         # We wrap the error here to match standard Python error handling
         # and avoid leaking Google API exceptions to users.
         raise FileNotFoundError(f"{bucket_name}/{object_name}")
+    except BaseException as exc:
+        logger.info(
+            "init_mrd for %s/%s failed (%s) in %.2f ms",
+            bucket_name,
+            object_name,
+            type(exc).__name__,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        raise
+
+    logger.info(
+        "init_mrd for %s/%s completed in %.2f ms",
+        bucket_name,
+        object_name,
+        (time.perf_counter() - t0) * 1000.0,
+    )
+    return mrd
 
 
 async def download_range(offset, length, mrd):
@@ -708,6 +734,7 @@ class MRDPool:
         self.details = None
         self.persisted_size = None
         self.finalized = finalized
+        self._reused_idle_mrd = False
         self._initialized = False
         self._closed = False
 
@@ -804,7 +831,11 @@ class MRDPool:
                     size = (self.details or {}).get("size")
                     if isinstance(size, int):
                         self.persisted_size = size
-                    mrd = self._take_idle_mrd() or await self._create_mrd()
+                    mrd = self._take_idle_mrd()
+                    if mrd is not None:
+                        self._reused_idle_mrd = True
+                    else:
+                        mrd = await self._create_mrd()
                 else:
                     # Always create a new MRD for unfinalized objects to get the up-to-date persisted_size
                     mrd = await self._create_mrd()
@@ -1069,7 +1100,9 @@ class MRDPoolCache:
         if fs is None:
             raise RuntimeError("ExtendedGcsFileSystem has been garbage collected.")
 
+        t_info_start = time.perf_counter()
         info = await fs._info(f"{bucket_name}/{object_name}", generation=generation)
+        t_info_end = time.perf_counter()
         if generation is None:
             generation = info.get("generation")
         key = (bucket_name, object_name, generation, cache_type)
@@ -1091,7 +1124,14 @@ class MRDPoolCache:
             mrd_pool.details = info
 
         try:
+            t_init_start = time.perf_counter()
             await mrd_pool.initialize()
+            t_init_end = time.perf_counter()
+            mrd_pool._checkout_timings_ms = {
+                "info_ms": (t_info_end - t_info_start) * 1000.0,
+                "pool_init_ms": (t_init_end - t_init_start) * 1000.0,
+                "reused_idle_mrd": mrd_pool._reused_idle_mrd,
+            }
         except BaseException:
             # Init failed. `mrd_pool.close()` donates any partial MRDs back
             # via release() and drops the refcount we just took. If that was

@@ -1,5 +1,7 @@
+import contextlib
 import logging
 import threading
+import time
 
 from fsspec import asyn
 from fsspec.caching import caches
@@ -25,6 +27,24 @@ from .caching import (  # noqa: F401 Unused import to register GCS-Specific cach
 )
 
 logger = logging.getLogger("gcsfs.zonal_file")
+
+_open_timing_local = threading.local()
+
+
+@contextlib.contextmanager
+def _zonal_open_timing_context(start_time, bucket_lookup_ms):
+    prev = getattr(_open_timing_local, "current", None)
+    _open_timing_local.current = (start_time, bucket_lookup_ms)
+    try:
+        yield
+    finally:
+        _open_timing_local.current = prev
+
+
+def _consume_zonal_open_timing():
+    val = getattr(_open_timing_local, "current", None)
+    _open_timing_local.current = None
+    return val
 
 
 class ZonalFile(GCSFile):
@@ -76,6 +96,13 @@ class ZonalFile(GCSFile):
         of `_MAX_CHUNK_SIZE_BYTES` (2 MiB). Note that this higher default value may
         increase memory usage.
         """
+        t_zonal_start = time.perf_counter()
+        outer_timing = _consume_zonal_open_timing()
+        if outer_timing is not None:
+            t_open_start, bucket_lookup_ms = outer_timing
+        else:
+            t_open_start, bucket_lookup_ms = t_zonal_start, 0.0
+
         bucket, key, path_generation = gcsfs.split_path(path)
         generation = _coalesce_generation(generation, path_generation)
         if not key:
@@ -92,9 +119,10 @@ class ZonalFile(GCSFile):
             from gcsfs.extended_gcsfs import ExtendedGcsFileSystem
 
             if isinstance(gcsfs, ExtendedGcsFileSystem):
-                finalize_on_close = gcsfs._resolve_finalize_on_close(
-                    gcsfs._sync_lookup_bucket_layout(bucket)
-                )
+                t_layout = time.perf_counter()
+                layout = gcsfs._sync_lookup_bucket_layout(bucket)
+                bucket_lookup_ms += (time.perf_counter() - t_layout) * 1000.0
+                finalize_on_close = gcsfs._resolve_finalize_on_close(layout)
             else:
                 finalize_on_close = False
         self.aaow = None
@@ -147,8 +175,11 @@ class ZonalFile(GCSFile):
 
         # The pool checkout and everything after it run under the cleanup below.
         try:
+            mrd_pool_checkout_ms = 0.0
             if self.mode == "rb":
+                t_checkout = time.perf_counter()
                 self.mrd_pool = asyn.sync(self.gcsfs.loop, _checkout_pool)
+                mrd_pool_checkout_ms = (time.perf_counter() - t_checkout) * 1000.0
             if self.mrd_pool is not None:
                 if getattr(self.mrd_pool, "details", None) is not None:
                     self._details = self.mrd_pool.details
@@ -160,6 +191,7 @@ class ZonalFile(GCSFile):
                         "This may result in incorrect behavior for unfinalized objects."
                     )
 
+            t_super = time.perf_counter()
             super().__init__(
                 gcsfs,
                 path,
@@ -183,7 +215,51 @@ class ZonalFile(GCSFile):
                 size=object_size if object_size is not None else caller_size,
                 **kwargs,
             )
-        except BaseException:
+            t_end = time.perf_counter()
+            super_init_ms = (t_end - t_super) * 1000.0
+            total_open_ms = (t_end - t_open_start) * 1000.0
+            checkout_timings = getattr(self.mrd_pool, "_checkout_timings_ms", None)
+            if self.mode == "rb":
+                if isinstance(checkout_timings, dict):
+                    logger.info(
+                        "zonal.open for %s (mode=%s) completed in %.2f ms "
+                        "(bucket_lookup=%.2f ms, mrd_pool_checkout=%.2f ms "
+                        "[info=%.2f ms, pool_init=%.2f ms, reused_idle_mrd=%s], "
+                        "super_init=%.2f ms)",
+                        path,
+                        mode,
+                        total_open_ms,
+                        bucket_lookup_ms,
+                        mrd_pool_checkout_ms,
+                        checkout_timings["info_ms"],
+                        checkout_timings["pool_init_ms"],
+                        checkout_timings["reused_idle_mrd"],
+                        super_init_ms,
+                    )
+                else:
+                    logger.info(
+                        "zonal.open for %s (mode=%s) completed in %.2f ms "
+                        "(bucket_lookup=%.2f ms, mrd_pool_checkout=%.2f ms, "
+                        "super_init=%.2f ms)",
+                        path,
+                        mode,
+                        total_open_ms,
+                        bucket_lookup_ms,
+                        mrd_pool_checkout_ms,
+                        super_init_ms,
+                    )
+            else:
+                logger.info(
+                    "zonal.open for %s (mode=%s) completed in %.2f ms "
+                    "(bucket_lookup=%.2f ms, super_init=%.2f ms)",
+                    path,
+                    mode,
+                    total_open_ms,
+                    bucket_lookup_ms,
+                    super_init_ms,
+                )
+        except BaseException as exc:
+            t_fail = time.perf_counter()
             with handoff_lock:
                 handoff["aborted"] = True
                 if self.mrd_pool is None:
@@ -212,6 +288,13 @@ class ZonalFile(GCSFile):
                         "Failed to close MRD pool during failed initialization cleanup: %s",
                         e,
                     )
+            logger.info(
+                "zonal.open for %s (mode=%s) failed (%s) in %.2f ms",
+                path,
+                mode,
+                type(exc).__name__,
+                (t_fail - t_open_start) * 1000.0,
+            )
             raise
 
     def _reopen_kwargs(self):

@@ -2247,3 +2247,137 @@ def test_zonal_file_adaptive_cache_rebinds_when_global_loop_differs_from_fs_loop
                 thread2.join(timeout=5)
             if not loop2.is_running():
                 loop2.close()
+
+
+def test_zonal_open_logs_latency_and_idle_mrd_reuse(caplog):
+    """Verify ExtendedGcsFileSystem._open logs zonal.open latency once per open with breakdown."""
+    fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+    fs._grpc_client = mock.MagicMock()
+    fs._grpc_client.grpc_client.transport.close = mock.AsyncMock()
+    fake_mrd = mock.MagicMock()
+    fake_mrd.persisted_size = 1024
+    fake_mrd.close = mock.AsyncMock()
+    path = "gs://test-bucket/shard-00000.parquet"
+    info_payload = {
+        "name": "test-bucket/shard-00000.parquet",
+        "size": 1024,
+        "generation": "777",
+        "timeFinalized": "2026-11-09T00:00:00Z",
+    }
+
+    try:
+        with (
+            mock.patch.object(
+                fs,
+                "_sync_lookup_bucket_layout",
+                return_value=layouts.ZONAL_HIERARCHICAL,
+            ),
+            mock.patch.object(
+                fs,
+                "_info",
+                new_callable=mock.AsyncMock,
+                return_value=info_payload,
+            ),
+            mock.patch.object(fs, "_get_grpc_client", new_callable=mock.AsyncMock),
+            mock.patch(
+                "gcsfs.zb_hns_utils.AsyncMultiRangeDownloader.create_mrd",
+                new_callable=mock.AsyncMock,
+                return_value=fake_mrd,
+            ) as mock_create_mrd,
+        ):
+            with caplog.at_level(logging.INFO, logger="gcsfs"):
+                f1 = fs._open(path, mode="rb", cache_type="none")
+            open_logs_1 = [
+                r.getMessage() for r in caplog.records if "zonal.open" in r.getMessage()
+            ]
+            assert len(open_logs_1) == 1
+            assert path in open_logs_1[0]
+            assert "mode=rb" in open_logs_1[0]
+            assert "bucket_lookup=" in open_logs_1[0]
+            assert "mrd_pool_checkout=" in open_logs_1[0]
+            assert "info=" in open_logs_1[0]
+            assert "pool_init=" in open_logs_1[0]
+            assert "reused_idle_mrd=False" in open_logs_1[0]
+            assert "super_init=" in open_logs_1[0]
+            assert "ms" in open_logs_1[0]
+            f1.close()
+
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="gcsfs"):
+                f2 = fs._open(path, mode="rb", cache_type="none")
+            open_logs_2 = [
+                r.getMessage() for r in caplog.records if "zonal.open" in r.getMessage()
+            ]
+            assert len(open_logs_2) == 1
+            assert "reused_idle_mrd=True" in open_logs_2[0]
+            assert mock_create_mrd.await_count == 1
+            f2.close()
+    finally:
+        fsspec.asyn.sync(fs.loop, fs._close_resources)
+
+
+def test_zonal_open_logs_latency_on_failure(caplog):
+    """Verify failed ZonalFile open still emits a zonal.open failure latency log."""
+    fs = ExtendedGcsFileSystem(token="anon", skip_instance_cache=True)
+    fs._grpc_client = mock.MagicMock()
+    fs._grpc_client.grpc_client.transport.close = mock.AsyncMock()
+    path = "gs://test-bucket/missing-shard.parquet"
+    info_payload = {
+        "name": "test-bucket/missing-shard.parquet",
+        "size": 1024,
+        "generation": "777",
+        "timeFinalized": "2026-11-09T00:00:00Z",
+    }
+
+    try:
+        with (
+            mock.patch.object(
+                fs,
+                "_sync_lookup_bucket_layout",
+                return_value=layouts.ZONAL_HIERARCHICAL,
+            ),
+            mock.patch.object(
+                fs,
+                "_info",
+                new_callable=mock.AsyncMock,
+                return_value=info_payload,
+            ),
+            mock.patch.object(fs, "_get_grpc_client", new_callable=mock.AsyncMock),
+            mock.patch(
+                "gcsfs.zb_hns_utils.AsyncMultiRangeDownloader.create_mrd",
+                new_callable=mock.AsyncMock,
+                side_effect=NotFound("missing"),
+            ),
+            caplog.at_level(logging.INFO, logger="gcsfs"),
+        ):
+            with pytest.raises(FileNotFoundError):
+                fs._open(path, mode="rb", cache_type="none")
+
+        open_logs = [
+            r.getMessage() for r in caplog.records if "zonal.open" in r.getMessage()
+        ]
+        assert len(open_logs) == 1
+        assert "failed" in open_logs[0]
+        assert path in open_logs[0]
+        assert "ms" in open_logs[0]
+    finally:
+        fsspec.asyn.sync(fs.loop, fs._close_resources)
+
+
+def test_gcsfs_log_level_env_configures_logger(monkeypatch):
+    """Verify GCSFS_LOG_LEVEL configures a logger (mapping TRACE -> DEBUG) when GCSFS_DEBUG is unset."""
+    import gcsfs.core as core_mod
+
+    monkeypatch.delenv("GCSFS_DEBUG", raising=False)
+    monkeypatch.setenv("GCSFS_LOG_LEVEL", "TRACE")
+    test_logger = logging.getLogger("gcsfs.test_env_level")
+    orig_handlers = list(test_logger.handlers)
+    orig_level = test_logger.level
+    try:
+        test_logger.handlers.clear()
+        core_mod._configure_logger_from_env(test_logger)
+        assert test_logger.level == logging.DEBUG
+        assert len(test_logger.handlers) >= 1
+    finally:
+        test_logger.handlers[:] = orig_handlers
+        test_logger.setLevel(orig_level)
