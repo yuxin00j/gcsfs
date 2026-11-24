@@ -1,6 +1,6 @@
 {
   "sourceFormat": "CSV",
-  "sourceUris": ["gs://@INFRA_PREFIX@-macrobench-results/*.csv"],
+  "sourceUris": ["gs://@INFRA_PREFIX@-macrobench-results/branch=*.csv"],
   "csvOptions": {
     "skipLeadingRows": 1,
     "sourceColumnMatch": "NAME",

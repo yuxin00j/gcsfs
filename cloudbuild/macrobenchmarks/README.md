@@ -167,6 +167,7 @@ Before creating the triggers, set up the following in your GCP project.
 | `_WORKLOAD_TIMEOUT_SECONDS` | `14400` | Workload/JobSet completion timeout in seconds (default 4 hours). |
 | `_JOBSET_VERSION` | `v0.12.0` | JobSet controller release to install. |
 | `_SKIP_CLEANUP` | `false` | Leave infra standing after the run (for debugging). |
+| `_RUN_SOURCE` | `manual` | `manual` or `scheduled`. Only `scheduled` runs upload under `branch=<branch>/` for BigQuery ingestion; manual runs upload under `manual/branch=<branch>/` so ad-hoc runs on `main` stay off the dashboard. |
 | `_RCU_WARMUP_SETTLE_SECONDS` | `""` | `*_rcu_warm` only: seconds to wait after the warm-up reads. Empty means 120 + 1.5 per GiB of the warmed objects. |
 
 ### Interaction notes
@@ -240,8 +241,20 @@ gcloud builds triggers create manual \
 ```
 
 `_INFRA_PREFIX` **must match** between the two triggers -- the ingestion pipeline
-reads `gs://<_INFRA_PREFIX>-macrobench-results` and writes to a dataset named
-`<_INFRA_PREFIX>_<_DATASET_NAME>` (hyphens collapsed to underscores).
+reads `gs://<_INFRA_PREFIX>-macrobench-results/branch=*.csv` and writes to a
+dataset named `<_INFRA_PREFIX>_<_DATASET_NAME>` (hyphens collapsed to
+underscores).
+
+Leave `_RUN_SOURCE` unset on the run trigger itself (so ad-hoc Cloud Build UI
+and `gcloud builds triggers run` runs default to `manual` and upload under
+`manual/branch=...`, outside BigQuery ingestion). For scheduled runs, pass
+`_RUN_SOURCE=scheduled` per invocation in the Cloud Scheduler regional `:run`
+request with `Content-Type: application/json` and body
+`{"source":{"substitutions":{"_RUN_SOURCE":"scheduled"}}}` (or pass
+`--substitutions=_RUN_SOURCE=scheduled` for an intentional one-off publish).
+Note that Cloud Build UI **Retry** on a scheduled build and Cloud Scheduler
+**Force run** both inherit `_RUN_SOURCE=scheduled`; use Triggers → Run or
+`gcloud builds triggers run` for ad-hoc debugging.
 
 ## Metrics: summary schema, results, and ingestion
 
@@ -250,7 +263,8 @@ reads `gs://<_INFRA_PREFIX>-macrobench-results` and writes to a dataset named
 Each run uploads one summary CSV to:
 
 ```
-gs://<_INFRA_PREFIX>-macrobench-results/branch=<branch>/<YYYYMMDD>/<run_id>/<timestamp>.csv
+gs://<_INFRA_PREFIX>-macrobench-results/branch=<branch>/<YYYYMMDD>/<run_id>/<timestamp>.csv         # _RUN_SOURCE=scheduled (ingested)
+gs://<_INFRA_PREFIX>-macrobench-results/manual/branch=<branch>/<YYYYMMDD>/<run_id>/<timestamp>.csv  # _RUN_SOURCE=manual (default, not ingested)
 ```
 
 ### Summary schema
@@ -313,12 +327,13 @@ fields `N/A`.
 
 1. Ensures the dataset `<_INFRA_PREFIX>_<_DATASET_NAME>` exists (created in
    `LOCATION`).
-2. Recreates an external **`staging`** table pointing at the results-bucket CSVs,
-   using `macrobenchmarks_schema.json`.
+2. Recreates an external **`staging`** table pointing at `branch=*.csv` in the
+   results bucket (excluding `manual/`), using `macrobenchmarks_schema.json`.
 3. Runs `ingest.sql`, which maintains a **`history`** table partitioned by
    `run_date`: it auto-evolves the schema when new columns appear, extracts
-   metadata (`run_date`, `build_id`, `run_timestamp`) from the source path, and
-   inserts new rows -- deduplicating on `source_uri` so re-runs don't double-count.
+   metadata (`run_date`, `build_id`, `run_timestamp`) from the source path,
+   excludes `manual/` URIs as defense-in-depth, and inserts new rows --
+   deduplicating on `source_uri` so re-runs don't double-count.
 
 After ingestion, the metrics are available as rows in the **`history`** table of
 the `<_INFRA_PREFIX>_<_DATASET_NAME>` BigQuery dataset.

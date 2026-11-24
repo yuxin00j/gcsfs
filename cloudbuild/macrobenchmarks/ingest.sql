@@ -51,7 +51,7 @@ BEGIN
     "_FILE_NAME as source_uri, ",
     "REGEXP_EXTRACT(_FILE_NAME, r'/branch=([^/]+)/') as branch_name, ",
     columns_list,
-    " FROM `@PROJECT_ID@.@DATASET_NAME@.staging` s WHERE NOT EXISTS (SELECT 1 FROM `@PROJECT_ID@.@DATASET_NAME@.history` h WHERE h.source_uri = s._FILE_NAME)"
+    " FROM `@PROJECT_ID@.@DATASET_NAME@.staging` s WHERE NOT REGEXP_CONTAINS(s._FILE_NAME, r'^gs://[^/]+/manual/') AND NOT EXISTS (SELECT 1 FROM `@PROJECT_ID@.@DATASET_NAME@.history` h WHERE h.source_uri = s._FILE_NAME)"
   );
 
   EXECUTE IMMEDIATE insert_query;

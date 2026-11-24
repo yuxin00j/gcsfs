@@ -537,18 +537,44 @@ def test_cloudbuild_disables_rcu_caches_before_removing_their_bucket(tmp_path, s
     assert removals and disables[0] < min(removals), calls
 
 
+def test_cloudbuild_run_source_defaults_to_manual_and_rejects_unknown_values(tmp_path):
+    cb = _cloudbuild_yaml()
+    assert '_RUN_SOURCE: "manual"' in cb
+    assert '"_RUN_SOURCE=${_RUN_SOURCE}"' in cb
+
+    exports, err = _init_variables(tmp_path)
+    assert exports is not None, err
+    assert exports["RUN_SOURCE"] == "manual"
+
+    exports, err = _init_variables(tmp_path, _RUN_SOURCE="scheduled")
+    assert exports is not None, err
+    assert exports["RUN_SOURCE"] == "scheduled"
+
+    exports, err = _init_variables(tmp_path, _RUN_SOURCE="bogus")
+    assert exports is None
+    assert "unknown _RUN_SOURCE" in err
+
+
 @pytest.mark.parametrize(
-    "mode, root", [("ci", "subsystembenchmarks-ci"), ("nightly", "subsystembenchmarks")]
+    "mode, run_source, root",
+    [
+        ("ci", "manual", "subsystembenchmarks-ci"),
+        ("ci", "scheduled", "subsystembenchmarks-ci"),
+        ("nightly", "manual", "subsystembenchmarks-manual"),
+        ("nightly", None, "subsystembenchmarks-manual"),
+        ("nightly", "scheduled", "subsystembenchmarks"),
+    ],
 )
-def test_upload_results_keeps_ci_artifacts_out_of_bigquery_ingestion(
-    tmp_path, mode, root
+def test_upload_results_keeps_ci_and_manual_artifacts_out_of_bigquery_ingestion(
+    tmp_path, mode, run_source, root
 ):
     # The ingestion external table reads gs://<prefix>-run-results/subsystembenchmarks/*.csv.
     home = tmp_path / "home"
     (home / "gcsfs/gcsfs/tests/perf/subsystembenchmarks/__run__/ci").mkdir(parents=True)
+    run_source_line = f"export RUN_SOURCE={run_source}\n" if run_source else ""
     (home / "ssb_cloudbuild.env").write_text(
-        f"export MODE={mode}\nexport RESULTS_BUCKET=b-run-results\n"
-        "export BRANCH_NAME=feat-x\nexport RUN_ID=build-1\n"
+        f"export MODE={mode}\n{run_source_line}export RESULTS_BUCKET=b-run-results\n"
+        "export BRANCH_NAME=main\nexport RUN_ID=build-1\n"
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -558,11 +584,24 @@ def test_upload_results_keeps_ci_artifacts_out_of_bigquery_ingestion(
     script = os.path.join(
         _REPO_ROOT, "cloudbuild", "subsystembenchmarks", "scripts", "upload-results.sh"
     )
-    env = dict(os.environ, HOME=str(home), PATH=f"{bin_dir}:{os.environ['PATH']}")
+    env = {"HOME": str(home), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
     subprocess.run(["bash", script], env=env, check=True, capture_output=True)
 
     dest = calls.read_text().split()[-1]
     assert re.fullmatch(
-        rf"gs://b-run-results/{root}/branch=feat-x/\d{{8}}/build-1/", dest
+        rf"gs://b-run-results/{root}/branch=main/\d{{8}}/build-1/", dest
+    )
+    schema_path = os.path.join(
+        _REPO_ROOT,
+        "cloudbuild",
+        "subsystembenchmarks",
+        "subsystembenchmarks_schema.json",
+    )
+    with open(schema_path) as f:
+        schema_uri = yaml.safe_load(f)["sourceUris"][0].replace("@INFRA_PREFIX@", "b")
+    glob_re = re.compile("^" + re.escape(schema_uri).replace(r"\*", ".*") + "$")
+    sample_csv = f"{dest}20261124-000000/results.csv"
+    assert bool(glob_re.match(sample_csv)) is (
+        mode == "nightly" and run_source == "scheduled"
     )

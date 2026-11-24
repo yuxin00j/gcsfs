@@ -145,6 +145,7 @@ normalized override are published with every result row.
 | `_SWEEP_AXES` | empty | Whitespace-separated configuration-axis names. Empty runs all configured cases; any selection still includes the implicit baseline case. |
 | `_MODE` | `nightly` | `nightly` runs `_GROUP` as configured. `ci` runs the fixed per-PR suite in `scripts/run-ci.sh` and ignores `_GROUP`, `_BUCKET_TYPE`, `_FILTER`, `_SWEEP_AXES`, `_MODEL_ID`, and `_REQUIREMENTS`. |
 | `_CI_MODEL_ID` | empty | `_MODE=ci` only: `gs://` copy of `gpt2` that `_VM_SERVICE_ACCOUNT` can read. Empty uses `gs://huggingface-model-weights/gpt2`. |
+| `_RUN_SOURCE` | `manual` | `manual` or `scheduled` (`_MODE=nightly` only; `_MODE=ci` always uploads under `subsystembenchmarks-ci/`). Only `scheduled` runs upload under `subsystembenchmarks/` for BigQuery ingestion; manual runs upload under `subsystembenchmarks-manual/` so ad-hoc runs on `main` stay off the dashboard. |
 
 `PROJECT_ID`, `LOCATION`, `BUILD_ID`, `BRANCH_NAME`, and `COMMIT_SHA` are Cloud
 Build built-ins rather than custom substitutions.
@@ -175,12 +176,24 @@ or subset of configuration axes. Because `_SWEEP_AXES` contains spaces when
 selecting more than one axis, quote the complete `--substitutions` argument in
 shell invocations.
 
+Leave `_RUN_SOURCE` unset on the trigger definition itself (so ad-hoc Cloud
+Build UI and `gcloud builds triggers run` runs default to `manual` and stay out
+of BigQuery). For scheduled runs, pass `_RUN_SOURCE=scheduled` per invocation in
+the Cloud Scheduler regional `:run` request with `Content-Type: application/json`
+and body `{"source":{"substitutions":{"_RUN_SOURCE":"scheduled"}}}` (or pass
+`--substitutions=_RUN_SOURCE=scheduled` for an intentional one-off publish).
+Note that Cloud Build UI **Retry** on a scheduled build and Cloud Scheduler
+**Force run** both inherit `_RUN_SOURCE=scheduled`; use Triggers → Run or
+`gcloud builds triggers run` for ad-hoc debugging.
+
 ## Results and failure behavior
 
 The remote upload script copies the complete local `__run__` directory to:
 
 ```text
-gs://<_INFRA_PREFIX>-run-results/subsystembenchmarks/
+gs://<_INFRA_PREFIX>-run-results/subsystembenchmarks/        # _MODE=nightly, _RUN_SOURCE=scheduled (ingested)
+gs://<_INFRA_PREFIX>-run-results/subsystembenchmarks-manual/ # _MODE=nightly, _RUN_SOURCE=manual (default, not ingested)
+gs://<_INFRA_PREFIX>-run-results/subsystembenchmarks-ci/     # _MODE=ci (not ingested, regardless of _RUN_SOURCE)
 └── branch=<branch>/
     └── <YYYYMMDD>/
         └── <build_id>/
@@ -317,8 +330,9 @@ gcloud builds triggers create manual \
 artifact URI pattern. On every ingestion run, the pipeline:
 
 1. Ensures `_DATASET_NAME` exists in `LOCATION`.
-2. Recreates `staging_subsystem` as an external CSV table over the results
-   bucket, so checked-in schema changes take effect.
+2. Recreates `staging_subsystem` as an external CSV table over
+   `subsystembenchmarks/*.csv` (so only `_MODE=nightly`, `_RUN_SOURCE=scheduled`
+   artifacts are ingested, and checked-in schema changes take effect).
 3. Adds new staging columns to `history_subsystem` when necessary.
 4. Inserts rows from previously unseen artifacts, deriving `run_date`,
    `build_id`, `run_timestamp`, `source_uri`, and `branch_name` from each object

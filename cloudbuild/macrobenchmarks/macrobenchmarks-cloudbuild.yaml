@@ -59,6 +59,8 @@ substitutions:
   _WORKLOAD_TIMEOUT_SECONDS: "14400"
   _JOBSET_VERSION: "v0.12.0"
   _SKIP_CLEANUP: "false"
+  # manual | scheduled (only scheduled runs upload to the BigQuery-ingested prefix)
+  _RUN_SOURCE: "manual"
   # *_rcu_warm only: seconds to wait after the warm-up reads for the cache to
   # ingest the objects. Empty => 120 + 1.5 per GiB of the warmed objects.
   _RCU_WARMUP_SETTLE_SECONDS: ""
@@ -105,6 +107,7 @@ steps:
       - "_TORCH_DISTRIBUTED_TIMEOUT_SECONDS=${_TORCH_DISTRIBUTED_TIMEOUT_SECONDS}"
       - "_WORKLOAD_TIMEOUT_SECONDS=${_WORKLOAD_TIMEOUT_SECONDS}"
       - "_RCU_WARMUP_SETTLE_SECONDS=${_RCU_WARMUP_SETTLE_SECONDS}"
+      - "_RUN_SOURCE=${_RUN_SOURCE}"
     args: ["cloudbuild/macrobenchmarks/scripts/init_variables.sh"]
     waitFor: ["-"]
 

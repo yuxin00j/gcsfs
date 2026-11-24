@@ -138,4 +138,9 @@ python3 -m metrics.monitoring \
 run_calculate "$SUMMARY" \
   || echo "Warning: recompute with system metrics failed; uploading summary without them."
 echo "export SUMMARY_FILE=${SUMMARY}" >> "${BUILD_VARS_FILE}"
-echo "export SUMMARY_URI=gs://${RESULTS_BUCKET}/branch=${BRANCH_NAME}/${DATE_DIR}/${RUN_ID}/${TS_DIR}.csv" >> "${BUILD_VARS_FILE}"
+if [ "${RUN_SOURCE:-manual}" = "scheduled" ]; then
+  SUMMARY_PREFIX=""
+else
+  SUMMARY_PREFIX="manual/"
+fi
+echo "export SUMMARY_URI=gs://${RESULTS_BUCKET}/${SUMMARY_PREFIX}branch=${BRANCH_NAME}/${DATE_DIR}/${RUN_ID}/${TS_DIR}.csv" >> "${BUILD_VARS_FILE}"

@@ -13,6 +13,7 @@ substitutions:
   _BOOT_DISK_SIZE: "200GB"
   _MODE: "nightly"  # nightly | ci (per-PR lightweight suite: scripts/run-ci.sh runs fixed cases; _GROUP/_BUCKET_TYPE/_FILTER/_SWEEP_AXES/_MODEL_ID/_REQUIREMENTS are ignored)
   _CI_MODEL_ID: ""  # _MODE=ci only: gs:// copy of gpt2 the VM service account can read (default gs://huggingface-model-weights/gpt2)
+  _RUN_SOURCE: "manual"  # manual | scheduled (only scheduled runs upload to the BigQuery-ingested prefix)
 
 steps:
   # 1. Generate a persistent SSH key for this build run.
@@ -62,6 +63,7 @@ steps:
       - "_BOOT_DISK_SIZE=${_BOOT_DISK_SIZE}"
       - "_MODE=${_MODE}"
       - "_CI_MODEL_ID=${_CI_MODEL_ID}"
+      - "_RUN_SOURCE=${_RUN_SOURCE}"
       - "PROJECT_ID=${PROJECT_ID}"
     args:
       - "-c"
@@ -81,6 +83,12 @@ steps:
         case "$${_MODE}" in
           nightly|ci) ;;
           *) echo "ERROR: unknown _MODE '$${_MODE}' (expected nightly or ci)"; exit 1;;
+        esac
+
+        RUN_SOURCE="$${_RUN_SOURCE:-manual}"
+        case "$${RUN_SOURCE}" in
+          manual|scheduled) ;;
+          *) echo "ERROR: unknown _RUN_SOURCE '$${RUN_SOURCE}' (expected manual or scheduled)"; exit 1;;
         esac
 
         # _MODE=ci picks each case's bucket type itself (scripts/run-ci.sh), so _BUCKET_TYPE
@@ -126,6 +134,7 @@ steps:
           printf 'export BOOT_DISK_SIZE=%q\n' "$${_BOOT_DISK_SIZE}"
           printf 'export MODE=%q\n' "$${_MODE}"
           printf 'export CI_MODEL_ID=%q\n' "$${_CI_MODEL_ID}"
+          printf 'export RUN_SOURCE=%q\n' "$${RUN_SOURCE}"
         } > /workspace/build_vars.env
     waitFor: ["-"]
 

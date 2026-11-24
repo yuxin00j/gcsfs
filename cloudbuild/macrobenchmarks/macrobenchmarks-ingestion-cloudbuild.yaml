@@ -32,7 +32,7 @@ steps:
       - |
         set -e
         # _INFRA_PREFIX selects the results bucket the external table reads
-        # (gs://<_INFRA_PREFIX>-macrobench-results/*.csv); a missing value would
+        # (gs://<_INFRA_PREFIX>-macrobench-results/branch=*.csv); a missing value would
         # render gs://-macrobench-results and silently read nothing. Require it
         # here too (not only in ensure-dataset) so this step is safe in isolation.
         if [ -z "${_INFRA_PREFIX}" ] || [ -z "${_DATASET_NAME}" ]; then

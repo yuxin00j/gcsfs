@@ -51,6 +51,13 @@ case "${_ENABLE_TIER1_NETWORKING:-true}" in
   true|false) ;;
   *) echo "ERROR: _ENABLE_TIER1_NETWORKING must be true|false (got '${_ENABLE_TIER1_NETWORKING}')."; exit 1 ;;
 esac
+# Reject an unknown run source before provisioning anything; default to manual
+# (fail-closed) so ad-hoc runs never land in the scheduled BigQuery dataset.
+RUN_SOURCE="${_RUN_SOURCE:-manual}"
+case "${RUN_SOURCE}" in
+  manual|scheduled) ;;
+  *) echo "ERROR: _RUN_SOURCE must be manual|scheduled (got '${_RUN_SOURCE}')."; exit 1 ;;
+esac
 # An external checkpoint, if supplied, takes precedence and the seed step
 # no-ops; note it so a run that set both does not look mis-wired.
 if [ "${_SEED_CHECKPOINT:-true}" = "true" ] && [ -n "${_CHECKPOINT_LOAD_PATH}" ]; then
@@ -153,3 +160,4 @@ echo "export RESULTS_BUCKET=${_INFRA_PREFIX}-macrobench-results" >> "${BUILD_VAR
 echo "export REGION=${REGION}" >> "${BUILD_VARS_FILE}"
 echo "export TORCH_DISTRIBUTED_TIMEOUT_SECONDS=${_TORCH_DISTRIBUTED_TIMEOUT_SECONDS:-900}" >> "${BUILD_VARS_FILE}"
 echo "export WORKLOAD_TIMEOUT_SECONDS=${_WORKLOAD_TIMEOUT_SECONDS:-14400}" >> "${BUILD_VARS_FILE}"
+echo "export RUN_SOURCE=${RUN_SOURCE}" >> "${BUILD_VARS_FILE}"
